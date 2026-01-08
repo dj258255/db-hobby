@@ -40,4 +40,14 @@ fn main() {
 
     println!("\n총 브랜치 수: {}", db.branch_names().len());
     println!("포크 1000개를 떴지만, 공유 덕분에 새로 저장된 노드는 한 줌뿐이다.");
+
+    // 에이전트 루프의 마지막 단계: 비교하고, 좋으면 채택한다.
+    println!("\n[diff] main 대비 try-7이 바꾼 것:");
+    for change in db.diff("main", "try-7").unwrap() {
+        println!("  {change:?}");
+    }
+
+    db.merge("try-7", "main").unwrap(); // 좋은 갈래를 채택
+    println!("\n[merge] try-7을 main에 채택한 뒤:");
+    show(&db, "main", "user:1"); // 이제 main도 bob
 }

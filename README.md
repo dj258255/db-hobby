@@ -66,12 +66,14 @@ an untouched subtree is asserted to be the *same allocation* in both versions vi
 
 ## Status
 
-Working: persistent tree (`insert` / `get` / `remove`), the `BranchDB` API
-(`fork` / `put` / `get` / `delete`), and tests that prove structural sharing.
+Working: persistent tree (`insert` / `get` / `remove` / `diff`), the `BranchDB`
+API (`fork` / `put` / `get` / `delete` / `diff` / `merge`), and tests that prove
+structural sharing.
 
-Planned: `diff` / `merge` between branches, on-disk content-addressed storage, a
-balanced (AVL) tree to replace the current worst-case O(n), and Python/JS
-bindings so agent runtimes can use it directly.
+Planned: 3-way `merge` using a common ancestor (current merge is a simple
+source-wins union), on-disk content-addressed storage, a balanced (AVL) tree to
+replace the current worst-case O(n), and Python/JS bindings so agent runtimes
+can use it directly.
 
 ## License
 

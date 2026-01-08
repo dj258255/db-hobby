@@ -121,6 +121,52 @@ impl BranchDB {
             .map(|_| ())
             .ok_or_else(|| Error::NoSuchBranch(name.to_string()))
     }
+
+    /// 한 브랜치의 모든 키-값을 키 순서로 돌려준다.
+    pub fn entries(&self, branch: &str) -> Result<Vec<(Key, Value)>, Error> {
+        let tree = self
+            .branches
+            .get(branch)
+            .ok_or_else(|| Error::NoSuchBranch(branch.to_string()))?;
+        Ok(tree::entries(tree))
+    }
+
+    /// 두 브랜치의 차이를 반환한다. `a`에서 `b`로 갈 때의 변화(추가/삭제/수정)다.
+    /// 에이전트가 "이 갈래가 main과 뭐가 다른가"를 확인하는 데 쓴다.
+    pub fn diff(&self, a: &str, b: &str) -> Result<Vec<tree::Change>, Error> {
+        let ta = self
+            .branches
+            .get(a)
+            .ok_or_else(|| Error::NoSuchBranch(a.to_string()))?;
+        let tb = self
+            .branches
+            .get(b)
+            .ok_or_else(|| Error::NoSuchBranch(b.to_string()))?;
+        Ok(tree::diff(ta, tb))
+    }
+
+    /// `from` 브랜치의 모든 키-값을 `into` 브랜치에 적용한다(충돌 시 from이 이긴다).
+    /// 에이전트가 "좋은 갈래를 main에 채택"하는 연산이다.
+    ///
+    /// 단순 합집합 병합이다 — `from`에서 *삭제된* 키는 전파하지 않는다. 공통 조상을
+    /// 이용한 3-way 병합(삭제까지 반영)은 다음 단계로 남겨둔다.
+    pub fn merge(&mut self, from: &str, into: &str) -> Result<(), Error> {
+        let from_tree = self
+            .branches
+            .get(from)
+            .ok_or_else(|| Error::NoSuchBranch(from.to_string()))?
+            .clone();
+        let mut into_tree = self
+            .branches
+            .get(into)
+            .ok_or_else(|| Error::NoSuchBranch(into.to_string()))?
+            .clone();
+        for (key, value) in tree::entries(&from_tree) {
+            into_tree = tree::insert(&into_tree, key, value);
+        }
+        self.branches.insert(into.to_string(), into_tree);
+        Ok(())
+    }
 }
 
 impl Default for BranchDB {
@@ -179,5 +225,45 @@ mod tests {
         db.create_branch("zeta").unwrap();
         db.create_branch("alpha").unwrap();
         assert_eq!(db.branch_names(), vec!["alpha", "main", "zeta"]);
+    }
+
+    #[test]
+    fn diff_shows_what_a_branch_changed() {
+        use crate::tree::Change;
+
+        let mut db = BranchDB::new();
+        db.put("main", b("keep"), b("same")).unwrap();
+        db.put("main", b("edit"), b("old")).unwrap();
+
+        db.fork("main", "exp").unwrap();
+        db.put("exp", b("edit"), b("new")).unwrap(); // 수정
+        db.put("exp", b("fresh"), b("v")).unwrap(); // 추가
+
+        let changes = db.diff("main", "exp").unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                Change::Modified { key: b("edit"), old: b("old"), new: b("new") },
+                Change::Added { key: b("fresh"), value: b("v") },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_adopts_the_source_branch() {
+        let mut db = BranchDB::new();
+        db.put("main", b("a"), b("1")).unwrap();
+
+        db.fork("main", "feature").unwrap();
+        db.put("feature", b("a"), b("2")).unwrap(); // main의 a를 덮어씀
+        db.put("feature", b("b"), b("new")).unwrap(); // 새 키
+
+        db.merge("feature", "main").unwrap();
+
+        // main이 feature의 변경을 채택했다.
+        assert_eq!(db.get("main", b"a").unwrap(), Some(&b"2"[..]));
+        assert_eq!(db.get("main", b"b").unwrap(), Some(&b"new"[..]));
+        // 병합 후 두 브랜치는 더 이상 차이가 없다.
+        assert!(db.diff("feature", "main").unwrap().is_empty());
     }
 }

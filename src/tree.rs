@@ -163,6 +163,78 @@ pub fn remove(tree: &Tree, key: &[u8]) -> Tree {
     }
 }
 
+/// `a`에서 `b`로 갈 때 한 키에 일어난 변화.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Change {
+    /// `b`에만 있는 키.
+    Added { key: Key, value: Value },
+    /// `a`에만 있는 키.
+    Removed { key: Key },
+    /// 양쪽에 있지만 값이 다른 키.
+    Modified { key: Key, old: Value, new: Value },
+}
+
+/// 트리를 키 순서대로 (키, 값) 목록으로 펼친다(중위 순회). BST의 중위 순회는
+/// 항상 정렬된 순서를 준다 — `diff`가 이걸 활용한다.
+pub fn entries(tree: &Tree) -> Vec<(Key, Value)> {
+    fn go(node: &Tree, out: &mut Vec<(Key, Value)>) {
+        if let Some(n) = node {
+            go(&n.left, out);
+            out.push((n.key.clone(), n.value.clone()));
+            go(&n.right, out);
+        }
+    }
+    let mut out = Vec::new();
+    go(tree, &mut out);
+    out
+}
+
+/// 두 트리의 차이를 키 순서로 반환한다. `a`에서 `b`로 갈 때의 변화다.
+///
+/// 양쪽을 정렬된 목록으로 펼친 뒤 두 포인터로 한 번에 훑는다(병합 비교) — O(n).
+pub fn diff(a: &Tree, b: &Tree) -> Vec<Change> {
+    let (ea, eb) = (entries(a), entries(b));
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+
+    while i < ea.len() && j < eb.len() {
+        match ea[i].0.cmp(&eb[j].0) {
+            // a에만 있는 키 -> 삭제됨.
+            Ordering::Less => {
+                out.push(Change::Removed { key: ea[i].0.clone() });
+                i += 1;
+            }
+            // b에만 있는 키 -> 추가됨.
+            Ordering::Greater => {
+                out.push(Change::Added { key: eb[j].0.clone(), value: eb[j].1.clone() });
+                j += 1;
+            }
+            // 같은 키 -> 값이 다르면 수정됨.
+            Ordering::Equal => {
+                if ea[i].1 != eb[j].1 {
+                    out.push(Change::Modified {
+                        key: ea[i].0.clone(),
+                        old: ea[i].1.clone(),
+                        new: eb[j].1.clone(),
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    // 남은 꼬리: a 쪽은 전부 삭제, b 쪽은 전부 추가.
+    while i < ea.len() {
+        out.push(Change::Removed { key: ea[i].0.clone() });
+        i += 1;
+    }
+    while j < eb.len() {
+        out.push(Change::Added { key: eb[j].0.clone(), value: eb[j].1.clone() });
+        j += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +292,31 @@ mod tests {
         for key in ["c", "p", "e", "n", "z"] {
             assert_eq!(get(&t, key.as_bytes()), Some(key.as_bytes()));
         }
+    }
+
+    #[test]
+    fn diff_reports_added_removed_modified() {
+        // a: {a=1, b=2, c=3}
+        let a = insert(&insert(&insert(&empty(), k("a"), k("1")), k("b"), k("2")), k("c"), k("3"));
+        // b: {a=1, b=9, d=4}  (b 수정, c 삭제, d 추가)
+        let b = insert(&insert(&insert(&empty(), k("a"), k("1")), k("b"), k("9")), k("d"), k("4"));
+
+        let changes = diff(&a, &b);
+        assert_eq!(
+            changes,
+            vec![
+                Change::Modified { key: k("b"), old: k("2"), new: k("9") },
+                Change::Removed { key: k("c") },
+                Change::Added { key: k("d"), value: k("4") },
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_of_identical_trees_is_empty() {
+        let a = insert(&insert(&empty(), k("x"), k("1")), k("y"), k("2"));
+        let b = insert(&insert(&empty(), k("x"), k("1")), k("y"), k("2"));
+        assert!(diff(&a, &b).is_empty());
     }
 
     #[test]
