@@ -167,6 +167,19 @@ impl BranchDB {
         self.branches.insert(into.to_string(), into_tree);
         Ok(())
     }
+
+    /// DB 전체를 한 파일로 저장한다. 여러 브랜치가 공유하는 노드는 디스크에도
+    /// 한 번만 기록된다 — 메모리의 구조 공유가 그대로 이어진다.
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        crate::store::save(&self.branches, path)
+    }
+
+    /// 파일에서 DB를 읽어 복원한다. 저장 전의 브랜치들과 공유 구조가 되살아난다.
+    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        Ok(BranchDB {
+            branches: crate::store::load(path)?,
+        })
+    }
 }
 
 impl Default for BranchDB {
@@ -265,5 +278,59 @@ mod tests {
         assert_eq!(db.get("main", b"b").unwrap(), Some(&b"new"[..]));
         // 병합 후 두 브랜치는 더 이상 차이가 없다.
         assert!(db.diff("feature", "main").unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_and_open_round_trips() {
+        let path = std::env::temp_dir().join("branchdb_roundtrip.db");
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = BranchDB::new();
+        db.put("main", b("user:1"), b("alice")).unwrap();
+        db.fork("main", "exp").unwrap();
+        db.put("exp", b("user:1"), b("bob")).unwrap();
+        db.put("exp", b("note"), b("hi")).unwrap();
+        db.save(&path).unwrap();
+
+        // 다시 열면 브랜치·값·격리가 그대로 복원된다.
+        let loaded = BranchDB::open(&path).unwrap();
+        assert_eq!(loaded.get("main", b"user:1").unwrap(), Some(&b"alice"[..]));
+        assert_eq!(loaded.get("exp", b"user:1").unwrap(), Some(&b"bob"[..]));
+        assert_eq!(loaded.get("exp", b"note").unwrap(), Some(&b"hi"[..]));
+        assert_eq!(loaded.branch_names(), vec!["exp", "main"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shared_nodes_are_stored_once() {
+        let one = std::env::temp_dir().join("branchdb_dedup_one.db");
+        let many = std::env::temp_dir().join("branchdb_dedup_many.db");
+        let _ = std::fs::remove_file(&one);
+        let _ = std::fs::remove_file(&many);
+
+        let mut base = BranchDB::new();
+        for kv in ["a", "b", "c", "d", "e"] {
+            base.put("main", b(kv), b(kv)).unwrap();
+        }
+        base.save(&one).unwrap();
+        let size_one = std::fs::metadata(&one).unwrap().len();
+
+        // 같은 트리를 100번 포크(분기 없음). 디스크에서 트리는 한 번만 저장돼야 한다.
+        for i in 0..100 {
+            base.fork("main", &format!("f{i}")).unwrap();
+        }
+        base.save(&many).unwrap();
+        let size_many = std::fs::metadata(&many).unwrap().len();
+
+        // 늘어난 건 브랜치 테이블 항목 100개(각 수십 바이트)뿐이어야 한다.
+        // 트리가 복제됐다면 크기가 100배로 불어났을 것이다.
+        assert!(
+            size_many - size_one < 100 * 64,
+            "공유 노드가 중복 저장된 듯하다: {size_one} -> {size_many}"
+        );
+
+        let _ = std::fs::remove_file(&one);
+        let _ = std::fs::remove_file(&many);
     }
 }

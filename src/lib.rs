@@ -9,9 +9,11 @@
 //!
 //! 계층 구조(아래에서 위로):
 //! - [`tree`]: 영속 불변 트리 (엔진).
-//! - [`db`]: `fork` / `put` / `get` / `delete`를 노출하는 브랜치 관리자 ([`db::BranchDB`]).
+//! - [`store`]: 오프셋 주소 기반 디스크 저장/복원 (공유 노드는 한 번만 기록).
+//! - [`db`]: `fork` / `put` / `get` / `delete` / `save` / `open`을 노출하는 브랜치 관리자 ([`db::BranchDB`]).
 
 pub mod db;
+pub mod store;
 pub mod tree;
 
 pub use db::{BranchDB, Error};

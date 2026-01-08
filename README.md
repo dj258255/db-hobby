@@ -43,10 +43,18 @@ assert_eq!(db.get("main",  b"user:1")?, Some(&b"alice"[..])); // untouched
 assert_eq!(db.get("try-7", b"user:1")?, Some(&b"bob"[..]));   // diverged
 ```
 
-Run the demo and the tests:
+Persist to disk and reopen — shared nodes are written once:
+
+```rust
+db.save("agent.db")?;
+let restored = branchdb::BranchDB::open("agent.db")?;
+```
+
+Run the demos and the tests:
 
 ```sh
 cargo run --example demo
+cargo run --example persistence
 cargo test
 ```
 
@@ -67,13 +75,13 @@ an untouched subtree is asserted to be the *same allocation* in both versions vi
 ## Status
 
 Working: persistent tree (`insert` / `get` / `remove` / `diff`), the `BranchDB`
-API (`fork` / `put` / `get` / `delete` / `diff` / `merge`), and tests that prove
-structural sharing.
+API (`fork` / `put` / `get` / `delete` / `diff` / `merge`), on-disk persistence
+(`save` / `open`) where shared nodes are stored once, and tests that prove
+structural sharing — in memory and on disk.
 
 Planned: 3-way `merge` using a common ancestor (current merge is a simple
-source-wins union), on-disk content-addressed storage, a balanced (AVL) tree to
-replace the current worst-case O(n), and Python/JS bindings so agent runtimes
-can use it directly.
+source-wins union), a balanced (AVL) tree to replace the current worst-case
+O(n), and Python/JS bindings so agent runtimes can use it directly.
 
 ## License
 
