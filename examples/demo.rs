@@ -3,10 +3,25 @@
 //!
 //! 실행:  cargo run --example demo
 
+use branchdb::tree::Change;
 use branchdb::BranchDB;
 
 fn b(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn fmt_change(c: &Change) -> String {
+    match c {
+        Change::Added { key, value } => format!("+ {} = {}", text(key), text(value)),
+        Change::Removed { key } => format!("- {}", text(key)),
+        Change::Modified { key, old, new } => {
+            format!("~ {} : {} -> {}", text(key), text(old), text(new))
+        }
+    }
 }
 
 fn show(db: &BranchDB, branch: &str, key: &str) {
@@ -44,7 +59,7 @@ fn main() {
     // 에이전트 루프의 마지막 단계: 비교하고, 좋으면 채택한다.
     println!("\n[diff] main 대비 try-7이 바꾼 것:");
     for change in db.diff("main", "try-7").unwrap() {
-        println!("  {change:?}");
+        println!("  {}", fmt_change(&change));
     }
 
     db.merge("try-7", "main").unwrap(); // 좋은 갈래를 채택
