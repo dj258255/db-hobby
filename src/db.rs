@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::tree::{self, Key, Tree, Value};
+use crate::tree::{self, Change, Key, Tree, Value};
 
 /// 새 `BranchDB`가 만들어질 때 기본으로 생기는 브랜치 이름.
 pub const DEFAULT_BRANCH: &str = "main";
@@ -37,14 +37,20 @@ impl std::error::Error for Error {}
 /// 늘어난다 — 공유되는 노드는 한 번만 저장된다.
 pub struct BranchDB {
     branches: HashMap<String, Tree>,
+    /// 각 브랜치가 갈라져 나온 시점의 루트(공통 조상). 3-way merge가 "이 브랜치가
+    /// 조상 대비 무엇을 바꿨나"를 계산하는 데 쓴다. 영속 트리라 조상 버전이 메모리에
+    /// 그대로 살아있어 추가 비용이 거의 없다.
+    bases: HashMap<String, Tree>,
 }
 
 impl BranchDB {
     /// 빈 `main` 브랜치 하나를 가진 새 DB를 만든다.
     pub fn new() -> Self {
         let mut branches = HashMap::new();
+        let mut bases = HashMap::new();
         branches.insert(DEFAULT_BRANCH.to_string(), tree::empty());
-        BranchDB { branches }
+        bases.insert(DEFAULT_BRANCH.to_string(), tree::empty());
+        BranchDB { branches, bases }
     }
 
     /// 현재 존재하는 브랜치 이름들. (정렬해서 결정적인 순서로 돌려준다.)
@@ -60,6 +66,7 @@ impl BranchDB {
             return Err(Error::BranchExists(name.to_string()));
         }
         self.branches.insert(name.to_string(), tree::empty());
+        self.bases.insert(name.to_string(), tree::empty());
         Ok(())
     }
 
@@ -77,7 +84,8 @@ impl BranchDB {
         if self.branches.contains_key(to) {
             return Err(Error::BranchExists(to.to_string()));
         }
-        self.branches.insert(to.to_string(), root);
+        self.branches.insert(to.to_string(), root.clone());
+        self.bases.insert(to.to_string(), root); // 포크 시점 = to의 공통 조상
         Ok(())
     }
 
@@ -116,10 +124,13 @@ impl BranchDB {
     /// 브랜치를 통째로 버린다. 공유되던 노드 중 아무도 안 가리키게 된 것만
     /// 실제로 해제된다(`Arc`가 알아서 정리한다).
     pub fn drop_branch(&mut self, name: &str) -> Result<(), Error> {
-        self.branches
-            .remove(name)
-            .map(|_| ())
-            .ok_or_else(|| Error::NoSuchBranch(name.to_string()))
+        let existed = self.branches.remove(name).is_some();
+        self.bases.remove(name);
+        if existed {
+            Ok(())
+        } else {
+            Err(Error::NoSuchBranch(name.to_string()))
+        }
     }
 
     /// 한 브랜치의 모든 키-값을 키 순서로 돌려준다.
@@ -145,24 +156,36 @@ impl BranchDB {
         Ok(tree::diff(ta, tb))
     }
 
-    /// `from` 브랜치의 모든 키-값을 `into` 브랜치에 적용한다(충돌 시 from이 이긴다).
+    /// `from` 브랜치가 갈라진 뒤 바꾼 것만 `into` 브랜치에 적용한다(3-way merge).
     /// 에이전트가 "좋은 갈래를 main에 채택"하는 연산이다.
     ///
-    /// 단순 합집합 병합이다 — `from`에서 *삭제된* 키는 전파하지 않는다. 공통 조상을
-    /// 이용한 3-way 병합(삭제까지 반영)은 다음 단계로 남겨둔다.
+    /// `from`의 공통 조상(포크 시점)과 현재를 `diff`해서 추가·수정·**삭제**를 가려낸
+    /// 뒤, 그 변화만 `into`에 적용한다. 그래서 `from`에서 지운 키는 `into`에서도
+    /// 지워진다 — 단순 합집합 병합과 달리 삭제가 전파된다.
+    ///
+    /// 조상은 `from`이 포크된 시점을 쓴다. 따라서 "main에서 갈라져 작업하고 main에
+    /// 되돌려 합치는" 흐름에 맞춰져 있다. (디스크에서 불러온 브랜치는 포크 이력을
+    /// 모르므로 조상이 빈 트리가 되어 사실상 합집합처럼 동작한다.)
     pub fn merge(&mut self, from: &str, into: &str) -> Result<(), Error> {
         let from_tree = self
             .branches
             .get(from)
             .ok_or_else(|| Error::NoSuchBranch(from.to_string()))?
             .clone();
+        let ancestor = self.bases.get(from).cloned().unwrap_or_else(tree::empty);
         let mut into_tree = self
             .branches
             .get(into)
             .ok_or_else(|| Error::NoSuchBranch(into.to_string()))?
             .clone();
-        for (key, value) in tree::entries(&from_tree) {
-            into_tree = tree::insert(&into_tree, key, value);
+
+        for change in tree::diff(&ancestor, &from_tree) {
+            into_tree = match change {
+                Change::Added { key, value } | Change::Modified { key, new: value, .. } => {
+                    tree::insert(&into_tree, key, value)
+                }
+                Change::Removed { key } => tree::remove(&into_tree, &key),
+            };
         }
         self.branches.insert(into.to_string(), into_tree);
         Ok(())
@@ -175,10 +198,13 @@ impl BranchDB {
     }
 
     /// 파일에서 DB를 읽어 복원한다. 저장 전의 브랜치들과 공유 구조가 되살아난다.
+    ///
+    /// 포크 이력(공통 조상)은 저장하지 않으므로, 불러온 브랜치들의 조상은 빈 트리로
+    /// 둔다. 따라서 불러온 직후의 `merge`는 3-way가 아니라 합집합처럼 동작한다.
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        Ok(BranchDB {
-            branches: crate::store::load(path)?,
-        })
+        let branches = crate::store::load(path)?;
+        let bases = branches.keys().map(|name| (name.clone(), tree::empty())).collect();
+        Ok(BranchDB { branches, bases })
     }
 }
 
@@ -278,6 +304,22 @@ mod tests {
         assert_eq!(db.get("main", b"b").unwrap(), Some(&b"new"[..]));
         // 병합 후 두 브랜치는 더 이상 차이가 없다.
         assert!(db.diff("feature", "main").unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_propagates_deletions() {
+        // 3-way merge: from에서 지운 키는 into에서도 지워져야 한다.
+        let mut db = BranchDB::new();
+        db.put("main", b("keep"), b("1")).unwrap();
+        db.put("main", b("doomed"), b("2")).unwrap();
+
+        db.fork("main", "cleanup").unwrap();
+        db.delete("cleanup", b"doomed").unwrap(); // 갈래에서 삭제
+
+        db.merge("cleanup", "main").unwrap();
+
+        assert_eq!(db.get("main", b"keep").unwrap(), Some(&b"1"[..]));
+        assert_eq!(db.get("main", b"doomed").unwrap(), None); // 삭제가 main으로 전파됨
     }
 
     #[test]
