@@ -1,6 +1,6 @@
-target/
-.claude/
+build/
+*.o
+*.db
+a.out
 .DS_Store
-.venv/
-*.so
-agent.db
+.claude/

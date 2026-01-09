@@ -1,102 +1,47 @@
-# branchdb
+# minidb
 
-An embedded, branchable key-value store for AI agents — with O(1) branching.
+A relational database built from scratch in C — to dissect how PostgreSQL and
+MySQL actually work inside. Page storage, slotted pages, buffer pool, B-Tree,
+SQL parser, executor — one layer at a time.
 
-Fork the entire dataset in constant time and zero data copying, mutate one
-branch, and the others are untouched. The data lives in a persistent immutable
-tree whose branches share every unchanged node (structural sharing), the same
-idea Git uses to store commits.
+This is a learning project. The goal isn't to invent something new; it's to
+reproduce the real structure accurately and understand it.
 
-## Why
-
-AI agents explore: a coding agent tries several fixes at once, a tree-search
-agent keeps thousands of partial trajectories alive, a simulation forks
-timelines to compare outcomes. They all want the same thing — try many branches
-cheaply, keep the good ones, throw the rest away.
-
-Server databases like Neon already do copy-on-write branching, but they cap
-active branches (Neon at ~20) and pay a network round trip per request. branchdb
-takes the embedded path: a library inside the agent's process, no server, no
-network, and a single process that owns thousands of branches with no
-coordination cost.
-
-This is a learning-first project built in the open. Expect dead ends and wrong
-turns to stay in the history.
-
-## Quick start
-
-```rust
-use branchdb::BranchDB;
-
-let mut db = BranchDB::new();
-db.put("main", b"user:1".to_vec(), b"alice".to_vec())?;
-
-// Fork 1000 branches off main — each is O(1), zero data copied.
-for i in 0..1000 {
-    db.fork("main", &format!("try-{i}"))?;
-}
-
-// Mutate exactly one branch.
-db.put("try-7", b"user:1".to_vec(), b"bob".to_vec())?;
-
-assert_eq!(db.get("main",  b"user:1")?, Some(&b"alice"[..])); // untouched
-assert_eq!(db.get("try-7", b"user:1")?, Some(&b"bob"[..]));   // diverged
-```
-
-Persist to disk and reopen — shared nodes are written once:
-
-```rust
-db.save("agent.db")?;
-let restored = branchdb::BranchDB::open("agent.db")?;
-```
-
-Run the demos and the tests:
+## Build & test
 
 ```sh
-cargo run --example demo
-cargo run --example persistence
-cargo test
+make test    # builds and runs the test suite
+make clean
 ```
 
-## How it works
+## Where things are
 
-A branch is just a pointer to the root of a persistent tree (`Option<Arc<Node>>`).
-
-- **Fork** clones the root `Arc` — O(1), copies no data. Both branches now share
-  every node until one of them is written to.
-- **Insert / remove** rebuild only the nodes on the path from the root to the
-  change (path copying, O(log n) new nodes) and share every subtree they don't
-  descend into. The old version stays valid; that is what makes branching free.
-- The tree is **AVL-balanced**, so it stays O(log n) even under sorted inserts.
-  Rotations are copy-on-write too — they rebuild a few nodes and share the rest.
-
-The `structural_sharing_is_real` test proves it: after inserting into one side,
-an untouched subtree is asserted to be the *same allocation* in both versions via
-`Arc::ptr_eq`.
+- `DESIGN.md` — the full layer map (parser → executor → catalog → storage) and build order.
+- `src/pager.c` — layer 1: the disk manager (fixed-size pages ↔ a single file).
 
 ## Status
 
-Working: AVL-balanced persistent tree (`insert` / `get` / `remove` / `diff`),
-the `BranchDB` API (`fork` / `put` / `get` / `delete` / `diff` / 3-way `merge`),
-on-disk persistence (`save` / `open`) where shared nodes are stored once,
-[Python bindings](bindings/python) (PyO3), a fork-vs-copy benchmark, and tests
-that prove structural sharing — in memory and on disk.
+Building bottom-up:
 
-Planned: JS/WASM bindings, and incremental on-disk appends (today `save` writes a
-full snapshot).
+1. **Pager / disk manager** — in progress
+2. Slotted page
+3. Buffer pool
+4. Heap file
+5. Catalog
+6. SQL parser
+7. Executor
+8. B-Tree index
+9. WAL / transactions
 
-## Python
+Goal:
 
-```sh
-cd bindings/python && pip install maturin && maturin develop
+```sql
+CREATE TABLE users (id INT, name TEXT);
+INSERT INTO users VALUES (1, 'kim');
+SELECT * FROM users WHERE id = 1;
 ```
 
-```python
-from branchdb import BranchDB
-db = BranchDB()
-db.put("main", b"k", b"v")
-db.fork("main", "exp")        # O(1)
-```
+stored in a single file that survives a restart.
 
 ## License
 
