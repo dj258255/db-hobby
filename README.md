@@ -67,6 +67,8 @@ A branch is just a pointer to the root of a persistent tree (`Option<Arc<Node>>`
 - **Insert / remove** rebuild only the nodes on the path from the root to the
   change (path copying, O(log n) new nodes) and share every subtree they don't
   descend into. The old version stays valid; that is what makes branching free.
+- The tree is **AVL-balanced**, so it stays O(log n) even under sorted inserts.
+  Rotations are copy-on-write too — they rebuild a few nodes and share the rest.
 
 The `structural_sharing_is_real` test proves it: after inserting into one side,
 an untouched subtree is asserted to be the *same allocation* in both versions via
@@ -79,9 +81,8 @@ API (`fork` / `put` / `get` / `delete` / `diff` / `merge`), on-disk persistence
 (`save` / `open`) where shared nodes are stored once, and tests that prove
 structural sharing — in memory and on disk.
 
-Planned: 3-way `merge` using a common ancestor (current merge is a simple
-source-wins union), a balanced (AVL) tree to replace the current worst-case
-O(n), and Python/JS bindings so agent runtimes can use it directly.
+Planned: Python/JS bindings so agent runtimes can use it directly, and a
+benchmark that pits O(1) forking against full-copy cloning.
 
 ## License
 

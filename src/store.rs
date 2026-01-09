@@ -160,7 +160,9 @@ fn read_node(data: &[u8], offset: u64, cache: &mut HashMap<u64, Arc<Node>>) -> i
         Some(off) => Some(read_node(data, off, cache)?),
     };
 
-    let node = Arc::new(Node { key, value, left, right });
+    // height는 디스크에 저장하지 않으므로 자식에서 다시 계산한다.
+    let height = 1 + crate::tree::height(&left).max(crate::tree::height(&right));
+    let node = Arc::new(Node { key, value, left, right, height });
     cache.insert(offset, node.clone());
     Ok(node)
 }
