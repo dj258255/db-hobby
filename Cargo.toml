@@ -14,3 +14,8 @@ name = "demo"
 path = "examples/demo.rs"
 
 [dependencies]
+
+# Python 바인딩은 무거운 의존성(pyo3)을 쓰므로 별도 크레이트로 분리해, 코어의
+# "의존성 0"과 일반 `cargo test`를 그대로 유지한다.
+[workspace]
+exclude = ["bindings/python"]

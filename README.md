@@ -76,13 +76,27 @@ an untouched subtree is asserted to be the *same allocation* in both versions vi
 
 ## Status
 
-Working: persistent tree (`insert` / `get` / `remove` / `diff`), the `BranchDB`
-API (`fork` / `put` / `get` / `delete` / `diff` / `merge`), on-disk persistence
-(`save` / `open`) where shared nodes are stored once, and tests that prove
-structural sharing — in memory and on disk.
+Working: AVL-balanced persistent tree (`insert` / `get` / `remove` / `diff`),
+the `BranchDB` API (`fork` / `put` / `get` / `delete` / `diff` / 3-way `merge`),
+on-disk persistence (`save` / `open`) where shared nodes are stored once,
+[Python bindings](bindings/python) (PyO3), a fork-vs-copy benchmark, and tests
+that prove structural sharing — in memory and on disk.
 
-Planned: Python/JS bindings so agent runtimes can use it directly, and a
-benchmark that pits O(1) forking against full-copy cloning.
+Planned: JS/WASM bindings, and incremental on-disk appends (today `save` writes a
+full snapshot).
+
+## Python
+
+```sh
+cd bindings/python && pip install maturin && maturin develop
+```
+
+```python
+from branchdb import BranchDB
+db = BranchDB()
+db.put("main", b"k", b"v")
+db.fork("main", "exp")        # O(1)
+```
 
 ## License
 

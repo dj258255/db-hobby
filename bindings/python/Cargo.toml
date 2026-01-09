@@ -1,0 +1,15 @@
+[package]
+name = "branchdb-python"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for branchdb, an embedded branchable key-value store."
+license = "MIT"
+
+[lib]
+# 파이썬에서 import 할 모듈 이름.
+name = "branchdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+branchdb = { path = "../.." }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
