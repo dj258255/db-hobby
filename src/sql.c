@@ -1,0 +1,284 @@
+#include "sql.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h> /* strcasecmp */
+
+/* ───────────────────────── 토크나이저(lexer) ───────────────────────── */
+
+typedef enum {
+    TOK_EOF, TOK_IDENT, TOK_INT, TOK_STRING,
+    TOK_LPAREN, TOK_RPAREN, TOK_COMMA, TOK_STAR, TOK_EQ, TOK_SEMI,
+    TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
+    TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
+    TOK_ERROR
+} TokType;
+
+typedef struct {
+    TokType type;
+    char text[SQL_TEXT_LEN];
+    long int_val;
+} Token;
+
+typedef struct {
+    const char *src;
+    size_t pos;
+} Lexer;
+
+static TokType keyword_of(const char *s) {
+    if (!strcasecmp(s, "CREATE")) return TOK_CREATE;
+    if (!strcasecmp(s, "TABLE")) return TOK_TABLE;
+    if (!strcasecmp(s, "INSERT")) return TOK_INSERT;
+    if (!strcasecmp(s, "INTO")) return TOK_INTO;
+    if (!strcasecmp(s, "VALUES")) return TOK_VALUES;
+    if (!strcasecmp(s, "SELECT")) return TOK_SELECT;
+    if (!strcasecmp(s, "FROM")) return TOK_FROM;
+    if (!strcasecmp(s, "WHERE")) return TOK_WHERE;
+    if (!strcasecmp(s, "INT")) return TOK_INT_TYPE;
+    if (!strcasecmp(s, "TEXT")) return TOK_TEXT_TYPE;
+    return TOK_IDENT;
+}
+
+static Token lex_next(Lexer *lx) {
+    Token t;
+    memset(&t, 0, sizeof(t));
+
+    while (lx->src[lx->pos] && isspace((unsigned char)lx->src[lx->pos])) {
+        lx->pos++;
+    }
+    char c = lx->src[lx->pos];
+    if (c == '\0') {
+        t.type = TOK_EOF;
+        return t;
+    }
+
+    switch (c) {
+        case '(': lx->pos++; t.type = TOK_LPAREN; return t;
+        case ')': lx->pos++; t.type = TOK_RPAREN; return t;
+        case ',': lx->pos++; t.type = TOK_COMMA; return t;
+        case '*': lx->pos++; t.type = TOK_STAR; return t;
+        case '=': lx->pos++; t.type = TOK_EQ; return t;
+        case ';': lx->pos++; t.type = TOK_SEMI; return t;
+        default: break;
+    }
+
+    /* 'string literal' */
+    if (c == '\'') {
+        lx->pos++;
+        size_t n = 0;
+        while (lx->src[lx->pos] && lx->src[lx->pos] != '\'') {
+            if (n < SQL_TEXT_LEN - 1) {
+                t.text[n++] = lx->src[lx->pos];
+            }
+            lx->pos++;
+        }
+        if (lx->src[lx->pos] != '\'') {
+            t.type = TOK_ERROR; /* 닫는 따옴표 없음 */
+            return t;
+        }
+        lx->pos++;
+        t.text[n] = '\0';
+        t.type = TOK_STRING;
+        return t;
+    }
+
+    /* 정수 (앞에 - 가능) */
+    if (isdigit((unsigned char)c) ||
+        (c == '-' && isdigit((unsigned char)lx->src[lx->pos + 1]))) {
+        size_t start = lx->pos;
+        if (c == '-') {
+            lx->pos++;
+        }
+        while (isdigit((unsigned char)lx->src[lx->pos])) {
+            lx->pos++;
+        }
+        char buf[64];
+        size_t len = lx->pos - start;
+        if (len >= sizeof(buf)) {
+            len = sizeof(buf) - 1;
+        }
+        memcpy(buf, lx->src + start, len);
+        buf[len] = '\0';
+        t.int_val = strtol(buf, NULL, 10);
+        t.type = TOK_INT;
+        return t;
+    }
+
+    /* 식별자 / 키워드 */
+    if (isalpha((unsigned char)c) || c == '_') {
+        size_t n = 0;
+        while (isalnum((unsigned char)lx->src[lx->pos]) || lx->src[lx->pos] == '_') {
+            if (n < SQL_NAME_LEN - 1) {
+                t.text[n++] = lx->src[lx->pos];
+            }
+            lx->pos++;
+        }
+        t.text[n] = '\0';
+        t.type = keyword_of(t.text);
+        return t;
+    }
+
+    t.type = TOK_ERROR;
+    return t;
+}
+
+/* ───────────────────────── 파서(recursive descent) ───────────────────────── */
+
+typedef struct {
+    Lexer lex;
+    Token cur;
+    int ok;
+    char err[128];
+} Parser;
+
+static void p_fail(Parser *p, const char *msg) {
+    if (p->ok) {
+        p->ok = 0;
+        snprintf(p->err, sizeof(p->err), "%s", msg);
+    }
+}
+
+static void p_advance(Parser *p) {
+    p->cur = lex_next(&p->lex);
+    if (p->cur.type == TOK_ERROR) {
+        p_fail(p, "토큰을 해석할 수 없습니다");
+    }
+}
+
+static int p_accept(Parser *p, TokType t) {
+    if (p->cur.type == t) {
+        p_advance(p);
+        return 1;
+    }
+    return 0;
+}
+
+static void p_expect(Parser *p, TokType t, const char *what) {
+    if (!p_accept(p, t)) {
+        p_fail(p, what);
+    }
+}
+
+static void parse_name(Parser *p, char *out) {
+    if (p->cur.type == TOK_IDENT) {
+        snprintf(out, SQL_NAME_LEN, "%s", p->cur.text);
+        p_advance(p);
+    } else {
+        p_fail(p, "이름(식별자)이 필요합니다");
+    }
+}
+
+static void parse_value(Parser *p, Value *v) {
+    if (p->cur.type == TOK_INT) {
+        v->type = VAL_INT;
+        v->int_val = p->cur.int_val;
+        p_advance(p);
+    } else if (p->cur.type == TOK_STRING) {
+        v->type = VAL_TEXT;
+        snprintf(v->text_val, SQL_TEXT_LEN, "%s", p->cur.text);
+        p_advance(p);
+    } else {
+        p_fail(p, "값(정수 또는 '문자열')이 필요합니다");
+    }
+}
+
+static void parse_create(Parser *p, Statement *st) {
+    st->type = STMT_CREATE;
+    CreateStmt *c = &st->create;
+    c->num_columns = 0;
+    p_expect(p, TOK_TABLE, "CREATE 다음에 TABLE이 필요합니다");
+    parse_name(p, c->table);
+    p_expect(p, TOK_LPAREN, "( 가 필요합니다");
+    while (p->ok && p->cur.type != TOK_RPAREN) {
+        if (c->num_columns >= SQL_MAX_COLS) {
+            p_fail(p, "컬럼이 너무 많습니다");
+            break;
+        }
+        ColumnDef *col = &c->columns[c->num_columns];
+        parse_name(p, col->name);
+        if (p_accept(p, TOK_INT_TYPE)) {
+            col->type = COL_INT;
+        } else if (p_accept(p, TOK_TEXT_TYPE)) {
+            col->type = COL_TEXT;
+        } else {
+            p_fail(p, "컬럼 타입(INT 또는 TEXT)이 필요합니다");
+            break;
+        }
+        c->num_columns++;
+        if (!p_accept(p, TOK_COMMA)) {
+            break;
+        }
+    }
+    p_expect(p, TOK_RPAREN, ") 가 필요합니다");
+}
+
+static void parse_insert(Parser *p, Statement *st) {
+    st->type = STMT_INSERT;
+    InsertStmt *in = &st->insert;
+    in->num_values = 0;
+    p_expect(p, TOK_INTO, "INSERT 다음에 INTO가 필요합니다");
+    parse_name(p, in->table);
+    p_expect(p, TOK_VALUES, "VALUES가 필요합니다");
+    p_expect(p, TOK_LPAREN, "( 가 필요합니다");
+    while (p->ok && p->cur.type != TOK_RPAREN) {
+        if (in->num_values >= SQL_MAX_COLS) {
+            p_fail(p, "값이 너무 많습니다");
+            break;
+        }
+        parse_value(p, &in->values[in->num_values]);
+        in->num_values++;
+        if (!p_accept(p, TOK_COMMA)) {
+            break;
+        }
+    }
+    p_expect(p, TOK_RPAREN, ") 가 필요합니다");
+}
+
+static void parse_select(Parser *p, Statement *st) {
+    st->type = STMT_SELECT;
+    SelectStmt *s = &st->select;
+    s->has_where = 0;
+    p_expect(p, TOK_STAR, "지금은 SELECT * 만 지원합니다");
+    p_expect(p, TOK_FROM, "FROM이 필요합니다");
+    parse_name(p, s->table);
+    if (p_accept(p, TOK_WHERE)) {
+        s->has_where = 1;
+        parse_name(p, s->where_col);
+        p_expect(p, TOK_EQ, "= 가 필요합니다");
+        parse_value(p, &s->where_val);
+    }
+}
+
+int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
+    Parser p;
+    memset(&p, 0, sizeof(p));
+    p.lex.src = sql;
+    p.lex.pos = 0;
+    p.ok = 1;
+    p_advance(&p); /* 첫 토큰 준비 */
+
+    memset(out, 0, sizeof(*out));
+    switch (p.cur.type) {
+        case TOK_CREATE: p_advance(&p); parse_create(&p, out); break;
+        case TOK_INSERT: p_advance(&p); parse_insert(&p, out); break;
+        case TOK_SELECT: p_advance(&p); parse_select(&p, out); break;
+        default: p_fail(&p, "CREATE / INSERT / SELECT 로 시작해야 합니다"); break;
+    }
+
+    if (p.ok) {
+        p_accept(&p, TOK_SEMI); /* 끝의 ; 는 선택 */
+        if (p.cur.type != TOK_EOF) {
+            p_fail(&p, "문장 끝에 예상치 못한 토큰이 있습니다");
+        }
+    }
+
+    if (!p.ok) {
+        if (errbuf && errlen) {
+            snprintf(errbuf, errlen, "%s", p.err);
+        }
+        return -1;
+    }
+    return 0;
+}
