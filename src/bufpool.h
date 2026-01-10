@@ -1,0 +1,47 @@
+#ifndef MINIDB_BUFPOOL_H
+#define MINIDB_BUFPOOL_H
+
+#include <stddef.h>
+#include "pager.h"
+
+/*
+ * Buffer Pool — 페이지를 메모리에 캐시한다. (InnoDB buffer pool, PostgreSQL
+ * shared buffers와 같은 역할.)
+ *
+ * 고정 개수의 "프레임"에 페이지를 담는다. 페이지를 요청하면:
+ *   - 풀에 있으면(cache hit) 그대로 돌려준다.
+ *   - 없으면(miss) 디스크에서 읽어 빈 프레임에 올린다. 빈 프레임이 없으면
+ *     LRU victim을 골라 쫓아낸다(쫓겨나는 페이지가 dirty면 먼저 디스크로 flush).
+ *
+ * 세 가지 안전장치:
+ *   - pin count: 쓰는 중인 페이지(pin>0)는 절대 쫓아내지 않는다.
+ *   - dirty:     메모리에서 수정된 페이지는 쫓겨나기/flush 시 디스크에 반영된다.
+ *   - LRU:       victim은 가장 오래 안 쓴 unpinned 프레임.
+ */
+
+typedef struct BufferPool BufferPool;
+
+/* 페이저 위에 num_frames개 프레임을 가진 버퍼 풀을 만든다. 실패 시 NULL. */
+BufferPool *bufpool_create(Pager *pager, size_t num_frames);
+
+/* 모든 dirty 페이지를 flush하고 풀을 해제한다. */
+void bufpool_destroy(BufferPool *bp);
+
+/* 페이지를 가져온다(없으면 로드, 꽉 차면 victim 교체). 반환 포인터는 unpin 전까지
+ * 유효하다. 모든 프레임이 pin되어 자리가 없으면 NULL. */
+void *bufpool_fetch(BufferPool *bp, page_id_t page_id);
+
+/* 새 페이지를 디스크에 할당하고 풀에 올려 돌려준다. page_id_out에 새 id. 실패 NULL. */
+void *bufpool_new_page(BufferPool *bp, page_id_t *page_id_out);
+
+/* 페이지 사용을 마쳤다고 표시한다(pin 감소). 수정했으면 is_dirty=1. */
+void bufpool_unpin(BufferPool *bp, page_id_t page_id, int is_dirty);
+
+/* 모든 dirty 페이지를 디스크에 쓴다. 성공 0, 실패 -1. */
+int bufpool_flush_all(BufferPool *bp);
+
+/* 통계 (시연·테스트용). */
+size_t bufpool_hits(const BufferPool *bp);
+size_t bufpool_misses(const BufferPool *bp);
+
+#endif /* MINIDB_BUFPOOL_H */

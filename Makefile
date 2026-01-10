@@ -3,10 +3,10 @@ CFLAGS ?= -std=c11 -Wall -Wextra -g
 BUILD := build
 
 # 핵심 소스 (계층이 늘면 여기에 추가)
-SRCS := src/pager.c src/page.c
+SRCS := src/pager.c src/page.c src/bufpool.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page
+TESTS := test_pager test_page test_bufpool
 
 .PHONY: test clean
 
