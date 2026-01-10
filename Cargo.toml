@@ -1,0 +1,16 @@
+[package]
+name = "branchdb"
+version = "0.1.0"
+edition = "2021"
+description = "An embedded, branchable key-value store for AI agents. O(1) copy-on-write branching via a persistent immutable tree."
+license = "MIT"
+
+[lib]
+name = "branchdb"
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[dependencies]
