@@ -4,7 +4,6 @@
 #include <string.h>
 
 /* ───────────── tuple codec: 값 ↔ 바이트 ─────────────
- * 한 행을 스키마 순서대로 인코딩한다.
  *   INT  : 4바이트 (int32)
  *   TEXT : 2바이트 길이 + 바이트열
  */
@@ -12,19 +11,19 @@
 static int encode_row(const CreateStmt *schema, const Value *vals, int nvals,
                       uint8_t *buf, uint16_t *out_len) {
     if (nvals != schema->num_columns) {
-        return -1; /* 값 개수가 컬럼 수와 다름 */
+        return -1;
     }
     uint16_t off = 0;
     for (int i = 0; i < schema->num_columns; i++) {
         const Value *v = &vals[i];
         if (schema->columns[i].type == COL_INT) {
             if (v->type != VAL_INT) {
-                return -1; /* 타입 불일치 */
+                return -1;
             }
             int32_t x = (int32_t)v->int_val;
             memcpy(buf + off, &x, 4);
             off += 4;
-        } else { /* COL_TEXT */
+        } else {
             if (v->type != VAL_TEXT) {
                 return -1;
             }
@@ -60,6 +59,31 @@ static void decode_row(const CreateStmt *schema, const uint8_t *rec, Value *out)
     }
 }
 
+/* RID ↔ int64 (인덱스 값으로 저장하려고). slot < 65536 이므로 안전. */
+static int64_t rid_encode(RID r) {
+    return (int64_t)r.page_id * 65536 + r.slot;
+}
+static RID rid_decode(int64_t v) {
+    RID r;
+    r.page_id = (page_id_t)(v / 65536);
+    r.slot = (uint16_t)(v % 65536);
+    return r;
+}
+
+static void print_row(FILE *out, const CreateStmt *schema, const Value *row) {
+    for (int i = 0; i < schema->num_columns; i++) {
+        if (i) {
+            fprintf(out, " | ");
+        }
+        if (row[i].type == VAL_INT) {
+            fprintf(out, "%ld", row[i].int_val);
+        } else {
+            fprintf(out, "%s", row[i].text_val);
+        }
+    }
+    fprintf(out, "\n");
+}
+
 /* ───────────── 실행기 ───────────── */
 
 static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
@@ -69,7 +93,20 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
     }
     db->schema = *c;
     db->has_table = 1;
-    fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개)\n", c->table, c->num_columns);
+
+    /* 첫 컬럼이 INT면 그 컬럼을 PK로 보고 B+Tree 인덱스를 만든다 */
+    if (c->num_columns > 0 && c->columns[0].type == COL_INT) {
+        char idxpath[600];
+        snprintf(idxpath, sizeof(idxpath), "%s.idx", db->path);
+        if (btree_open(&db->index, idxpath) == 0) {
+            db->has_index = 1;
+        }
+    }
+    fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개%s)\n", c->table, c->num_columns,
+            db->has_index ? ", 인덱스 on " : "");
+    if (db->has_index) {
+        fprintf(out, "  (인덱스: %s)\n", db->schema.columns[0].name);
+    }
     return 0;
 }
 
@@ -89,6 +126,10 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
         fprintf(out, "ERROR: 삽입 실패 (행이 너무 큼?)\n");
         return -1;
     }
+    /* 인덱스에 (PK 값 → RID) 등록 */
+    if (db->has_index && in->values[0].type == VAL_INT) {
+        btree_insert(&db->index, in->values[0].int_val, rid_encode(rid));
+    }
     fprintf(out, "1개 행 삽입됨\n");
     return 0;
 }
@@ -100,7 +141,6 @@ typedef struct {
     int count;
 } SelectCtx;
 
-/* WHERE 절을 만족하는 행인가 */
 static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Value *row) {
     if (!sel->has_where) {
         return 1;
@@ -112,7 +152,7 @@ static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Va
         }
     }
     if (ci < 0) {
-        return 0; /* 없는 컬럼 → 매치 없음 */
+        return 0;
     }
     const Value *cell = &row[ci];
     const Value *wv = &sel->where_val;
@@ -134,17 +174,7 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     if (!match_where(ctx->schema, ctx->sel, row)) {
         return 0;
     }
-    for (int i = 0; i < ctx->schema->num_columns; i++) {
-        if (i) {
-            fprintf(ctx->out, " | ");
-        }
-        if (row[i].type == VAL_INT) {
-            fprintf(ctx->out, "%ld", row[i].int_val);
-        } else {
-            fprintf(ctx->out, "%s", row[i].text_val);
-        }
-    }
-    fprintf(ctx->out, "\n");
+    print_row(ctx->out, ctx->schema, row);
     ctx->count++;
     return 0;
 }
@@ -154,7 +184,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
         return -1;
     }
-    /* 헤더: 컬럼 이름 */
+    /* 헤더 */
     for (int i = 0; i < db->schema.num_columns; i++) {
         if (i) {
             fprintf(out, " | ");
@@ -163,9 +193,33 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     }
     fprintf(out, "\n");
 
-    SelectCtx ctx = {&db->schema, sel, out, 0};
-    heap_scan(&db->heap, select_visit, &ctx);
-    fprintf(out, "(%d행)\n", ctx.count);
+    db->used_index = 0;
+    int count = 0;
+
+    /* WHERE가 인덱스된 PK(첫 컬럼)에 대한 정수 비교면 → O(log n) 인덱스 조회 */
+    if (sel->has_where && db->has_index &&
+        strcmp(sel->where_col, db->schema.columns[0].name) == 0 &&
+        sel->where_val.type == VAL_INT) {
+        db->used_index = 1;
+        bval_t encoded;
+        if (btree_search(&db->index, sel->where_val.int_val, &encoded) == 0) {
+            uint8_t recbuf[PAGE_SIZE];
+            uint16_t len;
+            if (heap_get(&db->heap, rid_decode(encoded), recbuf, &len) == 0) {
+                Value row[SQL_MAX_COLS];
+                decode_row(&db->schema, recbuf, row);
+                print_row(out, &db->schema, row);
+                count++;
+            }
+        }
+    } else {
+        /* 그 외 → 풀 스캔 */
+        SelectCtx ctx = {&db->schema, sel, out, 0};
+        heap_scan(&db->heap, select_visit, &ctx);
+        count = ctx.count;
+    }
+
+    fprintf(out, "(%d행%s)\n", count, db->used_index ? ", 인덱스 사용" : "");
     return 0;
 }
 
@@ -182,13 +236,21 @@ int db_open(Database *db, const char *path) {
     }
     heap_init(&db->heap, db->bp, &db->pager);
     db->has_table = 0;
+    db->has_index = 0;
+    db->used_index = 0;
+    snprintf(db->path, sizeof(db->path), "%s", path);
     return 0;
 }
 
 void db_close(Database *db) {
+    if (db->has_index) {
+        btree_close(&db->index);
+        db->has_index = 0;
+    }
     if (db->bp) {
         bufpool_flush_all(db->bp);
         bufpool_destroy(db->bp);
+        db->bp = NULL;
     }
     pager_close(&db->pager);
 }

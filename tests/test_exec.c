@@ -29,7 +29,9 @@ static char *run(Database *db, const char *sql) {
 
 int main(void) {
     const char *path = "build/test_exec.db";
+    const char *idx = "build/test_exec.db.idx";
     unlink(path);
+    unlink(idx);
 
     Database db;
     db_open(&db, path);
@@ -51,17 +53,20 @@ int main(void) {
     o = run(&db, "SELECT * FROM users");
     CHECK(strstr(o, "kim") && strstr(o, "lee") && strstr(o, "park"), "SELECT * 가 모든 행 반환");
     CHECK(strstr(o, "(3행)") != NULL, "SELECT * 가 3행 보고");
+    CHECK(db.used_index == 0, "WHERE 없으면 풀 스캔");
     free(o);
 
-    /* WHERE 정수 */
+    /* WHERE 정수 (인덱스된 PK) → 인덱스 사용 */
     o = run(&db, "SELECT * FROM users WHERE id = 2");
     CHECK(strstr(o, "lee") && !strstr(o, "kim") && !strstr(o, "park"), "WHERE id=2 → lee만");
-    CHECK(strstr(o, "(1행)") != NULL, "WHERE 결과 1행");
+    CHECK(strstr(o, "1행") != NULL, "WHERE 결과 1행");
+    CHECK(db.used_index == 1, "WHERE id=2 는 인덱스 사용 (O(log n))");
     free(o);
 
-    /* WHERE 문자열 */
+    /* WHERE 문자열 (인덱스 안 된 컬럼) → 풀 스캔 */
     o = run(&db, "SELECT * FROM users WHERE name = 'park'");
     CHECK(strstr(o, "park") && strstr(o, "(1행)"), "WHERE name='park' → park");
+    CHECK(db.used_index == 0, "TEXT 컬럼 WHERE는 풀 스캔");
     free(o);
 
     /* 타입/개수 오류 */
@@ -81,6 +86,7 @@ int main(void) {
     db_close(&db2);
 
     unlink(path);
+    unlink(idx);
 
     if (failures == 0) {
         printf("\n전체 통과\n");
