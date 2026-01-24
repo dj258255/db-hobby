@@ -141,13 +141,15 @@ typedef struct {
     int count;
 } SelectCtx;
 
-static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Value *row) {
-    if (!sel->has_where) {
+/* WHERE <col> = <val> 한 조건을 한 행에 적용. WHERE가 없으면 항상 참. */
+static int row_matches(const CreateStmt *schema, int has_where, const char *wcol,
+                       const Value *wval, const Value *row) {
+    if (!has_where) {
         return 1;
     }
     int ci = -1;
     for (int i = 0; i < schema->num_columns; i++) {
-        if (strcmp(schema->columns[i].name, sel->where_col) == 0) {
+        if (strcmp(schema->columns[i].name, wcol) == 0) {
             ci = i;
         }
     }
@@ -155,14 +157,17 @@ static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Va
         return 0;
     }
     const Value *cell = &row[ci];
-    const Value *wv = &sel->where_val;
-    if (cell->type == VAL_INT && wv->type == VAL_INT) {
-        return cell->int_val == wv->int_val;
+    if (cell->type == VAL_INT && wval->type == VAL_INT) {
+        return cell->int_val == wval->int_val;
     }
-    if (cell->type == VAL_TEXT && wv->type == VAL_TEXT) {
-        return strcmp(cell->text_val, wv->text_val) == 0;
+    if (cell->type == VAL_TEXT && wval->type == VAL_TEXT) {
+        return strcmp(cell->text_val, wval->text_val) == 0;
     }
     return 0;
+}
+
+static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Value *row) {
+    return row_matches(schema, sel->has_where, sel->where_col, &sel->where_val, row);
 }
 
 static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
@@ -220,6 +225,110 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     }
 
     fprintf(out, "(%d행%s)\n", count, db->used_index ? ", 인덱스 사용" : "");
+    return 0;
+}
+
+/* WHERE에 맞는 행들의 RID를 모은다. 스캔하면서 바로 고치면 새로 삽입한 행을
+ * 다시 스캔하는 문제가 생기니, RID를 먼저 모은 뒤 따로 처리한다. */
+#define DML_MAX_ROWS 4096
+typedef struct {
+    RID rids[DML_MAX_ROWS];
+    int count;
+    const CreateStmt *schema;
+    int has_where;
+    const char *wcol;
+    const Value *wval;
+} CollectCtx;
+
+static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)len;
+    CollectCtx *c = ctx_;
+    Value row[SQL_MAX_COLS];
+    decode_row(c->schema, rec, row);
+    if (row_matches(c->schema, c->has_where, c->wcol, c->wval, row) && c->count < DML_MAX_ROWS) {
+        c->rids[c->count++] = rid;
+    }
+    return 0;
+}
+
+static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
+    if (!db->has_table || strcmp(d->table, db->schema.table) != 0) {
+        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", d->table);
+        return -1;
+    }
+    CollectCtx ctx = {.count = 0,
+                      .schema = &db->schema,
+                      .has_where = d->has_where,
+                      .wcol = d->where_col,
+                      .wval = &d->where_val};
+    heap_scan(&db->heap, collect_visit, &ctx);
+    for (int i = 0; i < ctx.count; i++) {
+        heap_delete(&db->heap, ctx.rids[i]);
+    }
+    /* 인덱스 항목은 남겨둬도 무해하다: 가리키는 슬롯이 tombstone이라 heap_get이 -1을
+     * 돌려줘 결과에서 자동으로 빠진다. (B+Tree 삭제는 별도 주제로 미룬다.) */
+    fprintf(out, "%d개 행 삭제됨\n", ctx.count);
+    return 0;
+}
+
+static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
+    if (!db->has_table || strcmp(u->table, db->schema.table) != 0) {
+        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", u->table);
+        return -1;
+    }
+    int sci = -1;
+    for (int i = 0; i < db->schema.num_columns; i++) {
+        if (strcmp(db->schema.columns[i].name, u->set_col) == 0) {
+            sci = i;
+        }
+    }
+    if (sci < 0) {
+        fprintf(out, "ERROR: 그런 컬럼이 없습니다 (%s)\n", u->set_col);
+        return -1;
+    }
+    ColType ct = db->schema.columns[sci].type;
+    if ((ct == COL_INT && u->set_val.type != VAL_INT) ||
+        (ct == COL_TEXT && u->set_val.type != VAL_TEXT)) {
+        fprintf(out, "ERROR: SET 값 타입이 컬럼과 맞지 않습니다\n");
+        return -1;
+    }
+
+    CollectCtx ctx = {.count = 0,
+                      .schema = &db->schema,
+                      .has_where = u->has_where,
+                      .wcol = u->where_col,
+                      .wval = &u->where_val};
+    heap_scan(&db->heap, collect_visit, &ctx);
+
+    int n = 0;
+    for (int i = 0; i < ctx.count; i++) {
+        uint8_t recbuf[PAGE_SIZE];
+        uint16_t len;
+        if (heap_get(&db->heap, ctx.rids[i], recbuf, &len) != 0) {
+            continue;
+        }
+        Value row[SQL_MAX_COLS];
+        decode_row(&db->schema, recbuf, row);
+        row[sci] = u->set_val; /* SET 적용 */
+
+        /* 가변 길이라 제자리 수정이 안 된다 → 옛 행 삭제 + 새 행 삽입 */
+        uint8_t newbuf[PAGE_SIZE];
+        uint16_t newlen;
+        if (encode_row(&db->schema, row, db->schema.num_columns, newbuf, &newlen) != 0) {
+            continue;
+        }
+        heap_delete(&db->heap, ctx.rids[i]);
+        RID newrid;
+        if (heap_insert(&db->heap, newbuf, newlen, &newrid) != 0) {
+            continue;
+        }
+        /* 새 RID로 인덱스 갱신 — 안 하면 인덱스가 삭제된 옛 위치를 가리켜 행이 사라진다 */
+        if (db->has_index && row[0].type == VAL_INT) {
+            btree_insert(&db->index, row[0].int_val, rid_encode(newrid));
+        }
+        n++;
+    }
+    fprintf(out, "%d개 행 수정됨\n", n);
     return 0;
 }
 
@@ -327,6 +436,8 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         case STMT_CREATE: rc = exec_create(db, &st.create, out); break;
         case STMT_INSERT: rc = exec_insert(db, &st.insert, out); break;
         case STMT_SELECT: rc = exec_select(db, &st.select, out); break;
+        case STMT_DELETE: rc = exec_delete(db, &st.del, out); break;
+        case STMT_UPDATE: rc = exec_update(db, &st.upd, out); break;
         case STMT_BEGIN: rc = exec_begin(db, out); break;
         case STMT_COMMIT: rc = exec_commit(db, out); break;
         case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
@@ -334,7 +445,9 @@ int db_exec(Database *db, const char *sql, FILE *out) {
     }
     /* autocommit: 트랜잭션 밖에서 성공한 변경은 즉시 디스크에 반영하고 클린으로 만든다.
      * 그래야 이후 ROLLBACK이 이 변경까지 되돌리지 않는다. */
-    if (rc == 0 && !db->in_txn && (st.type == STMT_CREATE || st.type == STMT_INSERT)) {
+    if (rc == 0 && !db->in_txn &&
+        (st.type == STMT_CREATE || st.type == STMT_INSERT ||
+         st.type == STMT_DELETE || st.type == STMT_UPDATE)) {
         bufpool_flush_all(db->bp);
         if (db->has_index) {
             bufpool_flush_all(db->index.bp);

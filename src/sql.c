@@ -14,6 +14,7 @@ typedef enum {
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
+    TOK_DELETE, TOK_UPDATE, TOK_SET,
     TOK_ERROR
 } TokType;
 
@@ -42,6 +43,9 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "BEGIN")) return TOK_BEGIN;
     if (!strcasecmp(s, "COMMIT")) return TOK_COMMIT;
     if (!strcasecmp(s, "ROLLBACK")) return TOK_ROLLBACK;
+    if (!strcasecmp(s, "DELETE")) return TOK_DELETE;
+    if (!strcasecmp(s, "UPDATE")) return TOK_UPDATE;
+    if (!strcasecmp(s, "SET")) return TOK_SET;
     return TOK_IDENT;
 }
 
@@ -255,6 +259,37 @@ static void parse_select(Parser *p, Statement *st) {
     }
 }
 
+static void parse_delete(Parser *p, Statement *st) {
+    st->type = STMT_DELETE;
+    DeleteStmt *d = &st->del;
+    d->has_where = 0;
+    p_expect(p, TOK_FROM, "DELETE 다음에 FROM이 필요합니다");
+    parse_name(p, d->table);
+    if (p_accept(p, TOK_WHERE)) {
+        d->has_where = 1;
+        parse_name(p, d->where_col);
+        p_expect(p, TOK_EQ, "= 가 필요합니다");
+        parse_value(p, &d->where_val);
+    }
+}
+
+static void parse_update(Parser *p, Statement *st) {
+    st->type = STMT_UPDATE;
+    UpdateStmt *u = &st->upd;
+    u->has_where = 0;
+    parse_name(p, u->table);
+    p_expect(p, TOK_SET, "SET이 필요합니다");
+    parse_name(p, u->set_col);
+    p_expect(p, TOK_EQ, "= 가 필요합니다");
+    parse_value(p, &u->set_val);
+    if (p_accept(p, TOK_WHERE)) {
+        u->has_where = 1;
+        parse_name(p, u->where_col);
+        p_expect(p, TOK_EQ, "= 가 필요합니다");
+        parse_value(p, &u->where_val);
+    }
+}
+
 int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
     Parser p;
     memset(&p, 0, sizeof(p));
@@ -268,6 +303,8 @@ int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
         case TOK_CREATE: p_advance(&p); parse_create(&p, out); break;
         case TOK_INSERT: p_advance(&p); parse_insert(&p, out); break;
         case TOK_SELECT: p_advance(&p); parse_select(&p, out); break;
+        case TOK_DELETE: p_advance(&p); parse_delete(&p, out); break;
+        case TOK_UPDATE: p_advance(&p); parse_update(&p, out); break;
         case TOK_BEGIN: out->type = STMT_BEGIN; p_advance(&p); break;
         case TOK_COMMIT: out->type = STMT_COMMIT; p_advance(&p); break;
         case TOK_ROLLBACK: out->type = STMT_ROLLBACK; p_advance(&p); break;

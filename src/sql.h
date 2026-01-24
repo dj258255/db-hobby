@@ -40,6 +40,8 @@ typedef enum {
     STMT_CREATE,
     STMT_INSERT,
     STMT_SELECT,
+    STMT_DELETE,
+    STMT_UPDATE,
     STMT_BEGIN,    /* BEGIN — 트랜잭션 시작 */
     STMT_COMMIT,   /* COMMIT — 확정 */
     STMT_ROLLBACK, /* ROLLBACK — 되돌리기 */
@@ -65,11 +67,29 @@ typedef struct {
 } SelectStmt;
 
 typedef struct {
+    char table[SQL_NAME_LEN];
+    int has_where;
+    char where_col[SQL_NAME_LEN];
+    Value where_val;
+} DeleteStmt;
+
+typedef struct {
+    char table[SQL_NAME_LEN];
+    char set_col[SQL_NAME_LEN];
+    Value set_val;
+    int has_where;
+    char where_col[SQL_NAME_LEN];
+    Value where_val;
+} UpdateStmt;
+
+typedef struct {
     StmtType type;
     union {
         CreateStmt create;
         InsertStmt insert;
         SelectStmt select;
+        DeleteStmt del;
+        UpdateStmt upd;
     };
 } Statement;
 
