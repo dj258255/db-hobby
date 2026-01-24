@@ -103,10 +103,9 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
             db->has_index = 1;
         }
     }
-    fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개%s)\n", c->table, c->num_columns,
-            db->has_index ? ", 인덱스 on " : "");
+    fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개)\n", c->table, c->num_columns);
     if (db->has_index) {
-        fprintf(out, "  (인덱스: %s)\n", db->schema.columns[0].name);
+        fprintf(out, "  (인덱스: %s 컬럼)\n", db->schema.columns[0].name);
     }
     return 0;
 }
