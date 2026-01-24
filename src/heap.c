@@ -3,17 +3,18 @@
 
 #include <string.h>
 
-void heap_init(Heap *h, BufferPool *bp, Pager *pager) {
+void heap_init(Heap *h, BufferPool *bp, Pager *pager, page_id_t first_page) {
     h->bp = bp;
     h->pager = pager;
+    h->first_page = first_page;
 }
 
 int heap_insert(Heap *h, const void *rec, uint16_t len, RID *rid_out) {
     page_id_t target;
     void *page;
 
-    /* 1) 페이지가 하나라도 있으면 마지막 페이지에 먼저 시도한다. */
-    if (h->pager->num_pages > 0) {
+    /* 1) 데이터 페이지가 하나라도 있으면 마지막 페이지에 먼저 시도한다. */
+    if (h->pager->num_pages > h->first_page) {
         target = h->pager->num_pages - 1;
         page = bufpool_fetch(h->bp, target);
         if (!page) {
@@ -76,7 +77,7 @@ int heap_delete(Heap *h, RID rid) {
 
 int heap_scan(Heap *h, heap_visit_fn visit, void *ctx) {
     uint64_t np = h->pager->num_pages;
-    for (page_id_t pid = 0; pid < np; pid++) {
+    for (page_id_t pid = h->first_page; pid < np; pid++) {
         void *page = bufpool_fetch(h->bp, pid);
         if (!page) {
             return -1;

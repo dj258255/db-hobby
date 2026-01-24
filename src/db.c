@@ -4,6 +4,8 @@
 #include <string.h>
 #include <unistd.h>
 
+static void catalog_write(Database *db); /* 정의는 아래 카탈로그 섹션 */
+
 /* ───────────── tuple codec: 값 ↔ 바이트 ─────────────
  *   INT  : 4바이트 (int32)
  *   TEXT : 2바이트 길이 + 바이트열
@@ -103,6 +105,7 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
             db->has_index = 1;
         }
     }
+    catalog_write(db); /* 스키마를 page 0에 영속화 */
     fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개)\n", c->table, c->num_columns);
     if (db->has_index) {
         fprintf(out, "  (인덱스: %s 컬럼)\n", db->schema.columns[0].name);
@@ -391,6 +394,66 @@ static int exec_rollback(Database *db, FILE *out) {
     return 0;
 }
 
+/* ───────────── 카탈로그 (스키마를 page 0에 저장) ─────────────
+ * PostgreSQL이 pg_catalog에 스키마를 자기 테이블로 저장하는 것의 가장 단순한 형태.
+ * page 0 = 카탈로그(스키마), 힙 데이터는 page 1부터.
+ */
+
+static void catalog_write(Database *db) {
+    uint8_t *page = bufpool_fetch(db->bp, 0);
+    memset(page, 0, PAGE_SIZE);
+    uint32_t nc = db->has_table ? (uint32_t)db->schema.num_columns : 0;
+    uint16_t off = 0;
+    memcpy(page + off, &nc, 4);
+    off += 4;
+    if (db->has_table) {
+        memcpy(page + off, db->schema.table, SQL_NAME_LEN);
+        off += SQL_NAME_LEN;
+        for (int i = 0; i < db->schema.num_columns; i++) {
+            memcpy(page + off, db->schema.columns[i].name, SQL_NAME_LEN);
+            off += SQL_NAME_LEN;
+            uint32_t t = (uint32_t)db->schema.columns[i].type;
+            memcpy(page + off, &t, 4);
+            off += 4;
+        }
+    }
+    bufpool_unpin(db->bp, 0, 1);
+}
+
+static void catalog_read(Database *db) {
+    uint8_t *page = bufpool_fetch(db->bp, 0);
+    uint32_t nc;
+    memcpy(&nc, page, 4);
+    if (nc == 0 || nc > SQL_MAX_COLS) {
+        bufpool_unpin(db->bp, 0, 0);
+        return; /* 테이블 없음 */
+    }
+    uint16_t off = 4;
+    CreateStmt *s = &db->schema;
+    s->num_columns = (int)nc;
+    memcpy(s->table, page + off, SQL_NAME_LEN);
+    off += SQL_NAME_LEN;
+    for (int i = 0; i < (int)nc; i++) {
+        memcpy(s->columns[i].name, page + off, SQL_NAME_LEN);
+        off += SQL_NAME_LEN;
+        uint32_t t;
+        memcpy(&t, page + off, 4);
+        off += 4;
+        s->columns[i].type = (ColType)t;
+    }
+    bufpool_unpin(db->bp, 0, 0);
+    db->has_table = 1;
+
+    /* 첫 컬럼이 INT면 인덱스도 다시 연다 */
+    if (s->columns[0].type == COL_INT) {
+        char idxpath[600];
+        snprintf(idxpath, sizeof(idxpath), "%s.idx", db->path);
+        if (btree_open(&db->index, idxpath) == 0) {
+            db->has_index = 1;
+        }
+    }
+}
+
 /* ───────────── 공개 API ───────────── */
 
 int db_open(Database *db, const char *path) {
@@ -402,12 +465,23 @@ int db_open(Database *db, const char *path) {
         pager_close(&db->pager);
         return -1;
     }
-    heap_init(&db->heap, db->bp, &db->pager);
+    heap_init(&db->heap, db->bp, &db->pager, 1); /* page 0 = 카탈로그, 데이터는 page 1부터 */
     db->has_table = 0;
     db->has_index = 0;
     db->used_index = 0;
     db->in_txn = 0;
     snprintf(db->path, sizeof(db->path), "%s", path);
+
+    if (db->pager.num_pages == 0) {
+        /* 새 파일: page 0(카탈로그)를 빈 상태로 확보한다 */
+        page_id_t cid;
+        bufpool_new_page(db->bp, &cid); /* page 0, 0으로 채워짐 → 테이블 없음 */
+        bufpool_unpin(db->bp, cid, 1);
+        bufpool_flush_all(db->bp);
+    } else {
+        /* 기존 파일: 카탈로그에서 스키마를 복원한다 */
+        catalog_read(db);
+    }
     return 0;
 }
 

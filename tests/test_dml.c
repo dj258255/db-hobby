@@ -84,9 +84,9 @@ int main(void) {
     db_close(&db);
     Database db2;
     db_open(&db2, path);
-    o = run(&db2, "CREATE TABLE users (id INT, name TEXT)"); free(o);
+    /* 스키마가 카탈로그에 영속되므로 재선언 없이 바로 질의 */
     o = run(&db2, "SELECT * FROM users");
-    CHECK(strstr(o, "(0행"), "재시작 후에도 0행");
+    CHECK(strstr(o, "(0행"), "재시작 후 재선언 없이 0행");
     free(o);
     db_close(&db2);
 

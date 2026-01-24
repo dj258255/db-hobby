@@ -25,9 +25,10 @@ typedef struct {
 typedef struct {
     BufferPool *bp;
     Pager *pager;
+    page_id_t first_page; /* 데이터 페이지 시작. 보통 0, 카탈로그가 page 0을 쓰면 1. */
 } Heap;
 
-void heap_init(Heap *h, BufferPool *bp, Pager *pager);
+void heap_init(Heap *h, BufferPool *bp, Pager *pager, page_id_t first_page);
 
 /* 행을 삽입하고 RID를 돌려준다. 0 성공, -1 실패(빈 페이지에도 안 들어갈 만큼 큰 행 등). */
 int heap_insert(Heap *h, const void *rec, uint16_t len, RID *rid_out);

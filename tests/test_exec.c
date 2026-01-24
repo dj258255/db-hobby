@@ -78,10 +78,10 @@ int main(void) {
     db_close(&db);
     Database db2;
     db_open(&db2, path);
-    o = run(&db2, "CREATE TABLE users (id INT, name TEXT)");
-    free(o);
+    /* 스키마가 카탈로그(page 0)에 저장되므로 재선언 없이 바로 질의 */
     o = run(&db2, "SELECT * FROM users");
-    CHECK(strstr(o, "kim") && strstr(o, "(3행)"), "재오픈 후에도 행 3개 유지");
+    CHECK(strstr(o, "kim") && strstr(o, "(3행)"),
+          "재오픈 후 재선언 없이 스키마·행 유지 (카탈로그)");
     free(o);
     db_close(&db2);
 

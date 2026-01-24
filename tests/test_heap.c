@@ -40,7 +40,7 @@ int main(void) {
     pager_open(&pgr, path);
     BufferPool *bp = bufpool_create(&pgr, 8);
     Heap heap;
-    heap_init(&heap, bp, &pgr);
+    heap_init(&heap, bp, &pgr, 0);
 
     /* 기본 삽입/조회 */
     RID ra, rb, rg;
@@ -81,7 +81,7 @@ int main(void) {
     pager_open(&pgr2, path);
     BufferPool *bp2 = bufpool_create(&pgr2, 8);
     Heap heap2;
-    heap_init(&heap2, bp2, &pgr2);
+    heap_init(&heap2, bp2, &pgr2, 0);
     CHECK(scan_count(&heap2) == 202, "재오픈 후에도 202행");
     CHECK(heap_get(&heap2, ra, buf, &len) == 0 && memcmp(buf, "alpha", 5) == 0,
           "재오픈 후 alpha 조회");

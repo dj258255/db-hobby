@@ -86,8 +86,7 @@ int main(void) {
     /* ── 재시작 영속성 ── */
     Database db2;
     db_open(&db2, path);
-    o = run(&db2, "CREATE TABLE users (id INT, name TEXT)"); /* 스키마는 메모리라 재선언 */
-    free(o);
+    /* 스키마가 카탈로그에 영속되므로 재선언 없이 바로 질의 */
     o = run(&db2, "SELECT * FROM users");
     CHECK(strstr(o, "kim") && strstr(o, "park") && strstr(o, "(2행"),
           "재시작 후에도 커밋된 행만 남음 (2행)");
