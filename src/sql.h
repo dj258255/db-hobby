@@ -36,7 +36,14 @@ typedef struct {
     ColType type;
 } ColumnDef;
 
-typedef enum { STMT_CREATE, STMT_INSERT, STMT_SELECT } StmtType;
+typedef enum {
+    STMT_CREATE,
+    STMT_INSERT,
+    STMT_SELECT,
+    STMT_BEGIN,    /* BEGIN — 트랜잭션 시작 */
+    STMT_COMMIT,   /* COMMIT — 확정 */
+    STMT_ROLLBACK, /* ROLLBACK — 되돌리기 */
+} StmtType;
 
 typedef struct {
     char table[SQL_NAME_LEN];

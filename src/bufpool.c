@@ -19,6 +19,7 @@ struct BufferPool {
     uint64_t clock;        /* 단조 증가 LRU 스탬프 발급기 */
     size_t hits;
     size_t misses;
+    int no_steal;          /* 트랜잭션 중: dirty 페이지를 교체 대상에서 제외 */
 };
 
 BufferPool *bufpool_create(Pager *pager, size_t num_frames) {
@@ -63,10 +64,14 @@ static Frame *pick_frame(BufferPool *bp) {
     Frame *victim = NULL;
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
-        if (f->pin_count == 0) {
-            if (!victim || f->last_used < victim->last_used) {
-                victim = f;
-            }
+        if (f->pin_count != 0) {
+            continue;
+        }
+        if (bp->no_steal && f->dirty) {
+            continue; /* 트랜잭션 중엔 커밋 안 된 페이지를 쫓아내지 않는다 */
+        }
+        if (!victim || f->last_used < victim->last_used) {
+            victim = f;
         }
     }
     if (!victim) {
@@ -147,6 +152,20 @@ int bufpool_flush_all(BufferPool *bp) {
         }
     }
     return 0;
+}
+
+void bufpool_set_no_steal(BufferPool *bp, int on) {
+    bp->no_steal = on;
+}
+
+void bufpool_discard_dirty(BufferPool *bp) {
+    for (size_t i = 0; i < bp->num_frames; i++) {
+        Frame *f = &bp->frames[i];
+        if (f->valid && f->dirty) {
+            f->valid = 0; /* 디스크에 안 쓰고 무효화 → 다음 fetch가 원본을 읽는다 */
+            f->dirty = 0;
+        }
+    }
 }
 
 void bufpool_destroy(BufferPool *bp) {

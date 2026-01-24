@@ -199,6 +199,12 @@ int btree_insert(BTree *bt, bkey_t key, bval_t val) {
     return 0;
 }
 
+void btree_reload_root(BTree *bt) {
+    uint64_t *meta = (uint64_t *)bufpool_fetch(bt->bp, 0);
+    bt->root = meta[0];
+    bufpool_unpin(bt->bp, 0, 0);
+}
+
 int btree_search(BTree *bt, bkey_t key, bval_t *out) {
     page_id_t pid = bt->root;
     for (;;) {

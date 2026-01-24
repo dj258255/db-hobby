@@ -34,6 +34,10 @@ typedef struct {
     int has_index;
 
     int used_index; /* 직전 SELECT가 인덱스를 썼나 (시연·테스트용) */
+
+    int in_txn;               /* 명시적 트랜잭션(BEGIN) 중인가 */
+    uint64_t txn_data_pages;  /* BEGIN 시점의 데이터 파일 페이지 수(롤백 복원용) */
+    uint64_t txn_index_pages; /* BEGIN 시점의 인덱스 파일 페이지 수 */
 } Database;
 
 /* 파일을 열어 DB를 준비한다. 0 성공, -1 실패. */

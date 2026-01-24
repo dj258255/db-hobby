@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ───────────── tuple codec: 값 ↔ 바이트 ─────────────
  *   INT  : 4바이트 (int32)
@@ -223,6 +224,65 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     return 0;
 }
 
+/* ───────────── 트랜잭션 ─────────────
+ * no-steal + 커밋 시 force. 트랜잭션 중 바뀐 페이지는 버퍼 풀 메모리에만 두고,
+ * COMMIT이면 flush+fsync(내구), ROLLBACK이면 dirty 프레임을 버리고 할당분을 잘라
+ * 디스크 원본으로 되돌린다. 힙과 인덱스 둘 다 처리해 일관성을 지킨다.
+ */
+
+static int exec_begin(Database *db, FILE *out) {
+    if (db->in_txn) {
+        fprintf(out, "ERROR: 이미 트랜잭션 중입니다\n");
+        return -1;
+    }
+    db->in_txn = 1;
+    bufpool_set_no_steal(db->bp, 1);
+    db->txn_data_pages = db->pager.num_pages;
+    if (db->has_index) {
+        bufpool_set_no_steal(db->index.bp, 1);
+        db->txn_index_pages = db->index.pager.num_pages;
+    }
+    fprintf(out, "트랜잭션 시작\n");
+    return 0;
+}
+
+static int exec_commit(Database *db, FILE *out) {
+    if (!db->in_txn) {
+        fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
+        return -1;
+    }
+    bufpool_flush_all(db->bp);
+    fsync(db->pager.fd);
+    if (db->has_index) {
+        bufpool_flush_all(db->index.bp);
+        fsync(db->index.pager.fd);
+        bufpool_set_no_steal(db->index.bp, 0);
+    }
+    bufpool_set_no_steal(db->bp, 0);
+    db->in_txn = 0;
+    fprintf(out, "커밋됨\n");
+    return 0;
+}
+
+static int exec_rollback(Database *db, FILE *out) {
+    if (!db->in_txn) {
+        fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
+        return -1;
+    }
+    bufpool_discard_dirty(db->bp);
+    pager_truncate(&db->pager, db->txn_data_pages);
+    bufpool_set_no_steal(db->bp, 0);
+    if (db->has_index) {
+        bufpool_discard_dirty(db->index.bp);
+        pager_truncate(&db->index.pager, db->txn_index_pages);
+        btree_reload_root(&db->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
+        bufpool_set_no_steal(db->index.bp, 0);
+    }
+    db->in_txn = 0;
+    fprintf(out, "롤백됨\n");
+    return 0;
+}
+
 /* ───────────── 공개 API ───────────── */
 
 int db_open(Database *db, const char *path) {
@@ -238,6 +298,7 @@ int db_open(Database *db, const char *path) {
     db->has_table = 0;
     db->has_index = 0;
     db->used_index = 0;
+    db->in_txn = 0;
     snprintf(db->path, sizeof(db->path), "%s", path);
     return 0;
 }
@@ -262,10 +323,23 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         fprintf(out, "ERROR: %s\n", err);
         return -1;
     }
+    int rc;
     switch (st.type) {
-        case STMT_CREATE: return exec_create(db, &st.create, out);
-        case STMT_INSERT: return exec_insert(db, &st.insert, out);
-        case STMT_SELECT: return exec_select(db, &st.select, out);
-        default: return -1;
+        case STMT_CREATE: rc = exec_create(db, &st.create, out); break;
+        case STMT_INSERT: rc = exec_insert(db, &st.insert, out); break;
+        case STMT_SELECT: rc = exec_select(db, &st.select, out); break;
+        case STMT_BEGIN: rc = exec_begin(db, out); break;
+        case STMT_COMMIT: rc = exec_commit(db, out); break;
+        case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
+        default: rc = -1;
     }
+    /* autocommit: 트랜잭션 밖에서 성공한 변경은 즉시 디스크에 반영하고 클린으로 만든다.
+     * 그래야 이후 ROLLBACK이 이 변경까지 되돌리지 않는다. */
+    if (rc == 0 && !db->in_txn && (st.type == STMT_CREATE || st.type == STMT_INSERT)) {
+        bufpool_flush_all(db->bp);
+        if (db->has_index) {
+            bufpool_flush_all(db->index.bp);
+        }
+    }
+    return rc;
 }

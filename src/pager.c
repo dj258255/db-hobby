@@ -58,3 +58,11 @@ int pager_write(Pager *pager, page_id_t page_id, const void *buf) {
     ssize_t n = pwrite(pager->fd, buf, PAGE_SIZE, offset);
     return (n == (ssize_t)PAGE_SIZE) ? 0 : -1;
 }
+
+int pager_truncate(Pager *pager, uint64_t num_pages) {
+    if (ftruncate(pager->fd, (off_t)num_pages * PAGE_SIZE) < 0) {
+        return -1;
+    }
+    pager->num_pages = num_pages;
+    return 0;
+}

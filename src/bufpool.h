@@ -40,6 +40,13 @@ void bufpool_unpin(BufferPool *bp, page_id_t page_id, int is_dirty);
 /* 모든 dirty 페이지를 디스크에 쓴다. 성공 0, 실패 -1. */
 int bufpool_flush_all(BufferPool *bp);
 
+/* 트랜잭션용 no-steal 모드. 켜면 교체 시 dirty 프레임을 victim으로 안 고른다
+ * (커밋 안 된 페이지가 디스크로 새는 걸 막는다). */
+void bufpool_set_no_steal(BufferPool *bp, int on);
+
+/* dirty 프레임을 디스크에 쓰지 않고 전부 무효화한다(롤백용 — 다음 fetch가 디스크 원본을 읽음). */
+void bufpool_discard_dirty(BufferPool *bp);
+
 /* 통계 (시연·테스트용). */
 size_t bufpool_hits(const BufferPool *bp);
 size_t bufpool_misses(const BufferPool *bp);

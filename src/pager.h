@@ -40,4 +40,7 @@ int pager_read(Pager *pager, page_id_t page_id, void *buf);
 /* page_id 페이지에 buf(PAGE_SIZE 바이트)를 쓴다. 성공 0, 실패 -1. */
 int pager_write(Pager *pager, page_id_t page_id, const void *buf);
 
+/* 파일을 num_pages 페이지 크기로 줄인다(롤백 시 트랜잭션이 할당한 페이지 제거). 0/-1. */
+int pager_truncate(Pager *pager, uint64_t num_pages);
+
 #endif /* MINIDB_PAGER_H */

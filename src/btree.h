@@ -40,6 +40,9 @@ int btree_insert(BTree *bt, bkey_t key, bval_t val);
 /* 키를 찾는다. 있으면 *out에 값을 넣고 0, 없으면 -1. */
 int btree_search(BTree *bt, bkey_t key, bval_t *out);
 
+/* 메타 페이지에서 루트를 다시 읽는다(롤백 후 in-memory 루트를 디스크와 동기화). */
+void btree_reload_root(BTree *bt);
+
 /* 모든 키를 오름차순으로 visit에 넘긴다(리프 체인 따라). visit가 0 아니면 멈춤. */
 typedef int (*btree_visit_fn)(bkey_t key, bval_t val, void *ctx);
 int btree_scan(BTree *bt, btree_visit_fn visit, void *ctx);
