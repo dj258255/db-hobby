@@ -162,7 +162,7 @@ void bufpool_discard_dirty(BufferPool *bp) {
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
         if (f->valid && f->dirty) {
-            f->valid = 0; /* 디스크에 안 쓰고 무효화 → 다음 fetch가 원본을 읽는다 */
+            f->valid = 0; /* 디스크에 안 쓰고 무효화 -> 다음 fetch가 원본을 읽는다 */
             f->dirty = 0;
         }
     }

@@ -6,7 +6,7 @@
 #include "bufpool.h"
 
 /*
- * B+Tree 인덱스 — 키 → 값을 O(log n)에 찾는다. (InnoDB clustered index,
+ * B+Tree 인덱스 — 키 -> 값을 O(log n)에 찾는다. (InnoDB clustered index,
  * PostgreSQL btree와 같은 자료구조.) 풀 스캔(O(n))을 피하는 장치.
  *
  * 노드는 페이지에 저장된다(버퍼 풀 경유). 리프가 꽉 차면 반으로 쪼개고

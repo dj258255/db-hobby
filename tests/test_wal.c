@@ -28,7 +28,7 @@ int main(void) {
     Wal w;
     wal_open(&w, dp, lp);
 
-    /* 1) 정상 커밋 → 내구성 */
+    /* 1) 정상 커밋 -> 내구성 */
     wal_begin(&w);
     fill(page, 0xA1);
     wal_stage(&w, 1, page);
@@ -41,7 +41,7 @@ int main(void) {
     wal_read(&w, 1, buf);
     CHECK(buf[0] == 0xA1, "재오픈 후에도 유지 (내구성)");
 
-    /* 2) 로그 fsync 직후 크래시 → 복구가 redo */
+    /* 2) 로그 fsync 직후 크래시 -> 복구가 redo */
     wal_begin(&w);
     fill(page, 0xB2);
     wal_stage(&w, 1, page);
@@ -57,7 +57,7 @@ int main(void) {
     wal_read(&w, 1, buf);
     CHECK(buf[0] == 0xB2, "복구가 커밋된 변경을 재적용 (내구성)");
 
-    /* 3) 커밋 전 크래시 → 버려짐 (원자성) */
+    /* 3) 커밋 전 크래시 -> 버려짐 (원자성) */
     wal_begin(&w);
     fill(page, 0xC3);
     wal_stage(&w, 1, page);
@@ -66,7 +66,7 @@ int main(void) {
     wal_test_crash_before_commit = 0;
     wal_close(&w); /* 크래시 */
 
-    wal_open(&w, dp, lp); /* 복구: 커밋 마커 없음 → 버림 */
+    wal_open(&w, dp, lp); /* 복구: 커밋 마커 없음 -> 버림 */
     wal_read(&w, 1, buf);
     CHECK(buf[0] == 0xB2, "커밋 안 된 변경은 흔적 없이 버려짐 (원자성)");
 

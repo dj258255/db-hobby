@@ -32,7 +32,7 @@ int main(void) {
     slotpage_init(page);
     CHECK(slotpage_num_slots(page) == 0, "빈 페이지는 슬롯 0개");
 
-    /* 삽입 → 슬롯 번호 0, 1 */
+    /* 삽입 -> 슬롯 번호 0, 1 */
     int s0 = slotpage_insert(page, "hello", 5);
     int s1 = slotpage_insert(page, "world!!", 7);
     CHECK(s0 == 0, "첫 레코드 슬롯 0");
@@ -43,7 +43,7 @@ int main(void) {
     CHECK(rec_equals(page, 0, "hello"), "슬롯 0 == hello");
     CHECK(rec_equals(page, 1, "world!!"), "슬롯 1 == world!!");
 
-    /* 삭제 → 슬롯 0은 사라지고 슬롯 1은 유지 */
+    /* 삭제 -> 슬롯 0은 사라지고 슬롯 1은 유지 */
     CHECK(slotpage_delete(page, 0) == 0, "슬롯 0 삭제");
     const void *r;
     uint16_t l;

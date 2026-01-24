@@ -43,7 +43,7 @@ int main(void) {
 
     /* DELETE WHERE id = 2 */
     o = run(&db, "DELETE FROM users WHERE id = 2");
-    CHECK(strstr(o, "1개 행 삭제됨") != NULL, "DELETE WHERE id=2 → 1개 삭제");
+    CHECK(strstr(o, "1개 행 삭제됨") != NULL, "DELETE WHERE id=2 -> 1개 삭제");
     free(o);
     o = run(&db, "SELECT * FROM users");
     CHECK(strstr(o, "kim") && strstr(o, "park") && !strstr(o, "lee") && strstr(o, "(2행"),
@@ -55,13 +55,13 @@ int main(void) {
 
     /* UPDATE WHERE id = 1 (name 변경) — RID가 바뀌어도 인덱스로 찾혀야 함 */
     o = run(&db, "UPDATE users SET name = 'KIM' WHERE id = 1");
-    CHECK(strstr(o, "1개 행 수정됨") != NULL, "UPDATE WHERE id=1 → 1개 수정");
+    CHECK(strstr(o, "1개 행 수정됨") != NULL, "UPDATE WHERE id=1 -> 1개 수정");
     free(o);
     o = run(&db, "SELECT * FROM users WHERE id = 1");
     CHECK(strstr(o, "KIM") && strstr(o, "1행"), "수정 후 인덱스로 새 행(KIM) 찾음");
     free(o);
     o = run(&db, "SELECT * FROM users");
-    CHECK(strstr(o, "KIM") && strstr(o, "park") && !strstr(o, "kim"), "kim → KIM 반영");
+    CHECK(strstr(o, "KIM") && strstr(o, "park") && !strstr(o, "kim"), "kim -> KIM 반영");
     free(o);
 
     /* UPDATE 전체 (WHERE 없음) */

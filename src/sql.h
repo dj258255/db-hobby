@@ -7,10 +7,10 @@
  * SQL 프런트엔드 — 텍스트를 AST로 바꾼다.
  *
  *   "SELECT * FROM users WHERE id = 1"
- *        │  토크나이저(lexer): 토큰으로 쪼갬
- *        ▼  SELECT  *  FROM  users  WHERE  id  =  1
- *        │  파서(recursive descent): 구조로 조립
- *        ▼  Select{ table: "users", where: id = 1 }
+ *        |  토크나이저(lexer): 토큰으로 쪼갬
+ *        v  SELECT  *  FROM  users  WHERE  id  =  1
+ *        |  파서(recursive descent): 구조로 조립
+ *        v  Select{ table: "users", where: id = 1 }
  *
  * 지원 문법(학습용 최소 부분집합):
  *   CREATE TABLE <name> (<col> INT|TEXT, ...)

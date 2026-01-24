@@ -6,7 +6,7 @@
 
 static void catalog_write(Database *db); /* 정의는 아래 카탈로그 섹션 */
 
-/* ───────────── tuple codec: 값 ↔ 바이트 ─────────────
+/* ------------- tuple codec: 값 <-> 바이트 -------------
  *   INT  : 4바이트 (int32)
  *   TEXT : 2바이트 길이 + 바이트열
  */
@@ -62,7 +62,7 @@ static void decode_row(const CreateStmt *schema, const uint8_t *rec, Value *out)
     }
 }
 
-/* RID ↔ int64 (인덱스 값으로 저장하려고). slot < 65536 이므로 안전. */
+/* RID <-> int64 (인덱스 값으로 저장하려고). slot < 65536 이므로 안전. */
 static int64_t rid_encode(RID r) {
     return (int64_t)r.page_id * 65536 + r.slot;
 }
@@ -87,7 +87,7 @@ static void print_row(FILE *out, const CreateStmt *schema, const Value *row) {
     fprintf(out, "\n");
 }
 
-/* ───────────── 실행기 ───────────── */
+/* ------------- 실행기 ------------- */
 
 static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
     if (db->has_table) {
@@ -129,7 +129,7 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
         fprintf(out, "ERROR: 삽입 실패 (행이 너무 큼?)\n");
         return -1;
     }
-    /* 인덱스에 (PK 값 → RID) 등록 */
+    /* 인덱스에 (PK 값 -> RID) 등록 */
     if (db->has_index && in->values[0].type == VAL_INT) {
         btree_insert(&db->index, in->values[0].int_val, rid_encode(rid));
     }
@@ -204,7 +204,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     db->used_index = 0;
     int count = 0;
 
-    /* WHERE가 인덱스된 PK(첫 컬럼)에 대한 정수 비교면 → O(log n) 인덱스 조회 */
+    /* WHERE가 인덱스된 PK(첫 컬럼)에 대한 정수 비교면 -> O(log n) 인덱스 조회 */
     if (sel->has_where && db->has_index &&
         strcmp(sel->where_col, db->schema.columns[0].name) == 0 &&
         sel->where_val.type == VAL_INT) {
@@ -221,7 +221,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
             }
         }
     } else {
-        /* 그 외 → 풀 스캔 */
+        /* 그 외 -> 풀 스캔 */
         SelectCtx ctx = {&db->schema, sel, out, 0};
         heap_scan(&db->heap, select_visit, &ctx);
         count = ctx.count;
@@ -314,7 +314,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         decode_row(&db->schema, recbuf, row);
         row[sci] = u->set_val; /* SET 적용 */
 
-        /* 가변 길이라 제자리 수정이 안 된다 → 옛 행 삭제 + 새 행 삽입 */
+        /* 가변 길이라 제자리 수정이 안 된다 -> 옛 행 삭제 + 새 행 삽입 */
         uint8_t newbuf[PAGE_SIZE];
         uint16_t newlen;
         if (encode_row(&db->schema, row, db->schema.num_columns, newbuf, &newlen) != 0) {
@@ -335,7 +335,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
     return 0;
 }
 
-/* ───────────── 트랜잭션 ─────────────
+/* ------------- 트랜잭션 -------------
  * no-steal + 커밋 시 force. 트랜잭션 중 바뀐 페이지는 버퍼 풀 메모리에만 두고,
  * COMMIT이면 flush+fsync(내구), ROLLBACK이면 dirty 프레임을 버리고 할당분을 잘라
  * 디스크 원본으로 되돌린다. 힙과 인덱스 둘 다 처리해 일관성을 지킨다.
@@ -394,7 +394,7 @@ static int exec_rollback(Database *db, FILE *out) {
     return 0;
 }
 
-/* ───────────── 카탈로그 (스키마를 page 0에 저장) ─────────────
+/* ------------- 카탈로그 (스키마를 page 0에 저장) -------------
  * PostgreSQL이 pg_catalog에 스키마를 자기 테이블로 저장하는 것의 가장 단순한 형태.
  * page 0 = 카탈로그(스키마), 힙 데이터는 page 1부터.
  */
@@ -454,7 +454,7 @@ static void catalog_read(Database *db) {
     }
 }
 
-/* ───────────── 공개 API ───────────── */
+/* ------------- 공개 API ------------- */
 
 int db_open(Database *db, const char *path) {
     if (pager_open(&db->pager, path) != 0) {
@@ -475,7 +475,7 @@ int db_open(Database *db, const char *path) {
     if (db->pager.num_pages == 0) {
         /* 새 파일: page 0(카탈로그)를 빈 상태로 확보한다 */
         page_id_t cid;
-        bufpool_new_page(db->bp, &cid); /* page 0, 0으로 채워짐 → 테이블 없음 */
+        bufpool_new_page(db->bp, &cid); /* page 0, 0으로 채워짐 -> 테이블 없음 */
         bufpool_unpin(db->bp, cid, 1);
         bufpool_flush_all(db->bp);
     } else {

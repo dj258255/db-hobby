@@ -12,10 +12,10 @@
  * Database — 모든 계층을 하나로 묶어 SQL을 실행한다.
  *
  *   db_exec(db, "INSERT INTO users VALUES (1, 'kim')")
- *      → 파서: SQL → AST
- *      → 실행기: AST를 보고 저장 계층을 부린다
+ *      -> 파서: SQL -> AST
+ *      -> 실행기: AST를 보고 저장 계층을 부린다
  *          CREATE  : 스키마(카탈로그) 기록 + (첫 컬럼이 INT면) B+Tree 인덱스 생성
- *          INSERT  : 값을 바이트로 인코딩 → heap_insert → 인덱스에 (PK → RID) 등록
+ *          INSERT  : 값을 바이트로 인코딩 -> heap_insert -> 인덱스에 (PK -> RID) 등록
  *          SELECT  : WHERE가 PK면 인덱스로 O(log n) 조회, 아니면 풀 스캔
  *
  * 학습용 단순화: 한 데이터베이스 = 한 테이블. 첫 컬럼을 유일 PK로 보고 인덱싱한다.

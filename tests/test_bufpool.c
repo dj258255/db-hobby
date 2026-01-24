@@ -50,14 +50,14 @@ int main(void) {
     CHECK(marker(d0b) == 0xA1, "p0 내용 유지");
     bufpool_unpin(bp, p0, 0);
 
-    /* 세 번째 페이지 생성 → 프레임 2개가 꽉 찼으니 LRU victim(p1)이 쫓겨난다.
+    /* 세 번째 페이지 생성 -> 프레임 2개가 꽉 찼으니 LRU victim(p1)이 쫓겨난다.
      * p1은 dirty라 디스크로 flush되어야 한다. (p0는 방금 써서 더 최근) */
     void *d2 = bufpool_new_page(bp, &p2);
     mark(d2, 0xC3);
     bufpool_unpin(bp, p2, 1);
 
     /* p1을 다시 가져오면 miss(쫓겨났으니), 그런데 내용은 0xB2여야 한다
-     * → 쫓겨날 때 디스크에 제대로 flush됐다는 증거 */
+     * -> 쫓겨날 때 디스크에 제대로 flush됐다는 증거 */
     size_t miss_before = bufpool_misses(bp);
     void *d1b = bufpool_fetch(bp, p1);
     CHECK(bufpool_misses(bp) == miss_before + 1, "쫓겨난 p1 재요청은 miss");

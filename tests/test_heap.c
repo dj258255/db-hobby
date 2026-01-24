@@ -54,7 +54,7 @@ int main(void) {
           "get alpha by RID");
     CHECK(scan_count(&heap) == 3, "스캔 3행");
 
-    /* 멀티 페이지: 64바이트 행 200개 → 여러 페이지에 걸친다 */
+    /* 멀티 페이지: 64바이트 행 200개 -> 여러 페이지에 걸친다 */
     char row[64];
     memset(row, 'x', sizeof(row));
     for (int i = 0; i < 200; i++) {
@@ -67,7 +67,7 @@ int main(void) {
     CHECK(scan_count(&heap) == 203, "스캔 203행 (멀티 페이지)");
     CHECK(pgr.num_pages > 1, "여러 페이지에 걸쳐 저장됨");
 
-    /* 삭제 → 스캔에서 빠지고, 조회도 실패 */
+    /* 삭제 -> 스캔에서 빠지고, 조회도 실패 */
     CHECK(heap_delete(&heap, rb) == 0, "delete beta");
     CHECK(scan_count(&heap) == 202, "삭제 후 스캔 202행");
     CHECK(heap_get(&heap, rb, buf, &len) == -1, "삭제된 beta 조회 실패");

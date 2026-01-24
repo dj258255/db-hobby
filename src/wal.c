@@ -69,7 +69,7 @@ static int wal_recover(Wal *w) {
             }
             uint64_t pid;
             if (read_exact(w->log_fd, &pid, sizeof(pid)) != 0) {
-                break; /* 잘린 레코드 → 이 트랜잭션은 미완 */
+                break; /* 잘린 레코드 -> 이 트랜잭션은 미완 */
             }
             pending[np].page_id = pid;
             if (read_exact(w->log_fd, pending[np].data, PAGE_SIZE) != 0) {
@@ -77,7 +77,7 @@ static int wal_recover(Wal *w) {
             }
             np++;
         } else if (type == REC_COMMIT) {
-            /* 여기까지가 커밋됨 → 데이터에 재적용 */
+            /* 여기까지가 커밋됨 -> 데이터에 재적용 */
             for (int i = 0; i < np; i++) {
                 if (pager_write(&w->data, pending[i].page_id, pending[i].data) != 0) {
                     rc = -1;
@@ -88,7 +88,7 @@ static int wal_recover(Wal *w) {
             break;
         }
     }
-    /* 남은 pending = 커밋 안 됨 → 버린다 */
+    /* 남은 pending = 커밋 안 됨 -> 버린다 */
     free(pending);
     if (ftruncate(w->log_fd, 0) < 0) {
         rc = -1;
@@ -171,7 +171,7 @@ int wal_commit(Wal *w) {
     }
     if (wal_test_crash_before_commit) {
         fsync(w->log_fd);
-        return 0; /* 크래시: 커밋 마커 없음 → 복구 시 버려짐 */
+        return 0; /* 크래시: 커밋 마커 없음 -> 복구 시 버려짐 */
     }
 
     /* 2) 커밋 마커 + fsync — 이 줄을 지나면 "내구"하다 */
@@ -181,7 +181,7 @@ int wal_commit(Wal *w) {
     }
     fsync(w->log_fd);
     if (wal_test_crash_after_log) {
-        return 0; /* 크래시: 데이터 적용 전 → 복구가 redo */
+        return 0; /* 크래시: 데이터 적용 전 -> 복구가 redo */
     }
 
     /* 3) 데이터 파일에 실제로 적용 */

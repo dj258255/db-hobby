@@ -56,16 +56,16 @@ int main(void) {
     CHECK(db.used_index == 0, "WHERE 없으면 풀 스캔");
     free(o);
 
-    /* WHERE 정수 (인덱스된 PK) → 인덱스 사용 */
+    /* WHERE 정수 (인덱스된 PK) -> 인덱스 사용 */
     o = run(&db, "SELECT * FROM users WHERE id = 2");
-    CHECK(strstr(o, "lee") && !strstr(o, "kim") && !strstr(o, "park"), "WHERE id=2 → lee만");
+    CHECK(strstr(o, "lee") && !strstr(o, "kim") && !strstr(o, "park"), "WHERE id=2 -> lee만");
     CHECK(strstr(o, "1행") != NULL, "WHERE 결과 1행");
     CHECK(db.used_index == 1, "WHERE id=2 는 인덱스 사용 (O(log n))");
     free(o);
 
-    /* WHERE 문자열 (인덱스 안 된 컬럼) → 풀 스캔 */
+    /* WHERE 문자열 (인덱스 안 된 컬럼) -> 풀 스캔 */
     o = run(&db, "SELECT * FROM users WHERE name = 'park'");
-    CHECK(strstr(o, "park") && strstr(o, "(1행)"), "WHERE name='park' → park");
+    CHECK(strstr(o, "park") && strstr(o, "(1행)"), "WHERE name='park' -> park");
     CHECK(db.used_index == 0, "TEXT 컬럼 WHERE는 풀 스캔");
     free(o);
 

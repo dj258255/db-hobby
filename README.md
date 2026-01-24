@@ -16,8 +16,8 @@ make clean
 
 ## Where things are
 
-- `DESIGN.md` — the full layer map (parser → executor → catalog → storage) and build order.
-- `src/pager.c` — layer 1: the disk manager (fixed-size pages ↔ a single file).
+- `DESIGN.md` — the full layer map (parser -> executor -> catalog -> storage) and build order.
+- `src/pager.c` — layer 1: the disk manager (fixed-size pages <-> a single file).
 
 ## Status
 

@@ -6,7 +6,7 @@
 #include <string.h>
 #include <strings.h> /* strcasecmp */
 
-/* ───────────────────────── 토크나이저(lexer) ───────────────────────── */
+/* ------------------------- 토크나이저(lexer) ------------------------- */
 
 typedef enum {
     TOK_EOF, TOK_IDENT, TOK_INT, TOK_STRING,
@@ -132,7 +132,7 @@ static Token lex_next(Lexer *lx) {
     return t;
 }
 
-/* ───────────────────────── 파서(recursive descent) ───────────────────────── */
+/* ------------------------- 파서(recursive descent) ------------------------- */
 
 typedef struct {
     Lexer lex;

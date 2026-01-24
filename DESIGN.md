@@ -4,28 +4,28 @@ PostgreSQL / MySQL 같은 관계형 데이터베이스가 내부에서 어떻게
 직접 한 겹씩 구현하며 이해하는 학습 프로젝트다. 새로운 걸 발명하려는 게 아니라,
 이미 있는 것의 **기본 구조를 정확히 재현**하는 게 목표다.
 
-## 계층 구조 (위 → 아래)
+## 계층 구조 (위 -> 아래)
 
 ```
  SQL 텍스트
-   │
-   ▼ [1] Parser      토크나이저 + 파서 → AST
-   ▼ [2] Planner     AST → 실행 계획 (풀스캔 vs 인덱스)
-   ▼ [3] Executor    계획 실행 (Volcano/iterator 모델)
-   │
-   ▼ [4] Catalog     시스템 테이블 (스키마 메타데이터)        ← pg_catalog
-   │
-   ▼ [5] Access      Heap(테이블) + B-Tree(인덱스)
-   ▼ [6] Buffer Pool 페이지 캐시 + 교체(LRU)                  ← InnoDB buffer pool
-   ▼ [7] Page        슬롯 페이지: 행을 고정 크기 페이지에 패킹
-   ▼ [8] Pager/Disk  페이지 ↔ 단일 파일 (고정 크기 I/O)
-   │
-   ▼ [9] WAL/Txn     쓰기 선행 로그 + MVCC/락 (고급)
+   |
+   v [1] Parser      토크나이저 + 파서 -> AST
+   v [2] Planner     AST -> 실행 계획 (풀스캔 vs 인덱스)
+   v [3] Executor    계획 실행 (Volcano/iterator 모델)
+   |
+   v [4] Catalog     시스템 테이블 (스키마 메타데이터)        <- pg_catalog
+   |
+   v [5] Access      Heap(테이블) + B-Tree(인덱스)
+   v [6] Buffer Pool 페이지 캐시 + 교체(LRU)                  <- InnoDB buffer pool
+   v [7] Page        슬롯 페이지: 행을 고정 크기 페이지에 패킹
+   v [8] Pager/Disk  페이지 <-> 단일 파일 (고정 크기 I/O)
+   |
+   v [9] WAL/Txn     쓰기 선행 로그 + MVCC/락 (고급)
 ```
 
 핵심 사실: **모든 것은 고정 크기 페이지 위에 쌓인다.** (Postgres 8KB, MySQL InnoDB
-16KB, SQLite 4KB.) 디스크는 페이지 단위로만 읽고 쓰며, 그 위에 슬롯 페이지 →
-힙/B-Tree → 버퍼풀 → 실행기가 얹힌다. 그래서 맨 아래(Pager)부터 짓는다.
+16KB, SQLite 4KB.) 디스크는 페이지 단위로만 읽고 쓰며, 그 위에 슬롯 페이지 ->
+힙/B-Tree -> 버퍼풀 -> 실행기가 얹힌다. 그래서 맨 아래(Pager)부터 짓는다.
 
 ## 빌드 순서 (bottom-up)
 
@@ -36,7 +36,7 @@ PostgreSQL / MySQL 같은 관계형 데이터베이스가 내부에서 어떻게
 | 3 | **Buffer Pool** | 페이지 캐시 + LRU 교체 | InnoDB buffer pool |
 | 4 | **Heap File** | 테이블 = 페이지 모음, tuple 삽입/스캔 | PG heap |
 | 5 | **Catalog** | 스키마를 어디에 저장하나 | pg_catalog, information_schema |
-| 6 | **SQL Parser** | SQL 텍스트 → AST | 모든 DB의 프런트엔드 |
+| 6 | **SQL Parser** | SQL 텍스트 -> AST | 모든 DB의 프런트엔드 |
 | 7 | **Executor** | CREATE/INSERT/SELECT/WHERE 실행 | Volcano 모델 |
 | 8 | **B-Tree Index** | O(log n) 조회, 인덱스 스캔 | InnoDB clustered index |
 | 9 | **WAL / 트랜잭션** | 내구성·복구·동시성(MVCC/락) | PG WAL, InnoDB redo log |
@@ -47,7 +47,7 @@ CREATE TABLE users (id INT, name TEXT);
 INSERT INTO users VALUES (1, 'kim');
 SELECT * FROM users WHERE id = 1;
 ```
-→ 디스크 파일 하나에 저장되고, 프로그램을 껐다 켜도 데이터가 남는다.
+-> 디스크 파일 하나에 저장되고, 프로그램을 껐다 켜도 데이터가 남는다.
 
 ## 설계 원칙
 

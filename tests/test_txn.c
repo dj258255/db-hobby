@@ -45,7 +45,7 @@ int main(void) {
     CHECK(strstr(o, "kim") && strstr(o, "(1행"), "초기: kim 1행");
     free(o);
 
-    /* ── 롤백 ── */
+    /* -- 롤백 -- */
     o = run(&db, "BEGIN");
     CHECK(strstr(o, "트랜잭션 시작") != NULL, "BEGIN");
     free(o);
@@ -66,7 +66,7 @@ int main(void) {
     CHECK(strstr(o, "0행") && !strstr(o, "lee"), "롤백 후 인덱스도 id=2 못 찾음");
     free(o);
 
-    /* ── 커밋 ── */
+    /* -- 커밋 -- */
     o = run(&db, "BEGIN");
     free(o);
     o = run(&db, "INSERT INTO users VALUES (3, 'park')");
@@ -83,7 +83,7 @@ int main(void) {
 
     db_close(&db);
 
-    /* ── 재시작 영속성 ── */
+    /* -- 재시작 영속성 -- */
     Database db2;
     db_open(&db2, path);
     /* 스키마가 카탈로그에 영속되므로 재선언 없이 바로 질의 */

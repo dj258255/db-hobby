@@ -135,10 +135,10 @@ static int node_insert(BTree *bt, page_id_t pid, bkey_t key, bval_t val,
         return -1;
     }
     if (sp == 0) {
-        bufpool_unpin(bt->bp, pid, 0); /* 자식이 안 쪼개짐 → 이 노드 그대로 */
+        bufpool_unpin(bt->bp, pid, 0); /* 자식이 안 쪼개짐 -> 이 노드 그대로 */
         return 0;
     }
-    /* 자식이 쪼개짐 → (sep, cr)을 i 위치에 끼운다 */
+    /* 자식이 쪼개짐 -> (sep, cr)을 i 위치에 끼운다 */
     for (int j = n->num_keys; j > i; j--) {
         n->keys[j] = n->keys[j - 1];
     }
@@ -184,7 +184,7 @@ int btree_insert(BTree *bt, bkey_t key, bval_t val) {
         return -1;
     }
     if (sp == 1) {
-        /* 루트가 쪼개짐 → 새 루트(높이 +1) */
+        /* 루트가 쪼개짐 -> 새 루트(높이 +1) */
         page_id_t nr;
         BTNode *root = (BTNode *)bufpool_new_page(bt->bp, &nr);
         root->is_leaf = 0;
