@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="494" viewBox="0 0 680 494" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14.5">
+  <rect width="680" height="494" rx="10" fill="#0d1117"/>
+  <rect width="680" height="38" rx="10" fill="#161b22"/>
+  <rect y="28" width="680" height="10" fill="#161b22"/>
+  <circle cx="22" cy="19" r="5.5" fill="#ff5f56"/>
+  <circle cx="40" cy="19" r="5.5" fill="#ffbd2e"/>
+  <circle cx="58" cy="19" r="5.5" fill="#27c93f"/>
+  <text x="340" y="24" text-anchor="middle" fill="#6e7681" font-size="12">minidb</text>
+
+  <g>
+    <text x="20" y="64"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">CREATE TABLE users (id INT, name TEXT);</tspan></text>
+    <text x="20" y="86" fill="#8b949e">테이블 'users' 생성됨 (컬럼 2개)</text>
+    <text x="20" y="108" fill="#8b949e">  (인덱스: id 컬럼)</text>
+    <text x="20" y="130"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">INSERT INTO users VALUES (1, 'kim');</tspan></text>
+    <text x="20" y="152" fill="#8b949e">1개 행 삽입됨</text>
+    <text x="20" y="174"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">INSERT INTO users VALUES (2, 'lee');</tspan></text>
+    <text x="20" y="196" fill="#8b949e">1개 행 삽입됨</text>
+    <text x="20" y="218"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">SELECT * FROM users WHERE id = 2;</tspan></text>
+    <text x="20" y="240" fill="#6e7681">id | name</text>
+    <text x="20" y="262" fill="#3fb950">2 | lee</text>
+    <text x="20" y="284" fill="#6e7681">(1행, 인덱스 사용)</text>
+    <text x="20" y="306"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">BEGIN;</tspan></text>
+    <text x="20" y="328" fill="#3fb950">트랜잭션 시작</text>
+    <text x="20" y="350"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">DELETE FROM users WHERE id = 1;</tspan></text>
+    <text x="20" y="372" fill="#8b949e">1개 행 삭제됨</text>
+    <text x="20" y="394"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">ROLLBACK;</tspan></text>
+    <text x="20" y="416" fill="#f0b429">롤백됨</text>
+    <text x="20" y="438"><tspan fill="#58a6ff">minidb&gt;</tspan> <tspan fill="#e6edf3">SELECT * FROM users;</tspan></text>
+    <text x="20" y="460" fill="#6e7681">id | name</text>
+    <text x="20" y="482" fill="#3fb950">1 | kim   2 | lee   <tspan fill="#6e7681">(2행)</tspan></text>
+  </g>
+</svg>

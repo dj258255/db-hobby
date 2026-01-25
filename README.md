@@ -9,6 +9,8 @@ This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
 covered by tests (110 checks across 10 suites).
 
+![minidb REPL demo](docs/demo.svg)
+
 ## Quick start
 
 ```sh
