@@ -64,15 +64,18 @@ Built bottom-up; each layer sits on the one below it.
 ```
 CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
-SELECT * FROM <t> [WHERE <col> = <value>]
-UPDATE <t> SET <col> = <value> [WHERE <col> = <value>]
-DELETE FROM <t> [WHERE <col> = <value>]
+SELECT * FROM <t> [WHERE <col> <op> <value>]
+UPDATE <t> SET <col> = <value> [WHERE <col> <op> <value>]
+DELETE FROM <t> [WHERE <col> <op> <value>]
 BEGIN | COMMIT | ROLLBACK
+
+<op> is one of  =  !=  <  >  <=  >=
 ```
 
-`WHERE` on the first column (an `INT` primary key) uses the B+Tree index
-(O(log n)); otherwise it falls back to a full scan. Transactions use a
-no-steal + force-at-commit policy and roll back both the heap and the index.
+An `=` on the first column (an `INT` primary key) uses the B+Tree index for an
+O(log n) point lookup; range and inequality conditions fall back to a full scan
+-- the kind of choice a query planner makes. Transactions use a no-steal +
+force-at-commit policy and roll back both the heap and the index.
 
 See `DESIGN.md` for the full layer map and build order.
 
