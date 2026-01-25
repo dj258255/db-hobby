@@ -24,6 +24,9 @@
 
 typedef enum { COL_INT, COL_TEXT } ColType;
 
+/* WHERE 비교 연산자 */
+typedef enum { CMP_EQ, CMP_NE, CMP_LT, CMP_GT, CMP_LE, CMP_GE } CmpOp;
+
 typedef enum { VAL_INT, VAL_TEXT } ValueType;
 typedef struct {
     ValueType type;
@@ -62,7 +65,8 @@ typedef struct {
 typedef struct {
     char table[SQL_NAME_LEN];
     int has_where;                /* WHERE 절이 있나 */
-    char where_col[SQL_NAME_LEN]; /* WHERE <col> = ... */
+    char where_col[SQL_NAME_LEN]; /* WHERE <col> <op> <val> */
+    CmpOp where_op;
     Value where_val;
 } SelectStmt;
 
@@ -70,6 +74,7 @@ typedef struct {
     char table[SQL_NAME_LEN];
     int has_where;
     char where_col[SQL_NAME_LEN];
+    CmpOp where_op;
     Value where_val;
 } DeleteStmt;
 
@@ -79,6 +84,7 @@ typedef struct {
     Value set_val;
     int has_where;
     char where_col[SQL_NAME_LEN];
+    CmpOp where_op;
     Value where_val;
 } UpdateStmt;
 

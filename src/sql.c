@@ -11,6 +11,7 @@
 typedef enum {
     TOK_EOF, TOK_IDENT, TOK_INT, TOK_STRING,
     TOK_LPAREN, TOK_RPAREN, TOK_COMMA, TOK_STAR, TOK_EQ, TOK_SEMI,
+    TOK_LT, TOK_GT, TOK_LE, TOK_GE, TOK_NE,
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
@@ -62,12 +63,25 @@ static Token lex_next(Lexer *lx) {
         return t;
     }
 
+    /* 비교 연산자 (=, !=, <, >, <=, >=). 두 글자를 먼저 본다. */
+    if (c == '=' || c == '<' || c == '>' || c == '!') {
+        char nx = lx->src[lx->pos + 1];
+        if (c == '<' && nx == '=') { lx->pos += 2; t.type = TOK_LE; return t; }
+        if (c == '<' && nx == '>') { lx->pos += 2; t.type = TOK_NE; return t; }
+        if (c == '>' && nx == '=') { lx->pos += 2; t.type = TOK_GE; return t; }
+        if (c == '!' && nx == '=') { lx->pos += 2; t.type = TOK_NE; return t; }
+        if (c == '=') { lx->pos++; t.type = TOK_EQ; return t; }
+        if (c == '<') { lx->pos++; t.type = TOK_LT; return t; }
+        if (c == '>') { lx->pos++; t.type = TOK_GT; return t; }
+        t.type = TOK_ERROR; /* 외톨이 '!' */
+        return t;
+    }
+
     switch (c) {
         case '(': lx->pos++; t.type = TOK_LPAREN; return t;
         case ')': lx->pos++; t.type = TOK_RPAREN; return t;
         case ',': lx->pos++; t.type = TOK_COMMA; return t;
         case '*': lx->pos++; t.type = TOK_STAR; return t;
-        case '=': lx->pos++; t.type = TOK_EQ; return t;
         case ';': lx->pos++; t.type = TOK_SEMI; return t;
         default: break;
     }
@@ -192,6 +206,24 @@ static void parse_value(Parser *p, Value *v) {
     }
 }
 
+static void parse_where_op(Parser *p, CmpOp *out) {
+    if (p_accept(p, TOK_EQ)) {
+        *out = CMP_EQ;
+    } else if (p_accept(p, TOK_NE)) {
+        *out = CMP_NE;
+    } else if (p_accept(p, TOK_LT)) {
+        *out = CMP_LT;
+    } else if (p_accept(p, TOK_GT)) {
+        *out = CMP_GT;
+    } else if (p_accept(p, TOK_LE)) {
+        *out = CMP_LE;
+    } else if (p_accept(p, TOK_GE)) {
+        *out = CMP_GE;
+    } else {
+        p_fail(p, "비교 연산자(=, !=, <, >, <=, >=)가 필요합니다");
+    }
+}
+
 static void parse_create(Parser *p, Statement *st) {
     st->type = STMT_CREATE;
     CreateStmt *c = &st->create;
@@ -254,7 +286,7 @@ static void parse_select(Parser *p, Statement *st) {
     if (p_accept(p, TOK_WHERE)) {
         s->has_where = 1;
         parse_name(p, s->where_col);
-        p_expect(p, TOK_EQ, "= 가 필요합니다");
+        parse_where_op(p, &s->where_op);
         parse_value(p, &s->where_val);
     }
 }
@@ -268,7 +300,7 @@ static void parse_delete(Parser *p, Statement *st) {
     if (p_accept(p, TOK_WHERE)) {
         d->has_where = 1;
         parse_name(p, d->where_col);
-        p_expect(p, TOK_EQ, "= 가 필요합니다");
+        parse_where_op(p, &d->where_op);
         parse_value(p, &d->where_val);
     }
 }
@@ -285,7 +317,7 @@ static void parse_update(Parser *p, Statement *st) {
     if (p_accept(p, TOK_WHERE)) {
         u->has_where = 1;
         parse_name(p, u->where_col);
-        p_expect(p, TOK_EQ, "= 가 필요합니다");
+        parse_where_op(p, &u->where_op);
         parse_value(p, &u->where_val);
     }
 }

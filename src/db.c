@@ -144,8 +144,21 @@ typedef struct {
     int count;
 } SelectCtx;
 
-/* WHERE <col> = <val> 한 조건을 한 행에 적용. WHERE가 없으면 항상 참. */
-static int row_matches(const CreateStmt *schema, int has_where, const char *wcol,
+/* 비교 결과 sign(<0,0,>0)에 연산자를 적용해 참/거짓을 낸다. */
+static int cmp_apply(CmpOp op, long sign) {
+    switch (op) {
+        case CMP_EQ: return sign == 0;
+        case CMP_NE: return sign != 0;
+        case CMP_LT: return sign < 0;
+        case CMP_GT: return sign > 0;
+        case CMP_LE: return sign <= 0;
+        case CMP_GE: return sign >= 0;
+    }
+    return 0;
+}
+
+/* WHERE <col> <op> <val> 한 조건을 한 행에 적용. WHERE가 없으면 항상 참. */
+static int row_matches(const CreateStmt *schema, int has_where, const char *wcol, CmpOp op,
                        const Value *wval, const Value *row) {
     if (!has_where) {
         return 1;
@@ -161,16 +174,17 @@ static int row_matches(const CreateStmt *schema, int has_where, const char *wcol
     }
     const Value *cell = &row[ci];
     if (cell->type == VAL_INT && wval->type == VAL_INT) {
-        return cell->int_val == wval->int_val;
+        long sign = (cell->int_val < wval->int_val) ? -1 : (cell->int_val > wval->int_val ? 1 : 0);
+        return cmp_apply(op, sign);
     }
     if (cell->type == VAL_TEXT && wval->type == VAL_TEXT) {
-        return strcmp(cell->text_val, wval->text_val) == 0;
+        return cmp_apply(op, (long)strcmp(cell->text_val, wval->text_val));
     }
     return 0;
 }
 
 static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Value *row) {
-    return row_matches(schema, sel->has_where, sel->where_col, &sel->where_val, row);
+    return row_matches(schema, sel->has_where, sel->where_col, sel->where_op, &sel->where_val, row);
 }
 
 static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
@@ -205,7 +219,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     int count = 0;
 
     /* WHERE가 인덱스된 PK(첫 컬럼)에 대한 정수 비교면 -> O(log n) 인덱스 조회 */
-    if (sel->has_where && db->has_index &&
+    if (sel->has_where && db->has_index && sel->where_op == CMP_EQ &&
         strcmp(sel->where_col, db->schema.columns[0].name) == 0 &&
         sel->where_val.type == VAL_INT) {
         db->used_index = 1;
@@ -240,6 +254,7 @@ typedef struct {
     const CreateStmt *schema;
     int has_where;
     const char *wcol;
+    CmpOp op;
     const Value *wval;
 } CollectCtx;
 
@@ -248,7 +263,7 @@ static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     CollectCtx *c = ctx_;
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, rec, row);
-    if (row_matches(c->schema, c->has_where, c->wcol, c->wval, row) && c->count < DML_MAX_ROWS) {
+    if (row_matches(c->schema, c->has_where, c->wcol, c->op, c->wval, row) && c->count < DML_MAX_ROWS) {
         c->rids[c->count++] = rid;
     }
     return 0;
@@ -263,6 +278,7 @@ static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
                       .schema = &db->schema,
                       .has_where = d->has_where,
                       .wcol = d->where_col,
+                      .op = d->where_op,
                       .wval = &d->where_val};
     heap_scan(&db->heap, collect_visit, &ctx);
     for (int i = 0; i < ctx.count; i++) {
@@ -300,6 +316,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
                       .schema = &db->schema,
                       .has_where = u->has_where,
                       .wcol = u->where_col,
+                      .op = u->where_op,
                       .wval = &u->where_val};
     heap_scan(&db->heap, collect_visit, &ctx);
 
