@@ -40,21 +40,30 @@ int main(void) {
 
     /* SELECT (no WHERE) */
     CHECK(sql_parse("SELECT * FROM users", &st, err, sizeof(err)) == 0, "SELECT 파싱 성공");
-    CHECK(st.type == STMT_SELECT && st.select.has_where == 0, "WHERE 없음");
+    CHECK(st.type == STMT_SELECT && st.select.where.count == 0, "WHERE 없음");
     CHECK(strcmp(st.select.table, "users") == 0, "SELECT 테이블 users");
 
     /* SELECT ... WHERE int */
     CHECK(sql_parse("SELECT * FROM users WHERE id = 1;", &st, err, sizeof(err)) == 0,
           "SELECT WHERE 파싱 성공");
-    CHECK(st.select.has_where == 1 && strcmp(st.select.where_col, "id") == 0, "WHERE col = id");
-    CHECK(st.select.where_val.type == VAL_INT && st.select.where_val.int_val == 1, "WHERE 값 = 1");
+    CHECK(st.select.where.count == 1 && strcmp(st.select.where.conds[0].col, "id") == 0,
+          "WHERE col = id");
+    CHECK(st.select.where.conds[0].val.type == VAL_INT && st.select.where.conds[0].val.int_val == 1,
+          "WHERE 값 = 1");
 
     /* SELECT ... WHERE text (대소문자 키워드 섞기) */
     CHECK(sql_parse("select * from users where name = 'kim'", &st, err, sizeof(err)) == 0,
           "소문자 키워드도 파싱");
-    CHECK(st.select.where_val.type == VAL_TEXT &&
-              strcmp(st.select.where_val.text_val, "kim") == 0,
+    CHECK(st.select.where.conds[0].val.type == VAL_TEXT &&
+              strcmp(st.select.where.conds[0].val.text_val, "kim") == 0,
           "WHERE 값 = 'kim'");
+
+    /* AND 로 여러 조건 */
+    CHECK(sql_parse("SELECT * FROM t WHERE id > 1 AND name != 'x'", &st, err, sizeof(err)) == 0,
+          "AND 파싱 성공");
+    CHECK(st.select.where.count == 2, "조건 2개");
+    CHECK(st.select.where.conds[0].op == CMP_GT && st.select.where.conds[1].op == CMP_NE,
+          "연산자 > 와 !=");
 
     /* 오류 케이스 */
     CHECK(sql_parse("SELECT FROM users", &st, err, sizeof(err)) == -1, "잘못된 SELECT는 오류");

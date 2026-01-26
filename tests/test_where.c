@@ -87,6 +87,18 @@ int main(void) {
           "name != 'kim' -> lee, park, amy");
     free(o);
 
+    /* AND: 여러 조건 */
+    o = run(&db, "SELECT * FROM users WHERE id > 1 AND id < 4");
+    CHECK(strstr(o, "lee") && strstr(o, "park") && !strstr(o, "kim") && !strstr(o, "amy") &&
+              strstr(o, "(2행"),
+          "id > 1 AND id < 4 -> lee, park");
+    free(o);
+    o = run(&db, "SELECT * FROM users WHERE id >= 2 AND name != 'lee'");
+    CHECK(strstr(o, "park") && strstr(o, "amy") && !strstr(o, "lee") && !strstr(o, "kim") &&
+              strstr(o, "(2행"),
+          "id >= 2 AND name != 'lee' -> park, amy");
+    free(o);
+
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");
     CHECK(strstr(o, "2개 행 삭제됨") != NULL, "DELETE WHERE id >= 3 -> 2개 삭제");

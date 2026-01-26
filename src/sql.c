@@ -15,7 +15,7 @@ typedef enum {
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
-    TOK_DELETE, TOK_UPDATE, TOK_SET,
+    TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND,
     TOK_ERROR
 } TokType;
 
@@ -47,6 +47,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "DELETE")) return TOK_DELETE;
     if (!strcasecmp(s, "UPDATE")) return TOK_UPDATE;
     if (!strcasecmp(s, "SET")) return TOK_SET;
+    if (!strcasecmp(s, "AND")) return TOK_AND;
     return TOK_IDENT;
 }
 
@@ -224,6 +225,22 @@ static void parse_where_op(Parser *p, CmpOp *out) {
     }
 }
 
+/* WHERE 절: 조건 하나 이상을 AND로 묶어 파싱한다. (WHERE 키워드는 이미 소비됨) */
+static void parse_where(Parser *p, Where *w) {
+    w->count = 0;
+    do {
+        if (w->count >= SQL_MAX_CONDS) {
+            p_fail(p, "WHERE 조건이 너무 많습니다");
+            return;
+        }
+        Condition *c = &w->conds[w->count];
+        parse_name(p, c->col);
+        parse_where_op(p, &c->op);
+        parse_value(p, &c->val);
+        w->count++;
+    } while (p_accept(p, TOK_AND));
+}
+
 static void parse_create(Parser *p, Statement *st) {
     st->type = STMT_CREATE;
     CreateStmt *c = &st->create;
@@ -279,46 +296,34 @@ static void parse_insert(Parser *p, Statement *st) {
 static void parse_select(Parser *p, Statement *st) {
     st->type = STMT_SELECT;
     SelectStmt *s = &st->select;
-    s->has_where = 0;
     p_expect(p, TOK_STAR, "지금은 SELECT * 만 지원합니다");
     p_expect(p, TOK_FROM, "FROM이 필요합니다");
     parse_name(p, s->table);
     if (p_accept(p, TOK_WHERE)) {
-        s->has_where = 1;
-        parse_name(p, s->where_col);
-        parse_where_op(p, &s->where_op);
-        parse_value(p, &s->where_val);
+        parse_where(p, &s->where);
     }
 }
 
 static void parse_delete(Parser *p, Statement *st) {
     st->type = STMT_DELETE;
     DeleteStmt *d = &st->del;
-    d->has_where = 0;
     p_expect(p, TOK_FROM, "DELETE 다음에 FROM이 필요합니다");
     parse_name(p, d->table);
     if (p_accept(p, TOK_WHERE)) {
-        d->has_where = 1;
-        parse_name(p, d->where_col);
-        parse_where_op(p, &d->where_op);
-        parse_value(p, &d->where_val);
+        parse_where(p, &d->where);
     }
 }
 
 static void parse_update(Parser *p, Statement *st) {
     st->type = STMT_UPDATE;
     UpdateStmt *u = &st->upd;
-    u->has_where = 0;
     parse_name(p, u->table);
     p_expect(p, TOK_SET, "SET이 필요합니다");
     parse_name(p, u->set_col);
     p_expect(p, TOK_EQ, "= 가 필요합니다");
     parse_value(p, &u->set_val);
     if (p_accept(p, TOK_WHERE)) {
-        u->has_where = 1;
-        parse_name(p, u->where_col);
-        parse_where_op(p, &u->where_op);
-        parse_value(p, &u->where_val);
+        parse_where(p, &u->where);
     }
 }
 

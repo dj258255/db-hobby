@@ -157,15 +157,11 @@ static int cmp_apply(CmpOp op, long sign) {
     return 0;
 }
 
-/* WHERE <col> <op> <val> 한 조건을 한 행에 적용. WHERE가 없으면 항상 참. */
-static int row_matches(const CreateStmt *schema, int has_where, const char *wcol, CmpOp op,
-                       const Value *wval, const Value *row) {
-    if (!has_where) {
-        return 1;
-    }
+/* 한 조건 <col> <op> <val> 을 한 행에 적용. */
+static int cond_matches(const CreateStmt *schema, const Condition *cond, const Value *row) {
     int ci = -1;
     for (int i = 0; i < schema->num_columns; i++) {
-        if (strcmp(schema->columns[i].name, wcol) == 0) {
+        if (strcmp(schema->columns[i].name, cond->col) == 0) {
             ci = i;
         }
     }
@@ -173,18 +169,25 @@ static int row_matches(const CreateStmt *schema, int has_where, const char *wcol
         return 0;
     }
     const Value *cell = &row[ci];
-    if (cell->type == VAL_INT && wval->type == VAL_INT) {
-        long sign = (cell->int_val < wval->int_val) ? -1 : (cell->int_val > wval->int_val ? 1 : 0);
-        return cmp_apply(op, sign);
+    const Value *wv = &cond->val;
+    if (cell->type == VAL_INT && wv->type == VAL_INT) {
+        long sign = (cell->int_val < wv->int_val) ? -1 : (cell->int_val > wv->int_val ? 1 : 0);
+        return cmp_apply(cond->op, sign);
     }
-    if (cell->type == VAL_TEXT && wval->type == VAL_TEXT) {
-        return cmp_apply(op, (long)strcmp(cell->text_val, wval->text_val));
+    if (cell->type == VAL_TEXT && wv->type == VAL_TEXT) {
+        return cmp_apply(cond->op, (long)strcmp(cell->text_val, wv->text_val));
     }
     return 0;
 }
 
-static int match_where(const CreateStmt *schema, const SelectStmt *sel, const Value *row) {
-    return row_matches(schema, sel->has_where, sel->where_col, sel->where_op, &sel->where_val, row);
+/* WHERE 절(AND로 묶인 조건들)을 한 행에 적용. count==0 이면 항상 참. */
+static int where_matches(const CreateStmt *schema, const Where *w, const Value *row) {
+    for (int i = 0; i < w->count; i++) {
+        if (!cond_matches(schema, &w->conds[i], row)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
@@ -193,7 +196,7 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     SelectCtx *ctx = ctx_;
     Value row[SQL_MAX_COLS];
     decode_row(ctx->schema, rec, row);
-    if (!match_where(ctx->schema, ctx->sel, row)) {
+    if (!where_matches(ctx->schema, &ctx->sel->where, row)) {
         return 0;
     }
     print_row(ctx->out, ctx->schema, row);
@@ -219,12 +222,12 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     int count = 0;
 
     /* WHERE가 인덱스된 PK(첫 컬럼)에 대한 정수 비교면 -> O(log n) 인덱스 조회 */
-    if (sel->has_where && db->has_index && sel->where_op == CMP_EQ &&
-        strcmp(sel->where_col, db->schema.columns[0].name) == 0 &&
-        sel->where_val.type == VAL_INT) {
+    if (sel->where.count == 1 && db->has_index && sel->where.conds[0].op == CMP_EQ &&
+        strcmp(sel->where.conds[0].col, db->schema.columns[0].name) == 0 &&
+        sel->where.conds[0].val.type == VAL_INT) {
         db->used_index = 1;
         bval_t encoded;
-        if (btree_search(&db->index, sel->where_val.int_val, &encoded) == 0) {
+        if (btree_search(&db->index, sel->where.conds[0].val.int_val, &encoded) == 0) {
             uint8_t recbuf[PAGE_SIZE];
             uint16_t len;
             if (heap_get(&db->heap, rid_decode(encoded), recbuf, &len) == 0) {
@@ -252,10 +255,7 @@ typedef struct {
     RID rids[DML_MAX_ROWS];
     int count;
     const CreateStmt *schema;
-    int has_where;
-    const char *wcol;
-    CmpOp op;
-    const Value *wval;
+    const Where *where;
 } CollectCtx;
 
 static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
@@ -263,7 +263,7 @@ static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     CollectCtx *c = ctx_;
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, rec, row);
-    if (row_matches(c->schema, c->has_where, c->wcol, c->op, c->wval, row) && c->count < DML_MAX_ROWS) {
+    if (where_matches(c->schema, c->where, row) && c->count < DML_MAX_ROWS) {
         c->rids[c->count++] = rid;
     }
     return 0;
@@ -274,12 +274,7 @@ static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", d->table);
         return -1;
     }
-    CollectCtx ctx = {.count = 0,
-                      .schema = &db->schema,
-                      .has_where = d->has_where,
-                      .wcol = d->where_col,
-                      .op = d->where_op,
-                      .wval = &d->where_val};
+    CollectCtx ctx = {.count = 0, .schema = &db->schema, .where = &d->where};
     heap_scan(&db->heap, collect_visit, &ctx);
     for (int i = 0; i < ctx.count; i++) {
         heap_delete(&db->heap, ctx.rids[i]);
@@ -312,12 +307,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         return -1;
     }
 
-    CollectCtx ctx = {.count = 0,
-                      .schema = &db->schema,
-                      .has_where = u->has_where,
-                      .wcol = u->where_col,
-                      .op = u->where_op,
-                      .wval = &u->where_val};
+    CollectCtx ctx = {.count = 0, .schema = &db->schema, .where = &u->where};
     heap_scan(&db->heap, collect_visit, &ctx);
 
     int n = 0;

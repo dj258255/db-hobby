@@ -39,6 +39,20 @@ typedef struct {
     ColType type;
 } ColumnDef;
 
+/* WHERE 한 조건: <col> <op> <val> */
+typedef struct {
+    char col[SQL_NAME_LEN];
+    CmpOp op;
+    Value val;
+} Condition;
+
+/* WHERE 절: 여러 조건을 AND로 묶는다. count == 0 이면 WHERE 없음. */
+#define SQL_MAX_CONDS 8
+typedef struct {
+    int count;
+    Condition conds[SQL_MAX_CONDS];
+} Where;
+
 typedef enum {
     STMT_CREATE,
     STMT_INSERT,
@@ -64,28 +78,19 @@ typedef struct {
 
 typedef struct {
     char table[SQL_NAME_LEN];
-    int has_where;                /* WHERE 절이 있나 */
-    char where_col[SQL_NAME_LEN]; /* WHERE <col> <op> <val> */
-    CmpOp where_op;
-    Value where_val;
+    Where where;
 } SelectStmt;
 
 typedef struct {
     char table[SQL_NAME_LEN];
-    int has_where;
-    char where_col[SQL_NAME_LEN];
-    CmpOp where_op;
-    Value where_val;
+    Where where;
 } DeleteStmt;
 
 typedef struct {
     char table[SQL_NAME_LEN];
     char set_col[SQL_NAME_LEN];
     Value set_val;
-    int has_where;
-    char where_col[SQL_NAME_LEN];
-    CmpOp where_op;
-    Value where_val;
+    Where where;
 } UpdateStmt;
 
 typedef struct {
