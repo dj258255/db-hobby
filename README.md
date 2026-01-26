@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (110 checks across 10 suites).
+covered by tests (127 checks across 11 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -72,18 +72,21 @@ BEGIN | COMMIT | ROLLBACK
 <cond> is  <col> <op> <value>,  where <op> is one of  =  !=  <  >  <=  >=
 ```
 
-An `=` on the first column (an `INT` primary key) uses the B+Tree index for an
-O(log n) point lookup; range and inequality conditions fall back to a full scan
--- the kind of choice a query planner makes. Transactions use a no-steal +
-force-at-commit policy and roll back both the heap and the index.
+An `=`, `<`, `>`, `<=`, or `>=` on the first column (an `INT` primary key) uses
+the B+Tree index -- `=` is an O(log n) point lookup, the others walk the linked
+leaf chain as a range scan. `!=`, conditions on other columns, and compound
+`AND` conditions fall back to a full scan -- the kind of choice a query planner
+makes. Transactions use a no-steal + force-at-commit policy and roll back both
+the heap and the index.
 
 See `DESIGN.md` for the full layer map and build order.
 
 ## Scope (honest limitations)
 
 Kept simple on purpose: one table per database, the first column is treated as a
-unique integer primary key, `WHERE` is a single `=` comparison, and there is no
-isolation/concurrency (one transaction at a time). B+Tree deletion isn't
+unique integer primary key, `WHERE` supports comparison operators chained with
+`AND` (no `OR`, no parentheses), and there is no isolation/concurrency (one
+transaction at a time). B+Tree deletion isn't
 implemented (deleted rows are tombstoned in the heap, so a stale index entry is
 harmless). These are noted in the code where they matter.
 
