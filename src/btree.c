@@ -265,3 +265,40 @@ int btree_scan(BTree *bt, btree_visit_fn visit, void *ctx) {
     }
     return 0;
 }
+
+int btree_seek_scan(BTree *bt, bkey_t start, btree_visit_fn visit, void *ctx) {
+    /* start가 들어갈 리프로 바로 내려간다 */
+    page_id_t pid = bt->root;
+    for (;;) {
+        BTNode *n = fetch(bt, pid);
+        if (n->is_leaf) {
+            bufpool_unpin(bt->bp, pid, 0);
+            break;
+        }
+        int i = 0;
+        while (i < n->num_keys && start >= n->keys[i]) {
+            i++;
+        }
+        page_id_t c = n->u.children[i];
+        bufpool_unpin(bt->bp, pid, 0);
+        pid = c;
+    }
+    /* 그 리프부터 체인을 따라간다. 첫 리프에서는 start 미만 키를 건너뛴다. */
+    while (pid != 0) {
+        BTNode *n = fetch(bt, pid);
+        for (int i = 0; i < n->num_keys; i++) {
+            if (n->keys[i] < start) {
+                continue;
+            }
+            int r = visit(n->keys[i], n->u.values[i], ctx);
+            if (r != 0) {
+                bufpool_unpin(bt->bp, pid, 0);
+                return r;
+            }
+        }
+        page_id_t nxt = n->next_leaf;
+        bufpool_unpin(bt->bp, pid, 0);
+        pid = nxt;
+    }
+    return 0;
+}

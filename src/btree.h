@@ -47,4 +47,8 @@ void btree_reload_root(BTree *bt);
 typedef int (*btree_visit_fn)(bkey_t key, bval_t val, void *ctx);
 int btree_scan(BTree *bt, btree_visit_fn visit, void *ctx);
 
+/* start 이상(key >= start)인 키부터 오름차순으로 visit한다(범위 스캔의 lower bound).
+ * start가 있는 리프로 바로 내려간 뒤 리프 체인을 따라 옆으로 읽는다. */
+int btree_seek_scan(BTree *bt, bkey_t start, btree_visit_fn visit, void *ctx);
+
 #endif /* MINIDB_BTREE_H */

@@ -47,7 +47,7 @@ int main(void) {
     CHECK(strstr(o, "park") && strstr(o, "amy") && !strstr(o, "kim") && !strstr(o, "lee") &&
               strstr(o, "(2행"),
           "id > 2  -> park, amy");
-    CHECK(db.used_index == 0, "범위 조건(>)은 풀 스캔");
+    CHECK(db.used_index == 1, "범위 조건(>)도 인덱스 (범위 스캔)");
     free(o);
 
     /* >= */
@@ -60,6 +60,7 @@ int main(void) {
     /* < */
     o = run(&db, "SELECT * FROM users WHERE id < 2");
     CHECK(strstr(o, "kim") && !strstr(o, "lee") && strstr(o, "(1행"), "id < 2  -> kim");
+    CHECK(db.used_index == 1, "범위 조건(<)도 인덱스");
     free(o);
 
     /* <= */

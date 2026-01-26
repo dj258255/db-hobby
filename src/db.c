@@ -204,6 +204,32 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     return 0;
 }
 
+/* 인덱스 범위 스캔: B+Tree가 준 (키, RID)마다 힙 행을 읽어 출력한다.
+ * tombstone(삭제된 슬롯)이면 heap_get이 -1이라 자동으로 빠진다. */
+typedef struct {
+    Database *db;
+    bkey_t bound;
+    CmpOp op;
+    FILE *out;
+    int count;
+} RangeCtx;
+
+static int range_visit(bkey_t key, bval_t val, void *ctx_) {
+    RangeCtx *r = ctx_;
+    if (r->op == CMP_GT && key == r->bound) return 0;  /* seek는 ==도 주니 건너뜀 */
+    if (r->op == CMP_LT && key >= r->bound) return 1;  /* 상한 도달 -> 멈춤 */
+    if (r->op == CMP_LE && key > r->bound) return 1;
+    uint8_t recbuf[PAGE_SIZE];
+    uint16_t len;
+    if (heap_get(&r->db->heap, rid_decode(val), recbuf, &len) == 0) {
+        Value row[SQL_MAX_COLS];
+        decode_row(&r->db->schema, recbuf, row);
+        print_row(r->out, &r->db->schema, row);
+        r->count++;
+    }
+    return 0;
+}
+
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     if (!db->has_table || strcmp(sel->table, db->schema.table) != 0) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
@@ -221,13 +247,17 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     db->used_index = 0;
     int count = 0;
 
-    /* WHERE가 인덱스된 PK(첫 컬럼)에 대한 정수 비교면 -> O(log n) 인덱스 조회 */
-    if (sel->where.count == 1 && db->has_index && sel->where.conds[0].op == CMP_EQ &&
-        strcmp(sel->where.conds[0].col, db->schema.columns[0].name) == 0 &&
-        sel->where.conds[0].val.type == VAL_INT) {
+    /* WHERE가 "PK(첫 컬럼) 정수 비교" 단일 조건이면 인덱스를 쓴다. */
+    const Condition *c0 = (sel->where.count == 1) ? &sel->where.conds[0] : NULL;
+    int pk_cond = c0 && db->has_index &&
+                  strcmp(c0->col, db->schema.columns[0].name) == 0 &&
+                  c0->val.type == VAL_INT;
+
+    if (pk_cond && c0->op == CMP_EQ) {
+        /* = -> 점 조회 O(log n) */
         db->used_index = 1;
         bval_t encoded;
-        if (btree_search(&db->index, sel->where.conds[0].val.int_val, &encoded) == 0) {
+        if (btree_search(&db->index, c0->val.int_val, &encoded) == 0) {
             uint8_t recbuf[PAGE_SIZE];
             uint16_t len;
             if (heap_get(&db->heap, rid_decode(encoded), recbuf, &len) == 0) {
@@ -237,8 +267,19 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
                 count++;
             }
         }
+    } else if (pk_cond && (c0->op == CMP_GT || c0->op == CMP_GE || c0->op == CMP_LT ||
+                           c0->op == CMP_LE)) {
+        /* <, >, <=, >= -> 인덱스 범위 스캔 (리프 체인) */
+        db->used_index = 1;
+        RangeCtx rc = {db, c0->val.int_val, c0->op, out, 0};
+        if (c0->op == CMP_GT || c0->op == CMP_GE) {
+            btree_seek_scan(&db->index, c0->val.int_val, range_visit, &rc);
+        } else {
+            btree_scan(&db->index, range_visit, &rc);
+        }
+        count = rc.count;
     } else {
-        /* 그 외 -> 풀 스캔 */
+        /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> 풀 스캔 */
         SelectCtx ctx = {&db->schema, sel, out, 0};
         heap_scan(&db->heap, select_visit, &ctx);
         count = ctx.count;
