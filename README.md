@@ -64,12 +64,12 @@ Built bottom-up; each layer sits on the one below it.
 ```
 CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
-SELECT * FROM <t> [WHERE <col> <op> <value>]
-UPDATE <t> SET <col> = <value> [WHERE <col> <op> <value>]
-DELETE FROM <t> [WHERE <col> <op> <value>]
+SELECT * FROM <t> [WHERE <cond> [AND <cond>] ...]
+UPDATE <t> SET <col> = <value> [WHERE <cond> [AND <cond>] ...]
+DELETE FROM <t> [WHERE <cond> [AND <cond>] ...]
 BEGIN | COMMIT | ROLLBACK
 
-<op> is one of  =  !=  <  >  <=  >=
+<cond> is  <col> <op> <value>,  where <op> is one of  =  !=  <  >  <=  >=
 ```
 
 An `=` on the first column (an `INT` primary key) uses the B+Tree index for an
