@@ -102,6 +102,16 @@ int main(void) {
     CHECK(strstr(o, "(1행") != NULL, "JOIN LIMIT 1 -> 1행");
     free(o);
 
+    /* 인덱스 중첩 루프 조인: 안쪽(users)의 PK(id)가 ON 컬럼이면 점 조회로 */
+    o = run(&db, "SELECT * FROM orders JOIN users ON orders.uid = users.id");
+    CHECK(strstr(o, "(3행") != NULL, "orders x users (uid=id) -> 3행 (uid 9는 매칭 없음)");
+    CHECK(db.used_index == 1, "안쪽 PK가 ON 컬럼 -> 인덱스 조인");
+    free(o);
+    /* 안쪽 컬럼이 PK가 아니면(users x orders, uid는 PK 아님) 전체 스캔 */
+    o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid");
+    CHECK(db.used_index == 0, "안쪽 비PK 조인 -> 전체 스캔");
+    free(o);
+
     /* 재오픈해도 두 테이블 다 살아 있다(카탈로그 + 파일별 영속) */
     db_close(&db);
     db_open(&db, path);

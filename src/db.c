@@ -482,10 +482,41 @@ typedef struct {
     /* ON 양변을 (side: 0=왼쪽테이블 1=오른쪽테이블, idx: 컬럼 위치)로 미리 해소 */
     int al_side, al_idx;
     int ar_side, ar_idx;
+    /* 인덱스 중첩 루프 조인: 안쪽(R)이 PK 인덱스를 갖고 ON이 그 PK와 맞으면,
+     * 안쪽 전체 스캔 대신 바깥 행의 키로 점 조회한다. */
+    int use_index;     /* 1이면 인덱스 NLJ */
+    int outer_key_idx; /* 바깥(L) 행에서 조인 키를 꺼낼 컬럼 위치 */
     FILE *out;
     int count;
     const Value *lrow; /* 바깥 루프의 현재 행 */
 } JoinCtx;
+
+/* 결합된 (lrow, rrow) 한 쌍을 ON·WHERE로 거른 뒤 출력한다.
+ * LIMIT에 도달했으면 1을 돌려 바깥/안쪽 루프를 멈추게 한다. */
+static int join_emit(JoinCtx *j, const Value *lrow, const Value *rrow) {
+    const Value *a = (j->al_side == 0) ? &lrow[j->al_idx] : &rrow[j->al_idx];
+    const Value *b = (j->ar_side == 0) ? &lrow[j->ar_idx] : &rrow[j->ar_idx];
+    if (!values_equal(a, b)) {
+        return 0;
+    }
+    if (!where_matches_join(&j->L->schema, lrow, &j->R->schema, rrow, &j->sel->where)) {
+        return 0;
+    }
+    /* 결합 행 출력: 왼쪽 컬럼들 다음 오른쪽 컬럼들 */
+    for (int i = 0; i < j->L->schema.num_columns; i++) {
+        if (i) {
+            fprintf(j->out, " | ");
+        }
+        print_value(j->out, &lrow[i]);
+    }
+    for (int i = 0; i < j->R->schema.num_columns; i++) {
+        fprintf(j->out, " | ");
+        print_value(j->out, &rrow[i]);
+    }
+    fprintf(j->out, "\n");
+    j->count++;
+    return (j->sel->limit >= 0 && j->count >= j->sel->limit); /* LIMIT 도달 -> 멈춤 */
+}
 
 /* [qtbl.]col 을 (side, idx)로 해소한다. qtbl 없으면 왼쪽부터 찾는다. 0 성공, -1 실패. */
 static int resolve_ref(Table *L, Table *R, const char *qtbl, const char *col, int *side,
@@ -534,33 +565,7 @@ static int join_inner_visit(RID rid, const void *rec, uint16_t len, void *ctx_) 
     JoinCtx *j = ctx_;
     Value rrow[SQL_MAX_COLS];
     decode_row(&j->R->schema, rec, rrow);
-
-    /* ON 양변의 셀을 꺼내 같은지 본다 */
-    const Value *a = (j->al_side == 0) ? &j->lrow[j->al_idx] : &rrow[j->al_idx];
-    const Value *b = (j->ar_side == 0) ? &j->lrow[j->ar_idx] : &rrow[j->ar_idx];
-    if (!values_equal(a, b)) {
-        return 0;
-    }
-    if (!where_matches_join(&j->L->schema, j->lrow, &j->R->schema, rrow, &j->sel->where)) {
-        return 0;
-    }
-    /* 결합 행 출력: 왼쪽 컬럼들 다음 오른쪽 컬럼들 */
-    for (int i = 0; i < j->L->schema.num_columns; i++) {
-        if (i) {
-            fprintf(j->out, " | ");
-        }
-        print_value(j->out, &j->lrow[i]);
-    }
-    for (int i = 0; i < j->R->schema.num_columns; i++) {
-        fprintf(j->out, " | ");
-        print_value(j->out, &rrow[i]);
-    }
-    fprintf(j->out, "\n");
-    j->count++;
-    if (j->sel->limit >= 0 && j->count >= j->sel->limit) {
-        return 1; /* LIMIT 도달 -> 안쪽 스캔 중단 */
-    }
-    return 0;
+    return join_emit(j, j->lrow, rrow);
 }
 
 static int join_outer_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
@@ -570,7 +575,26 @@ static int join_outer_visit(RID rid, const void *rec, uint16_t len, void *ctx_) 
     Value lrow[SQL_MAX_COLS];
     decode_row(&j->L->schema, rec, lrow);
     j->lrow = lrow;
-    int r = heap_scan(&j->R->heap, join_inner_visit, j); /* 바깥 한 행마다 안쪽 전체 스캔 */
+    int r;
+    if (j->use_index) {
+        /* 인덱스 NLJ: 안쪽 전체 스캔 대신 바깥 행의 키로 R의 PK 인덱스를 점 조회. */
+        r = 0;
+        const Value *k = &lrow[j->outer_key_idx];
+        if (k->type == VAL_INT) {
+            bval_t encoded;
+            if (btree_search(&j->R->index, k->int_val, &encoded) == 0) {
+                uint8_t recbuf[PAGE_SIZE];
+                uint16_t len2;
+                if (heap_get(&j->R->heap, rid_decode(encoded), recbuf, &len2) == 0) {
+                    Value rrow[SQL_MAX_COLS];
+                    decode_row(&j->R->schema, recbuf, rrow);
+                    r = join_emit(j, lrow, rrow);
+                }
+            }
+        }
+    } else {
+        r = heap_scan(&j->R->heap, join_inner_visit, j); /* 바깥 한 행마다 안쪽 전체 스캔 */
+    }
     j->lrow = NULL;
     return r; /* 안쪽이 LIMIT로 멈췄으면(!=0) 바깥도 멈춘다 */
 }
@@ -587,11 +611,23 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         return -1;
     }
 
-    JoinCtx j = {L, R, sel, 0, 0, 0, 0, out, 0, NULL};
+    JoinCtx j = {L, R, sel, 0, 0, 0, 0, 0, 0, out, 0, NULL};
     if (resolve_ref(L, R, sel->join.l_tbl, sel->join.l_col, &j.al_side, &j.al_idx) != 0 ||
         resolve_ref(L, R, sel->join.r_tbl, sel->join.r_col, &j.ar_side, &j.ar_idx) != 0) {
         fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
         return -1;
+    }
+
+    /* 인덱스 NLJ 가능 여부: 한 변이 R의 PK(첫 컬럼)이고 R에 인덱스가 있으며,
+     * 다른 변이 바깥(L)의 컬럼이면, 안쪽 전체 스캔을 점 조회로 바꾼다. */
+    if (R->has_index) {
+        if (j.ar_side == 1 && j.ar_idx == 0 && j.al_side == 0) {
+            j.use_index = 1;
+            j.outer_key_idx = j.al_idx;
+        } else if (j.al_side == 1 && j.al_idx == 0 && j.ar_side == 0) {
+            j.use_index = 1;
+            j.outer_key_idx = j.ar_idx;
+        }
     }
 
     /* 헤더: 양 테이블 컬럼을 table.col 로 한정해 출력 */
@@ -606,9 +642,9 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     }
     fprintf(out, "\n");
 
-    db->used_index = 0;
+    db->used_index = j.use_index;
     heap_scan(&L->heap, join_outer_visit, &j);
-    fprintf(out, "(%d행)\n", j.count);
+    fprintf(out, "(%d행%s)\n", j.count, j.use_index ? ", 인덱스 조인" : "");
     return 0;
 }
 
