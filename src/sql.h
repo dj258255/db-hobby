@@ -15,7 +15,9 @@
  * 지원 문법(학습용 최소 부분집합):
  *   CREATE TABLE <name> (<col> INT|TEXT, ...)
  *   INSERT INTO <name> VALUES (<int|'text'>, ...)
- *   SELECT * FROM <name> [WHERE <col> = <int|'text'>]
+ *   SELECT * FROM <name> [WHERE <cond> [AND <cond>] [OR ...]]
+ *                        [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
+ *   <cond> = <col> <op> <val>,  <op> = =, !=, <, >, <=, >=
  */
 
 #define SQL_MAX_COLS 32
@@ -46,11 +48,20 @@ typedef struct {
     Value val;
 } Condition;
 
-/* WHERE 절: 여러 조건을 AND로 묶는다. count == 0 이면 WHERE 없음. */
+/* AND로 묶인 조건 묶음(DNF 한 항). 전부 참이어야 이 묶음이 참. */
 #define SQL_MAX_CONDS 8
 typedef struct {
     int count;
     Condition conds[SQL_MAX_CONDS];
+} AndGroup;
+
+/* WHERE 절 = DNF. AND 묶음들을 OR로 잇는다(어느 한 묶음이라도 참이면 매칭).
+ *   a AND b OR c  ->  groups = [ [a,b], [c] ]
+ * count == 0 이면 WHERE 없음(항상 참). AND가 OR보다 강하게 묶인다. */
+#define SQL_MAX_GROUPS 8
+typedef struct {
+    int count;
+    AndGroup groups[SQL_MAX_GROUPS];
 } Where;
 
 typedef enum {
@@ -79,6 +90,9 @@ typedef struct {
 typedef struct {
     char table[SQL_NAME_LEN];
     Where where;
+    char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음 */
+    int order_desc;               /* 1이면 DESC, 0이면 ASC */
+    long limit;                   /* -1이면 LIMIT 없음 */
 } SelectStmt;
 
 typedef struct {

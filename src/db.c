@@ -1,6 +1,7 @@
 #include "db.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -180,14 +181,27 @@ static int cond_matches(const CreateStmt *schema, const Condition *cond, const V
     return 0;
 }
 
-/* WHERE 절(AND로 묶인 조건들)을 한 행에 적용. count==0 이면 항상 참. */
-static int where_matches(const CreateStmt *schema, const Where *w, const Value *row) {
-    for (int i = 0; i < w->count; i++) {
-        if (!cond_matches(schema, &w->conds[i], row)) {
+/* 한 AND 묶음: 조건이 전부 참이어야 참. */
+static int group_matches(const CreateStmt *schema, const AndGroup *g, const Value *row) {
+    for (int i = 0; i < g->count; i++) {
+        if (!cond_matches(schema, &g->conds[i], row)) {
             return 0;
         }
     }
     return 1;
+}
+
+/* WHERE 절(DNF): 어느 한 AND 묶음이라도 참이면 참. count==0 이면 WHERE 없음 -> 항상 참. */
+static int where_matches(const CreateStmt *schema, const Where *w, const Value *row) {
+    if (w->count == 0) {
+        return 1;
+    }
+    for (int i = 0; i < w->count; i++) {
+        if (group_matches(schema, &w->groups[i], row)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
@@ -230,6 +244,104 @@ static int range_visit(bkey_t key, bval_t val, void *ctx_) {
     return 0;
 }
 
+/* ------------- ORDER BY / LIMIT: materialize 경로 -------------
+ * 스트리밍으론 정렬을 못 한다(마지막 행까지 봐야 첫 출력 순서가 정해짐).
+ * WHERE에 맞는 행을 버퍼에 모은 뒤(= PostgreSQL의 Sort 노드) 정렬하고
+ * LIMIT만큼 자른다. 단순함을 위해 이 경로는 인덱스 대신 풀 스캔으로 모은다.
+ */
+#define SELECT_MAX_ROWS 4096
+
+typedef struct {
+    const CreateStmt *schema;
+    const Where *where;
+    Value *rows; /* count * ncols 짜리 평면 배열. 행 i는 rows + i*ncols */
+    int ncols;
+    int cap;
+    int count;
+} MatCtx;
+
+static int mat_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid;
+    (void)len;
+    MatCtx *m = ctx_;
+    if (m->count >= m->cap) {
+        return 0; /* 버퍼 가득 — 학습용 상한 */
+    }
+    Value row[SQL_MAX_COLS];
+    decode_row(m->schema, rec, row);
+    if (!where_matches(m->schema, m->where, row)) {
+        return 0;
+    }
+    memcpy(m->rows + (size_t)m->count * m->ncols, row, (size_t)m->ncols * sizeof(Value));
+    m->count++;
+    return 0;
+}
+
+/* qsort 비교기는 컨텍스트를 못 받으니(이식성 위해 qsort_r 회피) 정렬 컬럼만
+ * 파일 정적으로 둔다. 단일 스레드 학습용이라 안전. ASC로만 비교하고
+ * DESC는 정렬 뒤 배열을 뒤집어 처리한다. */
+static int g_sort_ci;
+
+static int row_cmp(const void *a, const void *b) {
+    const Value *x = (const Value *)a + g_sort_ci;
+    const Value *y = (const Value *)b + g_sort_ci;
+    if (x->type == VAL_INT) {
+        if (x->int_val < y->int_val) return -1;
+        if (x->int_val > y->int_val) return 1;
+        return 0;
+    }
+    return strcmp(x->text_val, y->text_val);
+}
+
+static int exec_select_sorted(Database *db, const SelectStmt *sel, FILE *out) {
+    int ncols = db->schema.num_columns;
+    Value *rows = malloc((size_t)SELECT_MAX_ROWS * ncols * sizeof(Value));
+    if (!rows) {
+        fprintf(out, "ERROR: 메모리 부족\n");
+        return -1;
+    }
+    MatCtx m = {&db->schema, &sel->where, rows, ncols, SELECT_MAX_ROWS, 0};
+    heap_scan(&db->heap, mat_visit, &m);
+
+    if (sel->order_col[0] != '\0') {
+        int ci = -1;
+        for (int i = 0; i < ncols; i++) {
+            if (strcmp(db->schema.columns[i].name, sel->order_col) == 0) {
+                ci = i;
+            }
+        }
+        if (ci < 0) {
+            fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
+            free(rows);
+            return -1;
+        }
+        g_sort_ci = ci;
+        qsort(rows, m.count, (size_t)ncols * sizeof(Value), row_cmp);
+        if (sel->order_desc) {
+            /* ASC 정렬 결과를 뒤집어 DESC로 만든다 */
+            Value tmp[SQL_MAX_COLS];
+            for (int i = 0, j = m.count - 1; i < j; i++, j--) {
+                memcpy(tmp, rows + (size_t)i * ncols, (size_t)ncols * sizeof(Value));
+                memcpy(rows + (size_t)i * ncols, rows + (size_t)j * ncols,
+                       (size_t)ncols * sizeof(Value));
+                memcpy(rows + (size_t)j * ncols, tmp, (size_t)ncols * sizeof(Value));
+            }
+        }
+    }
+
+    int count = 0;
+    for (int i = 0; i < m.count; i++) {
+        if (sel->limit >= 0 && count >= sel->limit) {
+            break;
+        }
+        print_row(out, &db->schema, rows + (size_t)i * ncols);
+        count++;
+    }
+    free(rows);
+    fprintf(out, "(%d행)\n", count);
+    return 0;
+}
+
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     if (!db->has_table || strcmp(sel->table, db->schema.table) != 0) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
@@ -245,10 +357,19 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     fprintf(out, "\n");
 
     db->used_index = 0;
+
+    /* ORDER BY나 LIMIT이 있으면 모았다가 정렬/자르는 경로로 간다. */
+    if (sel->order_col[0] != '\0' || sel->limit >= 0) {
+        return exec_select_sorted(db, sel, out);
+    }
+
     int count = 0;
 
-    /* WHERE가 "PK(첫 컬럼) 정수 비교" 단일 조건이면 인덱스를 쓴다. */
-    const Condition *c0 = (sel->where.count == 1) ? &sel->where.conds[0] : NULL;
+    /* WHERE가 "PK(첫 컬럼) 정수 비교" 단일 조건이면 인덱스를 쓴다.
+     * (OR 묶음 하나, 그 안에 조건 하나일 때만.) */
+    const Condition *c0 = (sel->where.count == 1 && sel->where.groups[0].count == 1)
+                              ? &sel->where.groups[0].conds[0]
+                              : NULL;
     int pk_cond = c0 && db->has_index &&
                   strcmp(c0->col, db->schema.columns[0].name) == 0 &&
                   c0->val.type == VAL_INT;

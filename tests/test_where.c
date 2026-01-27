@@ -100,6 +100,44 @@ int main(void) {
           "id >= 2 AND name != 'lee' -> park, amy");
     free(o);
 
+    /* OR: 어느 한 묶음이라도 참이면 매칭 */
+    o = run(&db, "SELECT * FROM users WHERE id = 1 OR id = 4");
+    CHECK(strstr(o, "kim") && strstr(o, "amy") && !strstr(o, "lee") && !strstr(o, "park") &&
+              strstr(o, "(2행"),
+          "id = 1 OR id = 4 -> kim, amy");
+    free(o);
+    /* AND가 OR보다 강하게: (id=2 AND name='lee') OR id=4 -> lee, amy */
+    o = run(&db, "SELECT * FROM users WHERE id = 2 AND name = 'lee' OR id = 4");
+    CHECK(strstr(o, "lee") && strstr(o, "amy") && !strstr(o, "kim") && !strstr(o, "park") &&
+              strstr(o, "(2행"),
+          "id=2 AND name='lee' OR id=4 -> lee, amy");
+    free(o);
+
+    /* ORDER BY: 출력 순서를 위치로 검증 (id: 1=kim 2=lee 3=park 4=amy) */
+    o = run(&db, "SELECT * FROM users ORDER BY id DESC");
+    {
+        char *p4 = strstr(o, "amy"), *p3 = strstr(o, "park"), *p1 = strstr(o, "kim");
+        CHECK(p4 && p3 && p1 && p4 < p3 && p3 < p1, "ORDER BY id DESC -> amy, park, lee, kim");
+    }
+    free(o);
+    o = run(&db, "SELECT * FROM users ORDER BY name");
+    {
+        char *amy = strstr(o, "amy"), *kim = strstr(o, "kim"), *park = strstr(o, "park");
+        CHECK(amy && kim && park && amy < kim && kim < park,
+              "ORDER BY name(ASC) -> amy, kim, lee, park");
+    }
+    free(o);
+
+    /* LIMIT: ORDER BY와 함께 상위 N개만 */
+    o = run(&db, "SELECT * FROM users ORDER BY id DESC LIMIT 2");
+    CHECK(strstr(o, "amy") && strstr(o, "park") && !strstr(o, "lee") && !strstr(o, "kim") &&
+              strstr(o, "(2행"),
+          "ORDER BY id DESC LIMIT 2 -> amy, park");
+    free(o);
+    o = run(&db, "SELECT * FROM users LIMIT 1");
+    CHECK(strstr(o, "(1행") != NULL, "LIMIT 1 -> 1행만");
+    free(o);
+
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");
     CHECK(strstr(o, "2개 행 삭제됨") != NULL, "DELETE WHERE id >= 3 -> 2개 삭제");

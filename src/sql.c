@@ -15,7 +15,8 @@ typedef enum {
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
-    TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND,
+    TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
+    TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_ERROR
 } TokType;
 
@@ -48,6 +49,12 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "UPDATE")) return TOK_UPDATE;
     if (!strcasecmp(s, "SET")) return TOK_SET;
     if (!strcasecmp(s, "AND")) return TOK_AND;
+    if (!strcasecmp(s, "OR")) return TOK_OR;
+    if (!strcasecmp(s, "ORDER")) return TOK_ORDER;
+    if (!strcasecmp(s, "BY")) return TOK_BY;
+    if (!strcasecmp(s, "ASC")) return TOK_ASC;
+    if (!strcasecmp(s, "DESC")) return TOK_DESC;
+    if (!strcasecmp(s, "LIMIT")) return TOK_LIMIT;
     return TOK_IDENT;
 }
 
@@ -225,20 +232,35 @@ static void parse_where_op(Parser *p, CmpOp *out) {
     }
 }
 
-/* WHERE 절: 조건 하나 이상을 AND로 묶어 파싱한다. (WHERE 키워드는 이미 소비됨) */
-static void parse_where(Parser *p, Where *w) {
-    w->count = 0;
+/* 한 AND 묶음: cond (AND cond)* */
+static void parse_and_group(Parser *p, AndGroup *g) {
+    g->count = 0;
     do {
-        if (w->count >= SQL_MAX_CONDS) {
-            p_fail(p, "WHERE 조건이 너무 많습니다");
+        if (g->count >= SQL_MAX_CONDS) {
+            p_fail(p, "AND 조건이 너무 많습니다");
             return;
         }
-        Condition *c = &w->conds[w->count];
+        Condition *c = &g->conds[g->count];
         parse_name(p, c->col);
         parse_where_op(p, &c->op);
         parse_value(p, &c->val);
-        w->count++;
+        g->count++;
     } while (p_accept(p, TOK_AND));
+}
+
+/* WHERE 절: AND 묶음들을 OR로 잇는다(DNF). (WHERE 키워드는 이미 소비됨)
+ *   term (OR term)*,  term = cond (AND cond)*
+ * AND가 OR보다 먼저 묶이므로 a AND b OR c 는 (a AND b) OR c 가 된다. */
+static void parse_where(Parser *p, Where *w) {
+    w->count = 0;
+    do {
+        if (w->count >= SQL_MAX_GROUPS) {
+            p_fail(p, "OR 묶음이 너무 많습니다");
+            return;
+        }
+        parse_and_group(p, &w->groups[w->count]);
+        w->count++;
+    } while (p_accept(p, TOK_OR));
 }
 
 static void parse_create(Parser *p, Statement *st) {
@@ -296,11 +318,29 @@ static void parse_insert(Parser *p, Statement *st) {
 static void parse_select(Parser *p, Statement *st) {
     st->type = STMT_SELECT;
     SelectStmt *s = &st->select;
+    s->limit = -1; /* memset이 0으로 둔 걸 "LIMIT 없음"으로 바로잡는다 */
     p_expect(p, TOK_STAR, "지금은 SELECT * 만 지원합니다");
     p_expect(p, TOK_FROM, "FROM이 필요합니다");
     parse_name(p, s->table);
     if (p_accept(p, TOK_WHERE)) {
         parse_where(p, &s->where);
+    }
+    if (p_accept(p, TOK_ORDER)) {
+        p_expect(p, TOK_BY, "ORDER 다음에 BY가 필요합니다");
+        parse_name(p, s->order_col);
+        if (p_accept(p, TOK_DESC)) {
+            s->order_desc = 1;
+        } else {
+            p_accept(p, TOK_ASC); /* ASC는 기본값, 있어도 그만 */
+        }
+    }
+    if (p_accept(p, TOK_LIMIT)) {
+        if (p->cur.type != TOK_INT || p->cur.int_val < 0) {
+            p_fail(p, "LIMIT 뒤에는 0 이상의 정수가 필요합니다");
+        } else {
+            s->limit = p->cur.int_val;
+            p_advance(p);
+        }
     }
 }
 
