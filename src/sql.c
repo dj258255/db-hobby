@@ -10,13 +10,14 @@
 
 typedef enum {
     TOK_EOF, TOK_IDENT, TOK_INT, TOK_STRING,
-    TOK_LPAREN, TOK_RPAREN, TOK_COMMA, TOK_STAR, TOK_EQ, TOK_SEMI,
+    TOK_LPAREN, TOK_RPAREN, TOK_COMMA, TOK_STAR, TOK_EQ, TOK_SEMI, TOK_DOT,
     TOK_LT, TOK_GT, TOK_LE, TOK_GE, TOK_NE,
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
+    TOK_JOIN, TOK_ON,
     TOK_ERROR
 } TokType;
 
@@ -55,6 +56,8 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "ASC")) return TOK_ASC;
     if (!strcasecmp(s, "DESC")) return TOK_DESC;
     if (!strcasecmp(s, "LIMIT")) return TOK_LIMIT;
+    if (!strcasecmp(s, "JOIN")) return TOK_JOIN;
+    if (!strcasecmp(s, "ON")) return TOK_ON;
     return TOK_IDENT;
 }
 
@@ -91,6 +94,7 @@ static Token lex_next(Lexer *lx) {
         case ',': lx->pos++; t.type = TOK_COMMA; return t;
         case '*': lx->pos++; t.type = TOK_STAR; return t;
         case ';': lx->pos++; t.type = TOK_SEMI; return t;
+        case '.': lx->pos++; t.type = TOK_DOT; return t;
         default: break;
     }
 
@@ -200,6 +204,29 @@ static void parse_name(Parser *p, char *out) {
     }
 }
 
+/* 컬럼 참조: <ident> 또는 <ident>.<ident>. 앞쪽이 있으면 테이블 한정자. */
+static void parse_colref(Parser *p, char *tbl_out, char *col_out) {
+    tbl_out[0] = '\0';
+    if (p->cur.type != TOK_IDENT) {
+        p_fail(p, "컬럼 이름이 필요합니다");
+        return;
+    }
+    char first[SQL_NAME_LEN];
+    snprintf(first, SQL_NAME_LEN, "%s", p->cur.text);
+    p_advance(p);
+    if (p_accept(p, TOK_DOT)) {
+        snprintf(tbl_out, SQL_NAME_LEN, "%s", first); /* first 는 테이블 */
+        if (p->cur.type != TOK_IDENT) {
+            p_fail(p, ". 다음에 컬럼 이름이 필요합니다");
+            return;
+        }
+        snprintf(col_out, SQL_NAME_LEN, "%s", p->cur.text);
+        p_advance(p);
+    } else {
+        snprintf(col_out, SQL_NAME_LEN, "%s", first); /* first 는 컬럼 */
+    }
+}
+
 static void parse_value(Parser *p, Value *v) {
     if (p->cur.type == TOK_INT) {
         v->type = VAL_INT;
@@ -241,7 +268,7 @@ static void parse_and_group(Parser *p, AndGroup *g) {
             return;
         }
         Condition *c = &g->conds[g->count];
-        parse_name(p, c->col);
+        parse_colref(p, c->tbl, c->col);
         parse_where_op(p, &c->op);
         parse_value(p, &c->val);
         g->count++;
@@ -322,6 +349,14 @@ static void parse_select(Parser *p, Statement *st) {
     p_expect(p, TOK_STAR, "지금은 SELECT * 만 지원합니다");
     p_expect(p, TOK_FROM, "FROM이 필요합니다");
     parse_name(p, s->table);
+    if (p_accept(p, TOK_JOIN)) {
+        s->join.has_join = 1;
+        parse_name(p, s->join.table);
+        p_expect(p, TOK_ON, "JOIN 다음에 ON이 필요합니다");
+        parse_colref(p, s->join.l_tbl, s->join.l_col);
+        p_expect(p, TOK_EQ, "ON 조건은 <컬럼> = <컬럼> 형태여야 합니다");
+        parse_colref(p, s->join.r_tbl, s->join.r_col);
+    }
     if (p_accept(p, TOK_WHERE)) {
         parse_where(p, &s->where);
     }

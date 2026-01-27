@@ -5,8 +5,6 @@
 #include <string.h>
 #include <unistd.h>
 
-static void catalog_write(Database *db); /* 정의는 아래 카탈로그 섹션 */
-
 /* ------------- tuple codec: 값 <-> 바이트 -------------
  *   INT  : 4바이트 (int32)
  *   TEXT : 2바이트 길이 + 바이트열
@@ -74,76 +72,91 @@ static RID rid_decode(int64_t v) {
     return r;
 }
 
+static void print_value(FILE *out, const Value *v) {
+    if (v->type == VAL_INT) {
+        fprintf(out, "%ld", v->int_val);
+    } else {
+        fprintf(out, "%s", v->text_val);
+    }
+}
+
 static void print_row(FILE *out, const CreateStmt *schema, const Value *row) {
     for (int i = 0; i < schema->num_columns; i++) {
         if (i) {
             fprintf(out, " | ");
         }
-        if (row[i].type == VAL_INT) {
-            fprintf(out, "%ld", row[i].int_val);
-        } else {
-            fprintf(out, "%s", row[i].text_val);
-        }
+        print_value(out, &row[i]);
     }
     fprintf(out, "\n");
 }
 
-/* ------------- 실행기 ------------- */
+/* ------------- 카탈로그 (테이블 목록 + 스키마) -------------
+ * PostgreSQL의 pg_class에 해당. 어떤 테이블이 있고 컬럼이 뭔지를 <path> 파일에
+ * 그대로 직렬화한다(작은 메타데이터라 페이지 없이 단순 바이너리로 충분).
+ */
 
-static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
-    if (db->has_table) {
-        fprintf(out, "ERROR: 이미 테이블 '%s' 가 있습니다\n", db->schema.table);
+static void catalog_write(Database *db) {
+    FILE *f = fopen(db->path, "wb");
+    if (!f) {
+        return;
+    }
+    int32_t n = db->num_tables;
+    fwrite(&n, sizeof(n), 1, f);
+    for (int i = 0; i < db->num_tables; i++) {
+        fwrite(&db->tables[i].schema, sizeof(CreateStmt), 1, f);
+    }
+    fclose(f);
+}
+
+/* 테이블 파일(.tbl, .idx)을 열어 Heap/B+Tree를 준비한다. schema는 미리 채워둘 것. */
+static int table_open_files(Table *t, const char *dbpath) {
+    char p[700];
+    snprintf(p, sizeof(p), "%s.%s.tbl", dbpath, t->schema.table);
+    if (pager_open(&t->pager, p) != 0) {
         return -1;
     }
-    db->schema = *c;
-    db->has_table = 1;
-
-    /* 첫 컬럼이 INT면 그 컬럼을 PK로 보고 B+Tree 인덱스를 만든다 */
-    if (c->num_columns > 0 && c->columns[0].type == COL_INT) {
-        char idxpath[600];
-        snprintf(idxpath, sizeof(idxpath), "%s.idx", db->path);
-        if (btree_open(&db->index, idxpath) == 0) {
-            db->has_index = 1;
+    t->bp = bufpool_create(&t->pager, 16);
+    if (!t->bp) {
+        pager_close(&t->pager);
+        return -1;
+    }
+    heap_init(&t->heap, t->bp, &t->pager, 0); /* 테이블 파일은 순수 힙: page 0부터 */
+    t->has_index = 0;
+    if (t->schema.num_columns > 0 && t->schema.columns[0].type == COL_INT) {
+        char ip[700];
+        snprintf(ip, sizeof(ip), "%s.%s.idx", dbpath, t->schema.table);
+        if (btree_open(&t->index, ip) == 0) {
+            t->has_index = 1;
         }
     }
-    catalog_write(db); /* 스키마를 page 0에 영속화 */
-    fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개)\n", c->table, c->num_columns);
-    if (db->has_index) {
-        fprintf(out, "  (인덱스: %s 컬럼)\n", db->schema.columns[0].name);
-    }
     return 0;
 }
 
-static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
-    if (!db->has_table || strcmp(in->table, db->schema.table) != 0) {
-        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", in->table);
-        return -1;
+static void table_close_files(Table *t) {
+    if (t->has_index) {
+        btree_close(&t->index);
+        t->has_index = 0;
     }
-    uint8_t buf[PAGE_SIZE];
-    uint16_t len;
-    if (encode_row(&db->schema, in->values, in->num_values, buf, &len) != 0) {
-        fprintf(out, "ERROR: 값의 개수나 타입이 스키마와 맞지 않습니다\n");
-        return -1;
+    if (t->bp) {
+        bufpool_flush_all(t->bp);
+        bufpool_destroy(t->bp);
+        t->bp = NULL;
     }
-    RID rid;
-    if (heap_insert(&db->heap, buf, len, &rid) != 0) {
-        fprintf(out, "ERROR: 삽입 실패 (행이 너무 큼?)\n");
-        return -1;
-    }
-    /* 인덱스에 (PK 값 -> RID) 등록 */
-    if (db->has_index && in->values[0].type == VAL_INT) {
-        btree_insert(&db->index, in->values[0].int_val, rid_encode(rid));
-    }
-    fprintf(out, "1개 행 삽입됨\n");
-    return 0;
+    pager_close(&t->pager);
 }
 
-typedef struct {
-    const CreateStmt *schema;
-    const SelectStmt *sel;
-    FILE *out;
-    int count;
-} SelectCtx;
+static Table *find_table(Database *db, const char *name) {
+    for (int i = 0; i < db->num_tables; i++) {
+        if (strcmp(db->tables[i].schema.table, name) == 0) {
+            return &db->tables[i];
+        }
+    }
+    return NULL;
+}
+
+/* ------------- WHERE 평가 -------------
+ * 한정자(tbl)가 있으면 그 테이블의 컬럼만, 없으면 이름으로 찾는다.
+ */
 
 /* 비교 결과 sign(<0,0,>0)에 연산자를 적용해 참/거짓을 낸다. */
 static int cmp_apply(CmpOp op, long sign) {
@@ -158,18 +171,26 @@ static int cmp_apply(CmpOp op, long sign) {
     return 0;
 }
 
-/* 한 조건 <col> <op> <val> 을 한 행에 적용. */
-static int cond_matches(const CreateStmt *schema, const Condition *cond, const Value *row) {
-    int ci = -1;
-    for (int i = 0; i < schema->num_columns; i++) {
-        if (strcmp(schema->columns[i].name, cond->col) == 0) {
-            ci = i;
+/* 한 스키마에서 [qtbl.]col 에 해당하는 셀을 찾는다. 없으면 NULL.
+ * qtbl이 있고 이 스키마의 테이블명과 다르면 이 테이블 소속이 아니다. */
+static const Value *cell_in(const CreateStmt *s, const char *qtbl, const char *col,
+                            const Value *row) {
+    if (qtbl[0] && strcmp(qtbl, s->table) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < s->num_columns; i++) {
+        if (strcmp(s->columns[i].name, col) == 0) {
+            return &row[i];
         }
     }
-    if (ci < 0) {
+    return NULL;
+}
+
+/* 셀 하나에 <op> <val>을 적용. 셀이 없거나 타입이 안 맞으면 거짓. */
+static int cond_eval(const Value *cell, const Condition *cond) {
+    if (!cell) {
         return 0;
     }
-    const Value *cell = &row[ci];
     const Value *wv = &cond->val;
     if (cell->type == VAL_INT && wv->type == VAL_INT) {
         long sign = (cell->int_val < wv->int_val) ? -1 : (cell->int_val > wv->int_val ? 1 : 0);
@@ -181,7 +202,21 @@ static int cond_matches(const CreateStmt *schema, const Condition *cond, const V
     return 0;
 }
 
-/* 한 AND 묶음: 조건이 전부 참이어야 참. */
+static int values_equal(const Value *a, const Value *b) {
+    if (a->type != b->type) {
+        return 0;
+    }
+    if (a->type == VAL_INT) {
+        return a->int_val == b->int_val;
+    }
+    return strcmp(a->text_val, b->text_val) == 0;
+}
+
+/* --- 단일 테이블 WHERE --- */
+static int cond_matches(const CreateStmt *schema, const Condition *cond, const Value *row) {
+    return cond_eval(cell_in(schema, cond->tbl, cond->col, row), cond);
+}
+
 static int group_matches(const CreateStmt *schema, const AndGroup *g, const Value *row) {
     for (int i = 0; i < g->count; i++) {
         if (!cond_matches(schema, &g->conds[i], row)) {
@@ -191,7 +226,7 @@ static int group_matches(const CreateStmt *schema, const AndGroup *g, const Valu
     return 1;
 }
 
-/* WHERE 절(DNF): 어느 한 AND 묶음이라도 참이면 참. count==0 이면 WHERE 없음 -> 항상 참. */
+/* WHERE 절(DNF): 어느 한 AND 묶음이라도 참이면 참. count==0 이면 항상 참. */
 static int where_matches(const CreateStmt *schema, const Where *w, const Value *row) {
     if (w->count == 0) {
         return 1;
@@ -204,13 +239,112 @@ static int where_matches(const CreateStmt *schema, const Where *w, const Value *
     return 0;
 }
 
+/* --- 조인된 두 행에 대한 WHERE (왼쪽 먼저, 없으면 오른쪽에서 컬럼을 찾는다) --- */
+static const Value *cell_join(const CreateStmt *ls, const Value *lrow, const CreateStmt *rs,
+                              const Value *rrow, const char *qtbl, const char *col) {
+    const Value *v = cell_in(ls, qtbl, col, lrow);
+    if (v) {
+        return v;
+    }
+    return cell_in(rs, qtbl, col, rrow);
+}
+
+static int where_matches_join(const CreateStmt *ls, const Value *lrow, const CreateStmt *rs,
+                              const Value *rrow, const Where *w) {
+    if (w->count == 0) {
+        return 1;
+    }
+    for (int gi = 0; gi < w->count; gi++) {
+        const AndGroup *g = &w->groups[gi];
+        int all = 1;
+        for (int i = 0; i < g->count; i++) {
+            const Condition *c = &g->conds[i];
+            if (!cond_eval(cell_join(ls, lrow, rs, rrow, c->tbl, c->col), c)) {
+                all = 0;
+                break;
+            }
+        }
+        if (all) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ------------- 실행기: CREATE / INSERT ------------- */
+
+static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
+    if (find_table(db, c->table)) {
+        fprintf(out, "ERROR: 이미 테이블 '%s' 가 있습니다\n", c->table);
+        return -1;
+    }
+    if (db->num_tables >= DB_MAX_TABLES) {
+        fprintf(out, "ERROR: 테이블이 너무 많습니다 (최대 %d개)\n", DB_MAX_TABLES);
+        return -1;
+    }
+    /* 카탈로그엔 없지만 디스크에 옛 파일이 남아 있을 수 있으니 깨끗이 지우고 시작한다. */
+    char tp[700], ip[700];
+    snprintf(tp, sizeof(tp), "%s.%s.tbl", db->path, c->table);
+    snprintf(ip, sizeof(ip), "%s.%s.idx", db->path, c->table);
+    unlink(tp);
+    unlink(ip);
+
+    Table *t = &db->tables[db->num_tables];
+    t->schema = *c;
+    if (table_open_files(t, db->path) != 0) {
+        fprintf(out, "ERROR: 테이블 파일을 열 수 없습니다\n");
+        return -1;
+    }
+    db->num_tables++;
+    catalog_write(db);
+
+    fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개)\n", c->table, c->num_columns);
+    if (t->has_index) {
+        fprintf(out, "  (인덱스: %s 컬럼)\n", t->schema.columns[0].name);
+    }
+    return 0;
+}
+
+static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
+    Table *t = find_table(db, in->table);
+    if (!t) {
+        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", in->table);
+        return -1;
+    }
+    uint8_t buf[PAGE_SIZE];
+    uint16_t len;
+    if (encode_row(&t->schema, in->values, in->num_values, buf, &len) != 0) {
+        fprintf(out, "ERROR: 값의 개수나 타입이 스키마와 맞지 않습니다\n");
+        return -1;
+    }
+    RID rid;
+    if (heap_insert(&t->heap, buf, len, &rid) != 0) {
+        fprintf(out, "ERROR: 삽입 실패 (행이 너무 큼?)\n");
+        return -1;
+    }
+    if (t->has_index && in->values[0].type == VAL_INT) {
+        btree_insert(&t->index, in->values[0].int_val, rid_encode(rid));
+    }
+    fprintf(out, "1개 행 삽입됨\n");
+    return 0;
+}
+
+/* ------------- 실행기: SELECT (단일 테이블) ------------- */
+
+typedef struct {
+    const CreateStmt *schema;
+    const Where *where;
+    FILE *out;
+    int count;
+} SelectCtx;
+
 static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)rid;
     (void)len;
     SelectCtx *ctx = ctx_;
     Value row[SQL_MAX_COLS];
     decode_row(ctx->schema, rec, row);
-    if (!where_matches(ctx->schema, &ctx->sel->where, row)) {
+    if (!where_matches(ctx->schema, ctx->where, row)) {
         return 0;
     }
     print_row(ctx->out, ctx->schema, row);
@@ -221,7 +355,7 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
 /* 인덱스 범위 스캔: B+Tree가 준 (키, RID)마다 힙 행을 읽어 출력한다.
  * tombstone(삭제된 슬롯)이면 heap_get이 -1이라 자동으로 빠진다. */
 typedef struct {
-    Database *db;
+    Table *t;
     bkey_t bound;
     CmpOp op;
     FILE *out;
@@ -235,20 +369,18 @@ static int range_visit(bkey_t key, bval_t val, void *ctx_) {
     if (r->op == CMP_LE && key > r->bound) return 1;
     uint8_t recbuf[PAGE_SIZE];
     uint16_t len;
-    if (heap_get(&r->db->heap, rid_decode(val), recbuf, &len) == 0) {
+    if (heap_get(&r->t->heap, rid_decode(val), recbuf, &len) == 0) {
         Value row[SQL_MAX_COLS];
-        decode_row(&r->db->schema, recbuf, row);
-        print_row(r->out, &r->db->schema, row);
+        decode_row(&r->t->schema, recbuf, row);
+        print_row(r->out, &r->t->schema, row);
         r->count++;
     }
     return 0;
 }
 
-/* ------------- ORDER BY / LIMIT: materialize 경로 -------------
- * 스트리밍으론 정렬을 못 한다(마지막 행까지 봐야 첫 출력 순서가 정해짐).
- * WHERE에 맞는 행을 버퍼에 모은 뒤(= PostgreSQL의 Sort 노드) 정렬하고
- * LIMIT만큼 자른다. 단순함을 위해 이 경로는 인덱스 대신 풀 스캔으로 모은다.
- */
+/* ORDER BY / LIMIT: materialize 경로. 스트리밍으론 정렬을 못 한다(마지막 행까지 봐야
+ * 첫 출력 순서가 정해짐). WHERE에 맞는 행을 버퍼에 모은 뒤(= PostgreSQL의 Sort 노드)
+ * 정렬하고 LIMIT만큼 자른다. 단순함을 위해 이 경로는 인덱스 대신 풀 스캔으로 모은다. */
 #define SELECT_MAX_ROWS 4096
 
 typedef struct {
@@ -293,20 +425,20 @@ static int row_cmp(const void *a, const void *b) {
     return strcmp(x->text_val, y->text_val);
 }
 
-static int exec_select_sorted(Database *db, const SelectStmt *sel, FILE *out) {
-    int ncols = db->schema.num_columns;
+static int exec_select_sorted(Table *t, const SelectStmt *sel, FILE *out) {
+    int ncols = t->schema.num_columns;
     Value *rows = malloc((size_t)SELECT_MAX_ROWS * ncols * sizeof(Value));
     if (!rows) {
         fprintf(out, "ERROR: 메모리 부족\n");
         return -1;
     }
-    MatCtx m = {&db->schema, &sel->where, rows, ncols, SELECT_MAX_ROWS, 0};
-    heap_scan(&db->heap, mat_visit, &m);
+    MatCtx m = {&t->schema, &sel->where, rows, ncols, SELECT_MAX_ROWS, 0};
+    heap_scan(&t->heap, mat_visit, &m);
 
     if (sel->order_col[0] != '\0') {
         int ci = -1;
         for (int i = 0; i < ncols; i++) {
-            if (strcmp(db->schema.columns[i].name, sel->order_col) == 0) {
+            if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) {
                 ci = i;
             }
         }
@@ -334,7 +466,7 @@ static int exec_select_sorted(Database *db, const SelectStmt *sel, FILE *out) {
         if (sel->limit >= 0 && count >= sel->limit) {
             break;
         }
-        print_row(out, &db->schema, rows + (size_t)i * ncols);
+        print_row(out, &t->schema, rows + (size_t)i * ncols);
         count++;
     }
     free(rows);
@@ -342,17 +474,160 @@ static int exec_select_sorted(Database *db, const SelectStmt *sel, FILE *out) {
     return 0;
 }
 
+/* ------------- 실행기: JOIN (중첩 루프 조인) ------------- */
+
+typedef struct {
+    Table *L, *R;
+    const SelectStmt *sel;
+    /* ON 양변을 (side: 0=왼쪽테이블 1=오른쪽테이블, idx: 컬럼 위치)로 미리 해소 */
+    int al_side, al_idx;
+    int ar_side, ar_idx;
+    FILE *out;
+    int count;
+    const Value *lrow; /* 바깥 루프의 현재 행 */
+} JoinCtx;
+
+/* [qtbl.]col 을 (side, idx)로 해소한다. qtbl 없으면 왼쪽부터 찾는다. 0 성공, -1 실패. */
+static int resolve_ref(Table *L, Table *R, const char *qtbl, const char *col, int *side,
+                       int *idx) {
+    if (qtbl[0]) {
+        Table *t = NULL;
+        int s = -1;
+        if (strcmp(qtbl, L->schema.table) == 0) {
+            t = L;
+            s = 0;
+        } else if (strcmp(qtbl, R->schema.table) == 0) {
+            t = R;
+            s = 1;
+        } else {
+            return -1;
+        }
+        for (int i = 0; i < t->schema.num_columns; i++) {
+            if (strcmp(t->schema.columns[i].name, col) == 0) {
+                *side = s;
+                *idx = i;
+                return 0;
+            }
+        }
+        return -1;
+    }
+    for (int i = 0; i < L->schema.num_columns; i++) {
+        if (strcmp(L->schema.columns[i].name, col) == 0) {
+            *side = 0;
+            *idx = i;
+            return 0;
+        }
+    }
+    for (int i = 0; i < R->schema.num_columns; i++) {
+        if (strcmp(R->schema.columns[i].name, col) == 0) {
+            *side = 1;
+            *idx = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int join_inner_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid;
+    (void)len;
+    JoinCtx *j = ctx_;
+    Value rrow[SQL_MAX_COLS];
+    decode_row(&j->R->schema, rec, rrow);
+
+    /* ON 양변의 셀을 꺼내 같은지 본다 */
+    const Value *a = (j->al_side == 0) ? &j->lrow[j->al_idx] : &rrow[j->al_idx];
+    const Value *b = (j->ar_side == 0) ? &j->lrow[j->ar_idx] : &rrow[j->ar_idx];
+    if (!values_equal(a, b)) {
+        return 0;
+    }
+    if (!where_matches_join(&j->L->schema, j->lrow, &j->R->schema, rrow, &j->sel->where)) {
+        return 0;
+    }
+    /* 결합 행 출력: 왼쪽 컬럼들 다음 오른쪽 컬럼들 */
+    for (int i = 0; i < j->L->schema.num_columns; i++) {
+        if (i) {
+            fprintf(j->out, " | ");
+        }
+        print_value(j->out, &j->lrow[i]);
+    }
+    for (int i = 0; i < j->R->schema.num_columns; i++) {
+        fprintf(j->out, " | ");
+        print_value(j->out, &rrow[i]);
+    }
+    fprintf(j->out, "\n");
+    j->count++;
+    if (j->sel->limit >= 0 && j->count >= j->sel->limit) {
+        return 1; /* LIMIT 도달 -> 안쪽 스캔 중단 */
+    }
+    return 0;
+}
+
+static int join_outer_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid;
+    (void)len;
+    JoinCtx *j = ctx_;
+    Value lrow[SQL_MAX_COLS];
+    decode_row(&j->L->schema, rec, lrow);
+    j->lrow = lrow;
+    int r = heap_scan(&j->R->heap, join_inner_visit, j); /* 바깥 한 행마다 안쪽 전체 스캔 */
+    j->lrow = NULL;
+    return r; /* 안쪽이 LIMIT로 멈췄으면(!=0) 바깥도 멈춘다 */
+}
+
+static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
+    Table *L = find_table(db, sel->table);
+    Table *R = find_table(db, sel->join.table);
+    if (!L || !R) {
+        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", !L ? sel->table : sel->join.table);
+        return -1;
+    }
+    if (sel->order_col[0] != '\0') {
+        fprintf(out, "ERROR: JOIN과 ORDER BY는 아직 함께 못 씁니다\n");
+        return -1;
+    }
+
+    JoinCtx j = {L, R, sel, 0, 0, 0, 0, out, 0, NULL};
+    if (resolve_ref(L, R, sel->join.l_tbl, sel->join.l_col, &j.al_side, &j.al_idx) != 0 ||
+        resolve_ref(L, R, sel->join.r_tbl, sel->join.r_col, &j.ar_side, &j.ar_idx) != 0) {
+        fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
+        return -1;
+    }
+
+    /* 헤더: 양 테이블 컬럼을 table.col 로 한정해 출력 */
+    for (int i = 0; i < L->schema.num_columns; i++) {
+        if (i) {
+            fprintf(out, " | ");
+        }
+        fprintf(out, "%s.%s", L->schema.table, L->schema.columns[i].name);
+    }
+    for (int i = 0; i < R->schema.num_columns; i++) {
+        fprintf(out, " | %s.%s", R->schema.table, R->schema.columns[i].name);
+    }
+    fprintf(out, "\n");
+
+    db->used_index = 0;
+    heap_scan(&L->heap, join_outer_visit, &j);
+    fprintf(out, "(%d행)\n", j.count);
+    return 0;
+}
+
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
-    if (!db->has_table || strcmp(sel->table, db->schema.table) != 0) {
+    if (sel->join.has_join) {
+        return exec_select_join(db, sel, out);
+    }
+
+    Table *t = find_table(db, sel->table);
+    if (!t) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
         return -1;
     }
     /* 헤더 */
-    for (int i = 0; i < db->schema.num_columns; i++) {
+    for (int i = 0; i < t->schema.num_columns; i++) {
         if (i) {
             fprintf(out, " | ");
         }
-        fprintf(out, "%s", db->schema.columns[i].name);
+        fprintf(out, "%s", t->schema.columns[i].name);
     }
     fprintf(out, "\n");
 
@@ -360,7 +635,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
 
     /* ORDER BY나 LIMIT이 있으면 모았다가 정렬/자르는 경로로 간다. */
     if (sel->order_col[0] != '\0' || sel->limit >= 0) {
-        return exec_select_sorted(db, sel, out);
+        return exec_select_sorted(t, sel, out);
     }
 
     int count = 0;
@@ -370,21 +645,21 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     const Condition *c0 = (sel->where.count == 1 && sel->where.groups[0].count == 1)
                               ? &sel->where.groups[0].conds[0]
                               : NULL;
-    int pk_cond = c0 && db->has_index &&
-                  strcmp(c0->col, db->schema.columns[0].name) == 0 &&
-                  c0->val.type == VAL_INT;
+    int pk_cond = c0 && t->has_index &&
+                  (c0->tbl[0] == '\0' || strcmp(c0->tbl, t->schema.table) == 0) &&
+                  strcmp(c0->col, t->schema.columns[0].name) == 0 && c0->val.type == VAL_INT;
 
     if (pk_cond && c0->op == CMP_EQ) {
         /* = -> 점 조회 O(log n) */
         db->used_index = 1;
         bval_t encoded;
-        if (btree_search(&db->index, c0->val.int_val, &encoded) == 0) {
+        if (btree_search(&t->index, c0->val.int_val, &encoded) == 0) {
             uint8_t recbuf[PAGE_SIZE];
             uint16_t len;
-            if (heap_get(&db->heap, rid_decode(encoded), recbuf, &len) == 0) {
+            if (heap_get(&t->heap, rid_decode(encoded), recbuf, &len) == 0) {
                 Value row[SQL_MAX_COLS];
-                decode_row(&db->schema, recbuf, row);
-                print_row(out, &db->schema, row);
+                decode_row(&t->schema, recbuf, row);
+                print_row(out, &t->schema, row);
                 count++;
             }
         }
@@ -392,17 +667,17 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
                            c0->op == CMP_LE)) {
         /* <, >, <=, >= -> 인덱스 범위 스캔 (리프 체인) */
         db->used_index = 1;
-        RangeCtx rc = {db, c0->val.int_val, c0->op, out, 0};
+        RangeCtx rc = {t, c0->val.int_val, c0->op, out, 0};
         if (c0->op == CMP_GT || c0->op == CMP_GE) {
-            btree_seek_scan(&db->index, c0->val.int_val, range_visit, &rc);
+            btree_seek_scan(&t->index, c0->val.int_val, range_visit, &rc);
         } else {
-            btree_scan(&db->index, range_visit, &rc);
+            btree_scan(&t->index, range_visit, &rc);
         }
         count = rc.count;
     } else {
         /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> 풀 스캔 */
-        SelectCtx ctx = {&db->schema, sel, out, 0};
-        heap_scan(&db->heap, select_visit, &ctx);
+        SelectCtx ctx = {&t->schema, &sel->where, out, 0};
+        heap_scan(&t->heap, select_visit, &ctx);
         count = ctx.count;
     }
 
@@ -410,8 +685,9 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     return 0;
 }
 
-/* WHERE에 맞는 행들의 RID를 모은다. 스캔하면서 바로 고치면 새로 삽입한 행을
- * 다시 스캔하는 문제가 생기니, RID를 먼저 모은 뒤 따로 처리한다. */
+/* ------------- 실행기: DELETE / UPDATE -------------
+ * WHERE에 맞는 RID를 먼저 모은 뒤 처리한다. 스캔하며 바로 고치면 새로 삽입한 행을
+ * 다시 스캔하는 문제가 생긴다. */
 #define DML_MAX_ROWS 4096
 typedef struct {
     RID rids[DML_MAX_ROWS];
@@ -432,14 +708,15 @@ static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
 }
 
 static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
-    if (!db->has_table || strcmp(d->table, db->schema.table) != 0) {
+    Table *t = find_table(db, d->table);
+    if (!t) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", d->table);
         return -1;
     }
-    CollectCtx ctx = {.count = 0, .schema = &db->schema, .where = &d->where};
-    heap_scan(&db->heap, collect_visit, &ctx);
+    CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &d->where};
+    heap_scan(&t->heap, collect_visit, &ctx);
     for (int i = 0; i < ctx.count; i++) {
-        heap_delete(&db->heap, ctx.rids[i]);
+        heap_delete(&t->heap, ctx.rids[i]);
     }
     /* 인덱스 항목은 남겨둬도 무해하다: 가리키는 슬롯이 tombstone이라 heap_get이 -1을
      * 돌려줘 결과에서 자동으로 빠진다. (B+Tree 삭제는 별도 주제로 미룬다.) */
@@ -448,13 +725,14 @@ static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
 }
 
 static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
-    if (!db->has_table || strcmp(u->table, db->schema.table) != 0) {
+    Table *t = find_table(db, u->table);
+    if (!t) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", u->table);
         return -1;
     }
     int sci = -1;
-    for (int i = 0; i < db->schema.num_columns; i++) {
-        if (strcmp(db->schema.columns[i].name, u->set_col) == 0) {
+    for (int i = 0; i < t->schema.num_columns; i++) {
+        if (strcmp(t->schema.columns[i].name, u->set_col) == 0) {
             sci = i;
         }
     }
@@ -462,41 +740,41 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         fprintf(out, "ERROR: 그런 컬럼이 없습니다 (%s)\n", u->set_col);
         return -1;
     }
-    ColType ct = db->schema.columns[sci].type;
+    ColType ct = t->schema.columns[sci].type;
     if ((ct == COL_INT && u->set_val.type != VAL_INT) ||
         (ct == COL_TEXT && u->set_val.type != VAL_TEXT)) {
         fprintf(out, "ERROR: SET 값 타입이 컬럼과 맞지 않습니다\n");
         return -1;
     }
 
-    CollectCtx ctx = {.count = 0, .schema = &db->schema, .where = &u->where};
-    heap_scan(&db->heap, collect_visit, &ctx);
+    CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &u->where};
+    heap_scan(&t->heap, collect_visit, &ctx);
 
     int n = 0;
     for (int i = 0; i < ctx.count; i++) {
         uint8_t recbuf[PAGE_SIZE];
         uint16_t len;
-        if (heap_get(&db->heap, ctx.rids[i], recbuf, &len) != 0) {
+        if (heap_get(&t->heap, ctx.rids[i], recbuf, &len) != 0) {
             continue;
         }
         Value row[SQL_MAX_COLS];
-        decode_row(&db->schema, recbuf, row);
+        decode_row(&t->schema, recbuf, row);
         row[sci] = u->set_val; /* SET 적용 */
 
         /* 가변 길이라 제자리 수정이 안 된다 -> 옛 행 삭제 + 새 행 삽입 */
         uint8_t newbuf[PAGE_SIZE];
         uint16_t newlen;
-        if (encode_row(&db->schema, row, db->schema.num_columns, newbuf, &newlen) != 0) {
+        if (encode_row(&t->schema, row, t->schema.num_columns, newbuf, &newlen) != 0) {
             continue;
         }
-        heap_delete(&db->heap, ctx.rids[i]);
+        heap_delete(&t->heap, ctx.rids[i]);
         RID newrid;
-        if (heap_insert(&db->heap, newbuf, newlen, &newrid) != 0) {
+        if (heap_insert(&t->heap, newbuf, newlen, &newrid) != 0) {
             continue;
         }
         /* 새 RID로 인덱스 갱신 — 안 하면 인덱스가 삭제된 옛 위치를 가리켜 행이 사라진다 */
-        if (db->has_index && row[0].type == VAL_INT) {
-            btree_insert(&db->index, row[0].int_val, rid_encode(newrid));
+        if (t->has_index && row[0].type == VAL_INT) {
+            btree_insert(&t->index, row[0].int_val, rid_encode(newrid));
         }
         n++;
     }
@@ -505,10 +783,10 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
 }
 
 /* ------------- 트랜잭션 -------------
- * no-steal + 커밋 시 force. 트랜잭션 중 바뀐 페이지는 버퍼 풀 메모리에만 두고,
- * COMMIT이면 flush+fsync(내구), ROLLBACK이면 dirty 프레임을 버리고 할당분을 잘라
- * 디스크 원본으로 되돌린다. 힙과 인덱스 둘 다 처리해 일관성을 지킨다.
- */
+ * no-steal + 커밋 시 force. 모든 테이블에 걸쳐 적용한다. 트랜잭션 중 바뀐 페이지는
+ * 버퍼 풀 메모리에만 두고, COMMIT이면 flush+fsync(내구), ROLLBACK이면 dirty 프레임을
+ * 버리고 할당분을 잘라 디스크 원본으로 되돌린다. 힙과 인덱스 둘 다 처리한다.
+ * (DDL인 CREATE는 즉시 반영되며 트랜잭션에 묶이지 않는다 — 많은 DB의 동작과 같다.) */
 
 static int exec_begin(Database *db, FILE *out) {
     if (db->in_txn) {
@@ -516,11 +794,14 @@ static int exec_begin(Database *db, FILE *out) {
         return -1;
     }
     db->in_txn = 1;
-    bufpool_set_no_steal(db->bp, 1);
-    db->txn_data_pages = db->pager.num_pages;
-    if (db->has_index) {
-        bufpool_set_no_steal(db->index.bp, 1);
-        db->txn_index_pages = db->index.pager.num_pages;
+    for (int i = 0; i < db->num_tables; i++) {
+        Table *t = &db->tables[i];
+        bufpool_set_no_steal(t->bp, 1);
+        t->txn_data_pages = t->pager.num_pages;
+        if (t->has_index) {
+            bufpool_set_no_steal(t->index.bp, 1);
+            t->txn_index_pages = t->index.pager.num_pages;
+        }
     }
     fprintf(out, "트랜잭션 시작\n");
     return 0;
@@ -531,14 +812,17 @@ static int exec_commit(Database *db, FILE *out) {
         fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
         return -1;
     }
-    bufpool_flush_all(db->bp);
-    fsync(db->pager.fd);
-    if (db->has_index) {
-        bufpool_flush_all(db->index.bp);
-        fsync(db->index.pager.fd);
-        bufpool_set_no_steal(db->index.bp, 0);
+    for (int i = 0; i < db->num_tables; i++) {
+        Table *t = &db->tables[i];
+        bufpool_flush_all(t->bp);
+        fsync(t->pager.fd);
+        bufpool_set_no_steal(t->bp, 0);
+        if (t->has_index) {
+            bufpool_flush_all(t->index.bp);
+            fsync(t->index.pager.fd);
+            bufpool_set_no_steal(t->index.bp, 0);
+        }
     }
-    bufpool_set_no_steal(db->bp, 0);
     db->in_txn = 0;
     fprintf(out, "커밋됨\n");
     return 0;
@@ -549,122 +833,58 @@ static int exec_rollback(Database *db, FILE *out) {
         fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
         return -1;
     }
-    bufpool_discard_dirty(db->bp);
-    pager_truncate(&db->pager, db->txn_data_pages);
-    bufpool_set_no_steal(db->bp, 0);
-    if (db->has_index) {
-        bufpool_discard_dirty(db->index.bp);
-        pager_truncate(&db->index.pager, db->txn_index_pages);
-        btree_reload_root(&db->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
-        bufpool_set_no_steal(db->index.bp, 0);
+    for (int i = 0; i < db->num_tables; i++) {
+        Table *t = &db->tables[i];
+        bufpool_discard_dirty(t->bp);
+        pager_truncate(&t->pager, t->txn_data_pages);
+        bufpool_set_no_steal(t->bp, 0);
+        if (t->has_index) {
+            bufpool_discard_dirty(t->index.bp);
+            pager_truncate(&t->index.pager, t->txn_index_pages);
+            btree_reload_root(&t->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
+            bufpool_set_no_steal(t->index.bp, 0);
+        }
     }
     db->in_txn = 0;
     fprintf(out, "롤백됨\n");
     return 0;
 }
 
-/* ------------- 카탈로그 (스키마를 page 0에 저장) -------------
- * PostgreSQL이 pg_catalog에 스키마를 자기 테이블로 저장하는 것의 가장 단순한 형태.
- * page 0 = 카탈로그(스키마), 힙 데이터는 page 1부터.
- */
-
-static void catalog_write(Database *db) {
-    uint8_t *page = bufpool_fetch(db->bp, 0);
-    memset(page, 0, PAGE_SIZE);
-    uint32_t nc = db->has_table ? (uint32_t)db->schema.num_columns : 0;
-    uint16_t off = 0;
-    memcpy(page + off, &nc, 4);
-    off += 4;
-    if (db->has_table) {
-        memcpy(page + off, db->schema.table, SQL_NAME_LEN);
-        off += SQL_NAME_LEN;
-        for (int i = 0; i < db->schema.num_columns; i++) {
-            memcpy(page + off, db->schema.columns[i].name, SQL_NAME_LEN);
-            off += SQL_NAME_LEN;
-            uint32_t t = (uint32_t)db->schema.columns[i].type;
-            memcpy(page + off, &t, 4);
-            off += 4;
-        }
-    }
-    bufpool_unpin(db->bp, 0, 1);
-}
-
-static void catalog_read(Database *db) {
-    uint8_t *page = bufpool_fetch(db->bp, 0);
-    uint32_t nc;
-    memcpy(&nc, page, 4);
-    if (nc == 0 || nc > SQL_MAX_COLS) {
-        bufpool_unpin(db->bp, 0, 0);
-        return; /* 테이블 없음 */
-    }
-    uint16_t off = 4;
-    CreateStmt *s = &db->schema;
-    s->num_columns = (int)nc;
-    memcpy(s->table, page + off, SQL_NAME_LEN);
-    off += SQL_NAME_LEN;
-    for (int i = 0; i < (int)nc; i++) {
-        memcpy(s->columns[i].name, page + off, SQL_NAME_LEN);
-        off += SQL_NAME_LEN;
-        uint32_t t;
-        memcpy(&t, page + off, 4);
-        off += 4;
-        s->columns[i].type = (ColType)t;
-    }
-    bufpool_unpin(db->bp, 0, 0);
-    db->has_table = 1;
-
-    /* 첫 컬럼이 INT면 인덱스도 다시 연다 */
-    if (s->columns[0].type == COL_INT) {
-        char idxpath[600];
-        snprintf(idxpath, sizeof(idxpath), "%s.idx", db->path);
-        if (btree_open(&db->index, idxpath) == 0) {
-            db->has_index = 1;
-        }
-    }
-}
-
 /* ------------- 공개 API ------------- */
 
 int db_open(Database *db, const char *path) {
-    if (pager_open(&db->pager, path) != 0) {
-        return -1;
-    }
-    db->bp = bufpool_create(&db->pager, 16);
-    if (!db->bp) {
-        pager_close(&db->pager);
-        return -1;
-    }
-    heap_init(&db->heap, db->bp, &db->pager, 1); /* page 0 = 카탈로그, 데이터는 page 1부터 */
-    db->has_table = 0;
-    db->has_index = 0;
+    snprintf(db->path, sizeof(db->path), "%s", path);
+    db->num_tables = 0;
     db->used_index = 0;
     db->in_txn = 0;
-    snprintf(db->path, sizeof(db->path), "%s", path);
 
-    if (db->pager.num_pages == 0) {
-        /* 새 파일: page 0(카탈로그)를 빈 상태로 확보한다 */
-        page_id_t cid;
-        bufpool_new_page(db->bp, &cid); /* page 0, 0으로 채워짐 -> 테이블 없음 */
-        bufpool_unpin(db->bp, cid, 1);
-        bufpool_flush_all(db->bp);
-    } else {
-        /* 기존 파일: 카탈로그에서 스키마를 복원한다 */
-        catalog_read(db);
+    /* 카탈로그가 있으면 테이블 목록을 복원하고 각 테이블 파일을 연다. */
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        int32_t n = 0;
+        if (fread(&n, sizeof(n), 1, f) == 1 && n >= 0 && n <= DB_MAX_TABLES) {
+            for (int i = 0; i < n; i++) {
+                CreateStmt s;
+                if (fread(&s, sizeof(s), 1, f) != 1) {
+                    break;
+                }
+                Table *t = &db->tables[db->num_tables];
+                t->schema = s;
+                if (table_open_files(t, db->path) == 0) {
+                    db->num_tables++;
+                }
+            }
+        }
+        fclose(f);
     }
     return 0;
 }
 
 void db_close(Database *db) {
-    if (db->has_index) {
-        btree_close(&db->index);
-        db->has_index = 0;
+    for (int i = 0; i < db->num_tables; i++) {
+        table_close_files(&db->tables[i]);
     }
-    if (db->bp) {
-        bufpool_flush_all(db->bp);
-        bufpool_destroy(db->bp);
-        db->bp = NULL;
-    }
-    pager_close(&db->pager);
+    db->num_tables = 0;
 }
 
 int db_exec(Database *db, const char *sql, FILE *out) {
@@ -686,14 +906,16 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
         default: rc = -1;
     }
-    /* autocommit: 트랜잭션 밖에서 성공한 변경은 즉시 디스크에 반영하고 클린으로 만든다.
+    /* autocommit: 트랜잭션 밖에서 성공한 변경은 즉시 디스크에 반영해 클린으로 만든다.
      * 그래야 이후 ROLLBACK이 이 변경까지 되돌리지 않는다. */
     if (rc == 0 && !db->in_txn &&
-        (st.type == STMT_CREATE || st.type == STMT_INSERT ||
-         st.type == STMT_DELETE || st.type == STMT_UPDATE)) {
-        bufpool_flush_all(db->bp);
-        if (db->has_index) {
-            bufpool_flush_all(db->index.bp);
+        (st.type == STMT_CREATE || st.type == STMT_INSERT || st.type == STMT_DELETE ||
+         st.type == STMT_UPDATE)) {
+        for (int i = 0; i < db->num_tables; i++) {
+            bufpool_flush_all(db->tables[i].bp);
+            if (db->tables[i].has_index) {
+                bufpool_flush_all(db->tables[i].index.bp);
+            }
         }
     }
     return rc;

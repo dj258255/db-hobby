@@ -17,27 +17,37 @@
  *          CREATE  : 스키마(카탈로그) 기록 + (첫 컬럼이 INT면) B+Tree 인덱스 생성
  *          INSERT  : 값을 바이트로 인코딩 -> heap_insert -> 인덱스에 (PK -> RID) 등록
  *          SELECT  : WHERE가 PK면 인덱스로 O(log n) 조회, 아니면 풀 스캔
+ *                    JOIN이면 중첩 루프 조인
  *
- * 학습용 단순화: 한 데이터베이스 = 한 테이블. 첫 컬럼을 유일 PK로 보고 인덱싱한다.
- * 스키마는 메모리에만 둔다(행·인덱스는 디스크에 영속).
+ * 저장 구조(PostgreSQL의 relfilenode를 본뜸): 테이블마다 파일을 따로 둔다.
+ *   <path>            카탈로그 — 어떤 테이블이 있고 스키마가 뭔지 (pg_class 격)
+ *   <path>.<tbl>.tbl  그 테이블의 행 (Heap)
+ *   <path>.<tbl>.idx  그 테이블의 PK 인덱스 (B+Tree)
+ *
+ * 학습용 단순화: 첫 컬럼(INT)을 유일 PK로 보고 인덱싱한다. 단일 INNER JOIN까지.
  */
 
+#define DB_MAX_TABLES 16
+
 typedef struct {
+    CreateStmt schema;
     Pager pager;
     BufferPool *bp;
     Heap heap;
-    int has_table;
-    CreateStmt schema;
-
-    char path[512]; /* 데이터 파일 경로 (인덱스 파일 경로 유도용) */
-    BTree index;    /* 첫 컬럼(INT PK) 인덱스 */
+    BTree index; /* 첫 컬럼(INT PK) 인덱스 */
     int has_index;
 
-    int used_index; /* 직전 SELECT가 인덱스를 썼나 (시연·테스트용) */
+    uint64_t txn_data_pages;  /* BEGIN 시점 데이터 파일 페이지 수(롤백 복원용) */
+    uint64_t txn_index_pages; /* BEGIN 시점 인덱스 파일 페이지 수 */
+} Table;
 
-    int in_txn;               /* 명시적 트랜잭션(BEGIN) 중인가 */
-    uint64_t txn_data_pages;  /* BEGIN 시점의 데이터 파일 페이지 수(롤백 복원용) */
-    uint64_t txn_index_pages; /* BEGIN 시점의 인덱스 파일 페이지 수 */
+typedef struct {
+    char path[512]; /* 카탈로그 파일 경로 (테이블 파일 경로 유도용) */
+    Table tables[DB_MAX_TABLES];
+    int num_tables;
+
+    int used_index; /* 직전 SELECT가 인덱스를 썼나 (시연·테스트용) */
+    int in_txn;     /* 명시적 트랜잭션(BEGIN) 중인가 */
 } Database;
 
 /* 파일을 열어 DB를 준비한다. 0 성공, -1 실패. */

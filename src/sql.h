@@ -15,9 +15,11 @@
  * 지원 문법(학습용 최소 부분집합):
  *   CREATE TABLE <name> (<col> INT|TEXT, ...)
  *   INSERT INTO <name> VALUES (<int|'text'>, ...)
- *   SELECT * FROM <name> [WHERE <cond> [AND <cond>] [OR ...]]
+ *   SELECT * FROM <name> [JOIN <name> ON <colref> = <colref>]
+ *                        [WHERE <cond> [AND <cond>] [OR ...]]
  *                        [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
- *   <cond> = <col> <op> <val>,  <op> = =, !=, <, >, <=, >=
+ *   <cond>   = <colref> <op> <val>,  <op> = =, !=, <, >, <=, >=
+ *   <colref> = [<table>.]<col>
  */
 
 #define SQL_MAX_COLS 32
@@ -41,8 +43,9 @@ typedef struct {
     ColType type;
 } ColumnDef;
 
-/* WHERE 한 조건: <col> <op> <val> */
+/* WHERE 한 조건: [<tbl>.]<col> <op> <val>. tbl[0]=='\0' 이면 한정 없음. */
 typedef struct {
+    char tbl[SQL_NAME_LEN];
     char col[SQL_NAME_LEN];
     CmpOp op;
     Value val;
@@ -87,8 +90,17 @@ typedef struct {
     int num_values;
 } InsertStmt;
 
+/* INNER JOIN ... ON <l> = <r>. has_join==0 이면 단일 테이블. */
+typedef struct {
+    int has_join;
+    char table[SQL_NAME_LEN];                       /* JOIN 대상(오른쪽) 테이블 */
+    char l_tbl[SQL_NAME_LEN], l_col[SQL_NAME_LEN];  /* ON 왼쪽 컬럼 참조 */
+    char r_tbl[SQL_NAME_LEN], r_col[SQL_NAME_LEN];  /* ON 오른쪽 컬럼 참조 */
+} JoinSpec;
+
 typedef struct {
     char table[SQL_NAME_LEN];
+    JoinSpec join;
     Where where;
     char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음 */
     int order_desc;               /* 1이면 DESC, 0이면 ASC */
