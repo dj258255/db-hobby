@@ -25,7 +25,7 @@ typedef struct {
 typedef struct {
     BufferPool *bp;
     Pager *pager;
-    page_id_t first_page; /* 데이터 페이지 시작. 보통 0, 카탈로그가 page 0을 쓰면 1. */
+    page_id_t first_page; /* 데이터 페이지 시작. 테이블마다 파일이 따로라 보통 0. */
 } Heap;
 
 void heap_init(Heap *h, BufferPool *bp, Pager *pager, page_id_t first_page);

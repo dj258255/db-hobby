@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (127 checks across 11 suites).
+covered by tests (152 checks across 12 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -41,8 +41,9 @@ id | name
 (2행)
 ```
 
-Data is stored in a single file and survives a restart (the schema is persisted
-too, so no need to re-run `CREATE TABLE`).
+Each table is stored as its own pair of files and survives a restart (the schema
+is persisted too, so no need to re-run `CREATE TABLE`) -- see the storage layout
+below.
 
 ## What's inside
 
@@ -55,40 +56,58 @@ Built bottom-up; each layer sits on the one below it.
 | `bufpool.c` | page cache with pin counts, dirty flags, LRU eviction | InnoDB buffer pool |
 | `heap.c` | table = a collection of pages; rows addressed by `RID = (page, slot)` | PG heap |
 | `sql.c` | hand-written lexer + recursive-descent parser (SQL -> AST) | every DB frontend |
-| `db.c` | executor + tuple codec + catalog (schema persisted in page 0) | pg_catalog |
+| `db.c` | executor + tuple codec + multi-table catalog + nested-loop join | pg_catalog, executor |
 | `btree.c` | on-disk B+Tree index for O(log n) lookups, with node splits | InnoDB clustered index |
 | `wal.c` | write-ahead log: durability and atomicity, with crash recovery | PG WAL / redo log |
+
+### Storage layout
+
+Like PostgreSQL (each relation is its own file, `relfilenode`), every table lives
+in its own files, and a catalog file lists which tables exist:
+
+```
+mydb              catalog -- table names + schemas (like pg_class)
+mydb.users.tbl    users rows  (heap)
+mydb.users.idx    users PK index (B+Tree)
+mydb.orders.tbl   orders rows
+mydb.orders.idx   orders PK index
+```
 
 ## SQL supported
 
 ```
 CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
-SELECT * FROM <t> [WHERE <cond> [AND <cond>] ...]
-UPDATE <t> SET <col> = <value> [WHERE <cond> [AND <cond>] ...]
-DELETE FROM <t> [WHERE <cond> [AND <cond>] ...]
+SELECT * FROM <t> [JOIN <t2> ON <colref> = <colref>]
+                  [WHERE <cond> [AND <cond>] [OR ...]]
+                  [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
+UPDATE <t> SET <col> = <value> [WHERE ...]
+DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
 
-<cond> is  <col> <op> <value>,  where <op> is one of  =  !=  <  >  <=  >=
+<cond>   is  <colref> <op> <value>,  <op> is one of  =  !=  <  >  <=  >=
+<colref> is  [<table>.]<col>
 ```
 
 An `=`, `<`, `>`, `<=`, or `>=` on the first column (an `INT` primary key) uses
 the B+Tree index -- `=` is an O(log n) point lookup, the others walk the linked
 leaf chain as a range scan. `!=`, conditions on other columns, and compound
 `AND` conditions fall back to a full scan -- the kind of choice a query planner
-makes. Transactions use a no-steal + force-at-commit policy and roll back both
-the heap and the index.
+makes. `ORDER BY`/`LIMIT` take a materialize path (collect, sort, truncate),
+and `JOIN` is a nested-loop join. Transactions use a no-steal + force-at-commit
+policy across every table and roll back both the heap and the index.
 
 See `DESIGN.md` for the full layer map and build order.
 
 ## Scope (honest limitations)
 
-Kept simple on purpose: one table per database, the first column is treated as a
-unique integer primary key, `WHERE` supports comparison operators chained with
-`AND` (no `OR`, no parentheses), and there is no isolation/concurrency (one
-transaction at a time). B+Tree deletion isn't
-implemented (deleted rows are tombstoned in the heap, so a stale index entry is
-harmless). These are noted in the code where they matter.
+Kept simple on purpose: the first column of each table is treated as a unique
+integer primary key; `WHERE` is in disjunctive normal form (AND-groups joined by
+OR, no parentheses); `JOIN` is a single INNER JOIN with one `=` in `ON` and can't
+yet combine with `ORDER BY`; and there is no isolation/concurrency (one
+transaction at a time). B+Tree deletion isn't implemented (deleted rows are
+tombstoned in the heap, so a stale index entry is harmless). These are noted in
+the code where they matter.
 
 ## License
 
