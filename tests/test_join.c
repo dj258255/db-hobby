@@ -29,7 +29,7 @@ static char *run(Database *db, const char *sql) {
 /* 테스트가 만드는 파일들을 모두 지운다(카탈로그 + 테이블별 .tbl/.idx). */
 static void cleanup(const char *base) {
     char p[700];
-    const char *tbls[] = {"users", "orders", "products"};
+    const char *tbls[] = {"users", "orders", "products", "emp"};
     unlink(base);
     for (size_t i = 0; i < sizeof(tbls) / sizeof(tbls[0]); i++) {
         snprintf(p, sizeof(p), "%s.%s.tbl", base, tbls[i]);
@@ -156,6 +156,33 @@ int main(void) {
         char *a = strstr(o, " A"), *b = strstr(o, " B");
         CHECK(a && b && b < a && strstr(o, "(2행"), "ORDER BY products.pname DESC -> B 먼저");
     }
+    free(o);
+
+    /* 테이블 별칭 + self-join: 직원과 그 상사를 같은 테이블에서 잇는다 */
+    o = run(&db, "CREATE TABLE emp (id INT, name TEXT, mgr INT)"); free(o);
+    o = run(&db, "INSERT INTO emp VALUES (1, 'ceo', 0)"); free(o);
+    o = run(&db, "INSERT INTO emp VALUES (2, 'alice', 1)"); free(o);
+    o = run(&db, "INSERT INTO emp VALUES (3, 'bob', 1)"); free(o);
+
+    /* 단일 테이블 별칭 */
+    o = run(&db, "SELECT * FROM emp e WHERE e.mgr = 1");
+    CHECK(strstr(o, "alice") && strstr(o, "bob") && !strstr(o, "ceo") && strstr(o, "(2행"),
+          "별칭 e.mgr=1 -> alice, bob");
+    free(o);
+
+    /* self-join: e.mgr = m.id (같은 테이블 두 번, 별칭으로 구별) */
+    o = run(&db, "SELECT * FROM emp e JOIN emp m ON e.mgr = m.id");
+    CHECK(strstr(o, "e.id") && strstr(o, "m.name"), "self-join 헤더에 별칭 e.*/m.*");
+    CHECK(strstr(o, "(2행") != NULL, "alice->ceo, bob->ceo (ceo는 상사 없음)");
+    CHECK(strstr(o, "alice | 1 | 1 | ceo") && strstr(o, "bob | 1 | 1 | ceo"),
+          "alice/bob의 상사가 ceo로 결합");
+    CHECK(db.used_index == 1, "m.id(PK)가 ON -> 인덱스 self-join");
+    free(o);
+
+    /* self-join + WHERE로 특정 상사의 부하만 */
+    o = run(&db, "SELECT * FROM emp e JOIN emp m ON e.mgr = m.id WHERE e.name = 'bob'");
+    CHECK(strstr(o, "bob") && strstr(o, "ceo") && !strstr(o, "alice") && strstr(o, "(1행"),
+          "self-join + WHERE e.name='bob' -> bob/ceo 1행");
     free(o);
 
     /* 재오픈해도 두 테이블 다 살아 있다(카탈로그 + 파일별 영속) */

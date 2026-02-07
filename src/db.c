@@ -172,10 +172,11 @@ static int cmp_apply(CmpOp op, long sign) {
 }
 
 /* 한 스키마에서 [qtbl.]col 에 해당하는 셀을 찾는다. 없으면 NULL.
- * qtbl이 있고 이 스키마의 테이블명과 다르면 이 테이블 소속이 아니다. */
-static const Value *cell_in(const CreateStmt *s, const char *qtbl, const char *col,
-                            const Value *row) {
-    if (qtbl[0] && strcmp(qtbl, s->table) != 0) {
+ * tname은 이 테이블의 "실효 이름"(별칭이 있으면 별칭). qtbl이 있고 tname과
+ * 다르면 이 테이블 소속이 아니다. */
+static const Value *cell_in(const CreateStmt *s, const char *tname, const char *qtbl,
+                            const char *col, const Value *row) {
+    if (qtbl[0] && strcmp(qtbl, tname) != 0) {
         return NULL;
     }
     for (int i = 0; i < s->num_columns; i++) {
@@ -212,14 +213,16 @@ static int values_equal(const Value *a, const Value *b) {
     return strcmp(a->text_val, b->text_val) == 0;
 }
 
-/* --- 단일 테이블 WHERE --- */
-static int cond_matches(const CreateStmt *schema, const Condition *cond, const Value *row) {
-    return cond_eval(cell_in(schema, cond->tbl, cond->col, row), cond);
+/* --- 단일 테이블 WHERE (tname = 실효 테이블 이름) --- */
+static int cond_matches(const CreateStmt *schema, const char *tname, const Condition *cond,
+                        const Value *row) {
+    return cond_eval(cell_in(schema, tname, cond->tbl, cond->col, row), cond);
 }
 
-static int group_matches(const CreateStmt *schema, const AndGroup *g, const Value *row) {
+static int group_matches(const CreateStmt *schema, const char *tname, const AndGroup *g,
+                         const Value *row) {
     for (int i = 0; i < g->count; i++) {
-        if (!cond_matches(schema, &g->conds[i], row)) {
+        if (!cond_matches(schema, tname, &g->conds[i], row)) {
             return 0;
         }
     }
@@ -227,23 +230,25 @@ static int group_matches(const CreateStmt *schema, const AndGroup *g, const Valu
 }
 
 /* WHERE 절(DNF): 어느 한 AND 묶음이라도 참이면 참. count==0 이면 항상 참. */
-static int where_matches(const CreateStmt *schema, const Where *w, const Value *row) {
+static int where_matches(const CreateStmt *schema, const char *tname, const Where *w,
+                         const Value *row) {
     if (w->count == 0) {
         return 1;
     }
     for (int i = 0; i < w->count; i++) {
-        if (group_matches(schema, &w->groups[i], row)) {
+        if (group_matches(schema, tname, &w->groups[i], row)) {
             return 1;
         }
     }
     return 0;
 }
 
-/* --- 체인 조인된 N개 행에 대한 WHERE: 체인 순서대로 컬럼을 찾는다 --- */
-static const Value *cell_chain(Table **tabs, Value rows[][SQL_MAX_COLS], int ntabs,
-                               const char *qtbl, const char *col) {
+/* --- 체인 조인된 N개 행에 대한 WHERE: 체인 순서대로 컬럼을 찾는다.
+ *     tname[t] = t번째 체인 테이블의 실효 이름(별칭 있으면 별칭). --- */
+static const Value *cell_chain(Table **tabs, const char **tname, Value rows[][SQL_MAX_COLS],
+                               int ntabs, const char *qtbl, const char *col) {
     for (int t = 0; t < ntabs; t++) {
-        const Value *v = cell_in(&tabs[t]->schema, qtbl, col, rows[t]);
+        const Value *v = cell_in(&tabs[t]->schema, tname[t], qtbl, col, rows[t]);
         if (v) {
             return v;
         }
@@ -251,8 +256,8 @@ static const Value *cell_chain(Table **tabs, Value rows[][SQL_MAX_COLS], int nta
     return NULL;
 }
 
-static int where_matches_chain(Table **tabs, Value rows[][SQL_MAX_COLS], int ntabs,
-                               const Where *w) {
+static int where_matches_chain(Table **tabs, const char **tname, Value rows[][SQL_MAX_COLS],
+                               int ntabs, const Where *w) {
     if (w->count == 0) {
         return 1;
     }
@@ -261,7 +266,7 @@ static int where_matches_chain(Table **tabs, Value rows[][SQL_MAX_COLS], int nta
         int all = 1;
         for (int i = 0; i < g->count; i++) {
             const Condition *c = &g->conds[i];
-            if (!cond_eval(cell_chain(tabs, rows, ntabs, c->tbl, c->col), c)) {
+            if (!cond_eval(cell_chain(tabs, tname, rows, ntabs, c->tbl, c->col), c)) {
                 all = 0;
                 break;
             }
@@ -335,6 +340,7 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
 
 typedef struct {
     const CreateStmt *schema;
+    const char *tname;
     const Where *where;
     FILE *out;
     int count;
@@ -346,7 +352,7 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     SelectCtx *ctx = ctx_;
     Value row[SQL_MAX_COLS];
     decode_row(ctx->schema, rec, row);
-    if (!where_matches(ctx->schema, ctx->where, row)) {
+    if (!where_matches(ctx->schema, ctx->tname, ctx->where, row)) {
         return 0;
     }
     print_row(ctx->out, ctx->schema, row);
@@ -387,6 +393,7 @@ static int range_visit(bkey_t key, bval_t val, void *ctx_) {
 
 typedef struct {
     const CreateStmt *schema;
+    const char *tname;
     const Where *where;
     Value *rows; /* count * ncols 짜리 평면 배열. 행 i는 rows + i*ncols */
     int ncols;
@@ -403,7 +410,7 @@ static int mat_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     }
     Value row[SQL_MAX_COLS];
     decode_row(m->schema, rec, row);
-    if (!where_matches(m->schema, m->where, row)) {
+    if (!where_matches(m->schema, m->tname, m->where, row)) {
         return 0;
     }
     memcpy(m->rows + (size_t)m->count * m->ncols, row, (size_t)m->ncols * sizeof(Value));
@@ -427,19 +434,25 @@ static int row_cmp(const void *a, const void *b) {
     return strcmp(x->text_val, y->text_val);
 }
 
-static int exec_select_sorted(Table *t, const SelectStmt *sel, FILE *out) {
+static int exec_select_sorted(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
     int ncols = t->schema.num_columns;
     Value *rows = malloc((size_t)SELECT_MAX_ROWS * ncols * sizeof(Value));
     if (!rows) {
         fprintf(out, "ERROR: 메모리 부족\n");
         return -1;
     }
-    MatCtx m = {&t->schema, &sel->where, rows, ncols, SELECT_MAX_ROWS, 0};
+    MatCtx m = {.schema = &t->schema,
+                .tname = tname,
+                .where = &sel->where,
+                .rows = rows,
+                .ncols = ncols,
+                .cap = SELECT_MAX_ROWS,
+                .count = 0};
     heap_scan(&t->heap, mat_visit, &m);
 
     if (sel->order_col[0] != '\0') {
         int ci = -1;
-        if (sel->order_tbl[0] == '\0' || strcmp(sel->order_tbl, t->schema.table) == 0) {
+        if (sel->order_tbl[0] == '\0' || strcmp(sel->order_tbl, tname) == 0) {
             for (int i = 0; i < ncols; i++) {
                 if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) {
                     ci = i;
@@ -491,6 +504,7 @@ typedef struct {
     Database *db;
     const SelectStmt *sel;
     Table *tabs[MJOIN_MAX_TABS];
+    const char *tname[MJOIN_MAX_TABS]; /* 체인 테이블의 실효 이름(별칭 있으면 별칭) */
     int ntabs;
     /* 각 조인 레벨 k(1..ntabs-1)의 ON 양변을 (체인 테이블 idx, 컬럼 idx)로 해소 */
     int on_at[MJOIN_MAX_TABS], on_ai[MJOIN_MAX_TABS];
@@ -512,10 +526,10 @@ typedef struct {
 
 /* [qtbl.]col 을 체인의 (테이블 idx, 컬럼 idx)로 해소한다. qtbl 없으면 체인 순서로
  * 첫 매치. 0 성공, -1 실패. */
-static int resolve_chain_ref(Table **tabs, int ntabs, const char *qtbl, const char *col,
-                             int *ti, int *ci) {
+static int resolve_chain_ref(Table **tabs, const char **tname, int ntabs, const char *qtbl,
+                             const char *col, int *ti, int *ci) {
     for (int t = 0; t < ntabs; t++) {
-        if (qtbl[0] && strcmp(qtbl, tabs[t]->schema.table) != 0) {
+        if (qtbl[0] && strcmp(qtbl, tname[t]) != 0) {
             continue;
         }
         for (int i = 0; i < tabs[t]->schema.num_columns; i++) {
@@ -532,7 +546,7 @@ static int resolve_chain_ref(Table **tabs, int ntabs, const char *qtbl, const ch
 /* 모든 테이블이 묶였을 때: WHERE 적용 후 결합 행을 출력하거나 수집한다.
  * LIMIT에 도달했으면 1을 돌려 위쪽 루프들을 멈추게 한다. */
 static int mjoin_emit(MJoinCtx *m) {
-    if (!where_matches_chain(m->tabs, m->rows, m->ntabs, &m->sel->where)) {
+    if (!where_matches_chain(m->tabs, m->tname, m->rows, m->ntabs, &m->sel->where)) {
         return 0;
     }
     if (m->materialize) {
@@ -616,26 +630,32 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     MJoinCtx m = {.db = db, .sel = sel, .out = out};
     m.ntabs = 1 + sel->num_joins;
 
-    /* 체인 테이블들을 찾는다: tabs[0]=FROM, tabs[k]=k번째 JOIN 대상 */
+    /* 체인 테이블들을 찾는다: tabs[0]=FROM, tabs[k]=k번째 JOIN 대상.
+     * 실효 이름(tname)은 별칭이 있으면 별칭 — self-join은 별칭으로 두 인스턴스를 구별한다. */
     m.tabs[0] = find_table(db, sel->table);
     if (!m.tabs[0]) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
         return -1;
     }
+    m.tname[0] = sel->alias[0] ? sel->alias : m.tabs[0]->schema.table;
     for (int k = 1; k < m.ntabs; k++) {
-        m.tabs[k] = find_table(db, sel->joins[k - 1].table);
+        const JoinClause *jc0 = &sel->joins[k - 1];
+        m.tabs[k] = find_table(db, jc0->table);
         if (!m.tabs[k]) {
-            fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->joins[k - 1].table);
+            fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", jc0->table);
             return -1;
         }
+        m.tname[k] = jc0->alias[0] ? jc0->alias : m.tabs[k]->schema.table;
     }
 
     /* 각 조인 레벨의 ON을 해소하고 인덱스 NLJ 가능 여부를 정한다 */
     int used_index = 0;
     for (int k = 1; k < m.ntabs; k++) {
         const JoinClause *jc = &sel->joins[k - 1];
-        if (resolve_chain_ref(m.tabs, m.ntabs, jc->l_tbl, jc->l_col, &m.on_at[k], &m.on_ai[k]) != 0 ||
-            resolve_chain_ref(m.tabs, m.ntabs, jc->r_tbl, jc->r_col, &m.on_bt[k], &m.on_bi[k]) != 0) {
+        if (resolve_chain_ref(m.tabs, m.tname, m.ntabs, jc->l_tbl, jc->l_col, &m.on_at[k],
+                              &m.on_ai[k]) != 0 ||
+            resolve_chain_ref(m.tabs, m.tname, m.ntabs, jc->r_tbl, jc->r_col, &m.on_bt[k],
+                              &m.on_bi[k]) != 0) {
             fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
             return -1;
         }
@@ -674,7 +694,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
                     fprintf(out, " | ");
                 }
                 first = 0;
-                fprintf(out, "%s.%s", m.tabs[t]->schema.table, m.tabs[t]->schema.columns[i].name);
+                fprintf(out, "%s.%s", m.tname[t], m.tabs[t]->schema.columns[i].name);
             }
         }
         fprintf(out, "\n");
@@ -692,7 +712,8 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
 
     /* ORDER BY: 결합 행을 모아 정렬한 뒤 LIMIT만큼 출력한다(조인 위의 Sort 노드). */
     int oti, oci;
-    if (resolve_chain_ref(m.tabs, m.ntabs, sel->order_tbl, sel->order_col, &oti, &oci) != 0) {
+    if (resolve_chain_ref(m.tabs, m.tname, m.ntabs, sel->order_tbl, sel->order_col, &oti, &oci) !=
+        0) {
         fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
         return -1;
     }
@@ -749,6 +770,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
         return -1;
     }
+    const char *tname = sel->alias[0] ? sel->alias : t->schema.table; /* 실효 이름 */
     /* 헤더 */
     for (int i = 0; i < t->schema.num_columns; i++) {
         if (i) {
@@ -762,7 +784,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
 
     /* ORDER BY나 LIMIT이 있으면 모았다가 정렬/자르는 경로로 간다. */
     if (sel->order_col[0] != '\0' || sel->limit >= 0) {
-        return exec_select_sorted(t, sel, out);
+        return exec_select_sorted(t, tname, sel, out);
     }
 
     int count = 0;
@@ -773,7 +795,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
                               ? &sel->where.groups[0].conds[0]
                               : NULL;
     int pk_cond = c0 && t->has_index &&
-                  (c0->tbl[0] == '\0' || strcmp(c0->tbl, t->schema.table) == 0) &&
+                  (c0->tbl[0] == '\0' || strcmp(c0->tbl, tname) == 0) &&
                   strcmp(c0->col, t->schema.columns[0].name) == 0 && c0->val.type == VAL_INT;
 
     if (pk_cond && c0->op == CMP_EQ) {
@@ -803,7 +825,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         count = rc.count;
     } else {
         /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> 풀 스캔 */
-        SelectCtx ctx = {&t->schema, &sel->where, out, 0};
+        SelectCtx ctx = {&t->schema, tname, &sel->where, out, 0};
         heap_scan(&t->heap, select_visit, &ctx);
         count = ctx.count;
     }
@@ -828,7 +850,8 @@ static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     CollectCtx *c = ctx_;
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, rec, row);
-    if (where_matches(c->schema, c->where, row) && c->count < DML_MAX_ROWS) {
+    /* DELETE/UPDATE는 별칭이 없으니 실효 이름 = 테이블명 */
+    if (where_matches(c->schema, c->schema->table, c->where, row) && c->count < DML_MAX_ROWS) {
         c->rids[c->count++] = rid;
     }
     return 0;

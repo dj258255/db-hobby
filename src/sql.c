@@ -349,6 +349,9 @@ static void parse_select(Parser *p, Statement *st) {
     p_expect(p, TOK_STAR, "지금은 SELECT * 만 지원합니다");
     p_expect(p, TOK_FROM, "FROM이 필요합니다");
     parse_name(p, s->table);
+    if (p->cur.type == TOK_IDENT) { /* 테이블 뒤 식별자는 별칭 (키워드는 별도 토큰이라 안 걸림) */
+        parse_name(p, s->alias);
+    }
     while (p_accept(p, TOK_JOIN)) {
         if (s->num_joins >= SQL_MAX_JOINS) {
             p_fail(p, "JOIN이 너무 많습니다");
@@ -356,6 +359,9 @@ static void parse_select(Parser *p, Statement *st) {
         }
         JoinClause *jc = &s->joins[s->num_joins];
         parse_name(p, jc->table);
+        if (p->cur.type == TOK_IDENT) {
+            parse_name(p, jc->alias);
+        }
         p_expect(p, TOK_ON, "JOIN 다음에 ON이 필요합니다");
         parse_colref(p, jc->l_tbl, jc->l_col);
         p_expect(p, TOK_EQ, "ON 조건은 <컬럼> = <컬럼> 형태여야 합니다");
