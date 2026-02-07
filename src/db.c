@@ -239,18 +239,20 @@ static int where_matches(const CreateStmt *schema, const Where *w, const Value *
     return 0;
 }
 
-/* --- 조인된 두 행에 대한 WHERE (왼쪽 먼저, 없으면 오른쪽에서 컬럼을 찾는다) --- */
-static const Value *cell_join(const CreateStmt *ls, const Value *lrow, const CreateStmt *rs,
-                              const Value *rrow, const char *qtbl, const char *col) {
-    const Value *v = cell_in(ls, qtbl, col, lrow);
-    if (v) {
-        return v;
+/* --- 체인 조인된 N개 행에 대한 WHERE: 체인 순서대로 컬럼을 찾는다 --- */
+static const Value *cell_chain(Table **tabs, Value rows[][SQL_MAX_COLS], int ntabs,
+                               const char *qtbl, const char *col) {
+    for (int t = 0; t < ntabs; t++) {
+        const Value *v = cell_in(&tabs[t]->schema, qtbl, col, rows[t]);
+        if (v) {
+            return v;
+        }
     }
-    return cell_in(rs, qtbl, col, rrow);
+    return NULL;
 }
 
-static int where_matches_join(const CreateStmt *ls, const Value *lrow, const CreateStmt *rs,
-                              const Value *rrow, const Where *w) {
+static int where_matches_chain(Table **tabs, Value rows[][SQL_MAX_COLS], int ntabs,
+                               const Where *w) {
     if (w->count == 0) {
         return 1;
     }
@@ -259,7 +261,7 @@ static int where_matches_join(const CreateStmt *ls, const Value *lrow, const Cre
         int all = 1;
         for (int i = 0; i < g->count; i++) {
             const Condition *c = &g->conds[i];
-            if (!cond_eval(cell_join(ls, lrow, rs, rrow, c->tbl, c->col), c)) {
+            if (!cond_eval(cell_chain(tabs, rows, ntabs, c->tbl, c->col), c)) {
                 all = 0;
                 break;
             }
@@ -476,236 +478,253 @@ static int exec_select_sorted(Table *t, const SelectStmt *sel, FILE *out) {
     return 0;
 }
 
-/* ------------- 실행기: JOIN (중첩 루프 조인) ------------- */
+/* ------------- 실행기: JOIN (N-way 재귀 중첩 루프 조인) -------------
+ * 테이블 체인 [T0(FROM), T1, T2, ...] 을 레벨별로 재귀한다. 레벨 k에서 Tk를
+ * 스캔하며 행을 rows[k]에 담고, k번째 ON 조건(앞서 묶인 테이블을 참조)이 맞으면
+ * 레벨 k+1로 내려간다. 모든 테이블이 묶이면 WHERE를 걸고 출력(또는 정렬용 수집).
+ * 레벨마다, ON이 그 테이블의 PK를 앞 테이블 컬럼과 맞추고 인덱스가 있으면 전체
+ * 스캔 대신 점 조회(인덱스 NLJ)로 바꾼다.
+ */
+#define MJOIN_MAX_TABS (1 + SQL_MAX_JOINS)
 
 typedef struct {
-    Table *L, *R;
+    Database *db;
     const SelectStmt *sel;
-    /* ON 양변을 (side: 0=왼쪽테이블 1=오른쪽테이블, idx: 컬럼 위치)로 미리 해소 */
-    int al_side, al_idx;
-    int ar_side, ar_idx;
-    /* 인덱스 중첩 루프 조인: 안쪽(R)이 PK 인덱스를 갖고 ON이 그 PK와 맞으면,
-     * 안쪽 전체 스캔 대신 바깥 행의 키로 점 조회한다. */
-    int use_index;     /* 1이면 인덱스 NLJ */
-    int outer_key_idx; /* 바깥(L) 행에서 조인 키를 꺼낼 컬럼 위치 */
-    /* ORDER BY가 있으면 출력 대신 결합 행을 모은다(정렬은 다 모은 뒤에 한다). */
-    int materialize;
-    Value *matbuf; /* matcap * comb_ncols 평면 배열 */
+    Table *tabs[MJOIN_MAX_TABS];
+    int ntabs;
+    /* 각 조인 레벨 k(1..ntabs-1)의 ON 양변을 (체인 테이블 idx, 컬럼 idx)로 해소 */
+    int on_at[MJOIN_MAX_TABS], on_ai[MJOIN_MAX_TABS];
+    int on_bt[MJOIN_MAX_TABS], on_bi[MJOIN_MAX_TABS];
+    /* 인덱스 NLJ 계획(레벨 k): use_idx[k]면 Tk를 점 조회. key는 앞 테이블의 (kt,ki) */
+    int use_idx[MJOIN_MAX_TABS];
+    int key_t[MJOIN_MAX_TABS], key_i[MJOIN_MAX_TABS];
+    int off[MJOIN_MAX_TABS]; /* 결합 행에서 각 테이블 컬럼의 시작 위치 */
     int comb_ncols;
+    Value rows[MJOIN_MAX_TABS][SQL_MAX_COLS]; /* 레벨별 현재 행 */
+    /* ORDER BY면 출력 대신 결합 행을 모은다 */
+    int materialize;
+    Value *matbuf;
     int matcap;
     int matcount;
     FILE *out;
     int count;
-    const Value *lrow; /* 바깥 루프의 현재 행 */
-} JoinCtx;
+} MJoinCtx;
 
-/* 결합된 (lrow, rrow) 한 쌍을 ON·WHERE로 거른 뒤 출력(또는 버퍼에 수집)한다.
- * LIMIT에 도달했으면 1을 돌려 바깥/안쪽 루프를 멈추게 한다. */
-static int join_emit(JoinCtx *j, const Value *lrow, const Value *rrow) {
-    const Value *a = (j->al_side == 0) ? &lrow[j->al_idx] : &rrow[j->al_idx];
-    const Value *b = (j->ar_side == 0) ? &lrow[j->ar_idx] : &rrow[j->ar_idx];
-    if (!values_equal(a, b)) {
-        return 0;
-    }
-    if (!where_matches_join(&j->L->schema, lrow, &j->R->schema, rrow, &j->sel->where)) {
-        return 0;
-    }
-    int lc = j->L->schema.num_columns;
-    int rc = j->R->schema.num_columns;
-    if (j->materialize) {
-        /* ORDER BY 경로: 결합 행(L 컬럼들 + R 컬럼들)을 버퍼에 모은다. LIMIT은 정렬 후 적용. */
-        if (j->matcount < j->matcap) {
-            Value *dst = j->matbuf + (size_t)j->matcount * j->comb_ncols;
-            memcpy(dst, lrow, (size_t)lc * sizeof(Value));
-            memcpy(dst + lc, rrow, (size_t)rc * sizeof(Value));
-            j->matcount++;
+/* [qtbl.]col 을 체인의 (테이블 idx, 컬럼 idx)로 해소한다. qtbl 없으면 체인 순서로
+ * 첫 매치. 0 성공, -1 실패. */
+static int resolve_chain_ref(Table **tabs, int ntabs, const char *qtbl, const char *col,
+                             int *ti, int *ci) {
+    for (int t = 0; t < ntabs; t++) {
+        if (qtbl[0] && strcmp(qtbl, tabs[t]->schema.table) != 0) {
+            continue;
         }
-        return 0;
-    }
-    /* 결합 행 출력: 왼쪽 컬럼들 다음 오른쪽 컬럼들 */
-    for (int i = 0; i < lc; i++) {
-        if (i) {
-            fprintf(j->out, " | ");
-        }
-        print_value(j->out, &lrow[i]);
-    }
-    for (int i = 0; i < rc; i++) {
-        fprintf(j->out, " | ");
-        print_value(j->out, &rrow[i]);
-    }
-    fprintf(j->out, "\n");
-    j->count++;
-    return (j->sel->limit >= 0 && j->count >= j->sel->limit); /* LIMIT 도달 -> 멈춤 */
-}
-
-/* [qtbl.]col 을 (side, idx)로 해소한다. qtbl 없으면 왼쪽부터 찾는다. 0 성공, -1 실패. */
-static int resolve_ref(Table *L, Table *R, const char *qtbl, const char *col, int *side,
-                       int *idx) {
-    if (qtbl[0]) {
-        Table *t = NULL;
-        int s = -1;
-        if (strcmp(qtbl, L->schema.table) == 0) {
-            t = L;
-            s = 0;
-        } else if (strcmp(qtbl, R->schema.table) == 0) {
-            t = R;
-            s = 1;
-        } else {
-            return -1;
-        }
-        for (int i = 0; i < t->schema.num_columns; i++) {
-            if (strcmp(t->schema.columns[i].name, col) == 0) {
-                *side = s;
-                *idx = i;
+        for (int i = 0; i < tabs[t]->schema.num_columns; i++) {
+            if (strcmp(tabs[t]->schema.columns[i].name, col) == 0) {
+                *ti = t;
+                *ci = i;
                 return 0;
             }
-        }
-        return -1;
-    }
-    for (int i = 0; i < L->schema.num_columns; i++) {
-        if (strcmp(L->schema.columns[i].name, col) == 0) {
-            *side = 0;
-            *idx = i;
-            return 0;
-        }
-    }
-    for (int i = 0; i < R->schema.num_columns; i++) {
-        if (strcmp(R->schema.columns[i].name, col) == 0) {
-            *side = 1;
-            *idx = i;
-            return 0;
         }
     }
     return -1;
 }
 
-static int join_inner_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
-    (void)rid;
-    (void)len;
-    JoinCtx *j = ctx_;
-    Value rrow[SQL_MAX_COLS];
-    decode_row(&j->R->schema, rec, rrow);
-    return join_emit(j, j->lrow, rrow);
+/* 모든 테이블이 묶였을 때: WHERE 적용 후 결합 행을 출력하거나 수집한다.
+ * LIMIT에 도달했으면 1을 돌려 위쪽 루프들을 멈추게 한다. */
+static int mjoin_emit(MJoinCtx *m) {
+    if (!where_matches_chain(m->tabs, m->rows, m->ntabs, &m->sel->where)) {
+        return 0;
+    }
+    if (m->materialize) {
+        if (m->matcount < m->matcap) {
+            Value *dst = m->matbuf + (size_t)m->matcount * m->comb_ncols;
+            for (int t = 0; t < m->ntabs; t++) {
+                int nc = m->tabs[t]->schema.num_columns;
+                memcpy(dst + m->off[t], m->rows[t], (size_t)nc * sizeof(Value));
+            }
+            m->matcount++;
+        }
+        return 0;
+    }
+    int first = 1;
+    for (int t = 0; t < m->ntabs; t++) {
+        for (int i = 0; i < m->tabs[t]->schema.num_columns; i++) {
+            if (!first) {
+                fprintf(m->out, " | ");
+            }
+            first = 0;
+            print_value(m->out, &m->rows[t][i]);
+        }
+    }
+    fprintf(m->out, "\n");
+    m->count++;
+    return (m->sel->limit >= 0 && m->count >= m->sel->limit);
 }
 
-static int join_outer_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+static int mjoin_descend(MJoinCtx *m, int level);
+
+typedef struct {
+    MJoinCtx *m;
+    int level;
+} MJoinLevel;
+
+static int mjoin_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)rid;
     (void)len;
-    JoinCtx *j = ctx_;
-    Value lrow[SQL_MAX_COLS];
-    decode_row(&j->L->schema, rec, lrow);
-    j->lrow = lrow;
-    int r;
-    if (j->use_index) {
-        /* 인덱스 NLJ: 안쪽 전체 스캔 대신 바깥 행의 키로 R의 PK 인덱스를 점 조회. */
-        r = 0;
-        const Value *k = &lrow[j->outer_key_idx];
-        if (k->type == VAL_INT) {
-            bval_t encoded;
-            if (btree_search(&j->R->index, k->int_val, &encoded) == 0) {
-                uint8_t recbuf[PAGE_SIZE];
-                uint16_t len2;
-                if (heap_get(&j->R->heap, rid_decode(encoded), recbuf, &len2) == 0) {
-                    Value rrow[SQL_MAX_COLS];
-                    decode_row(&j->R->schema, recbuf, rrow);
-                    r = join_emit(j, lrow, rrow);
-                }
-            }
+    MJoinLevel *lv = ctx_;
+    MJoinCtx *m = lv->m;
+    int level = lv->level;
+    decode_row(&m->tabs[level]->schema, rec, m->rows[level]);
+    if (level >= 1) {
+        /* 이 레벨의 ON 등식을 확인한다 */
+        const Value *a = &m->rows[m->on_at[level]][m->on_ai[level]];
+        const Value *b = &m->rows[m->on_bt[level]][m->on_bi[level]];
+        if (!values_equal(a, b)) {
+            return 0;
         }
-    } else {
-        r = heap_scan(&j->R->heap, join_inner_visit, j); /* 바깥 한 행마다 안쪽 전체 스캔 */
     }
-    j->lrow = NULL;
-    return r; /* 안쪽이 LIMIT로 멈췄으면(!=0) 바깥도 멈춘다 */
+    return mjoin_descend(m, level + 1);
+}
+
+static int mjoin_descend(MJoinCtx *m, int level) {
+    if (level == m->ntabs) {
+        return mjoin_emit(m);
+    }
+    if (level >= 1 && m->use_idx[level]) {
+        /* 인덱스 NLJ: 앞 테이블의 키로 Tk의 PK 인덱스를 점 조회 */
+        const Value *k = &m->rows[m->key_t[level]][m->key_i[level]];
+        if (k->type != VAL_INT) {
+            return 0;
+        }
+        bval_t encoded;
+        if (btree_search(&m->tabs[level]->index, k->int_val, &encoded) != 0) {
+            return 0;
+        }
+        uint8_t recbuf[PAGE_SIZE];
+        uint16_t len2;
+        if (heap_get(&m->tabs[level]->heap, rid_decode(encoded), recbuf, &len2) != 0) {
+            return 0;
+        }
+        decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
+        return mjoin_descend(m, level + 1);
+    }
+    MJoinLevel lv = {m, level};
+    return heap_scan(&m->tabs[level]->heap, mjoin_visit, &lv);
 }
 
 static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
-    Table *L = find_table(db, sel->table);
-    Table *R = find_table(db, sel->join.table);
-    if (!L || !R) {
-        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", !L ? sel->table : sel->join.table);
-        return -1;
-    }
-    JoinCtx j = {.L = L, .R = R, .sel = sel, .out = out};
-    if (resolve_ref(L, R, sel->join.l_tbl, sel->join.l_col, &j.al_side, &j.al_idx) != 0 ||
-        resolve_ref(L, R, sel->join.r_tbl, sel->join.r_col, &j.ar_side, &j.ar_idx) != 0) {
-        fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
-        return -1;
-    }
+    MJoinCtx m = {.db = db, .sel = sel, .out = out};
+    m.ntabs = 1 + sel->num_joins;
 
-    /* 인덱스 NLJ 가능 여부: 한 변이 R의 PK(첫 컬럼)이고 R에 인덱스가 있으며,
-     * 다른 변이 바깥(L)의 컬럼이면, 안쪽 전체 스캔을 점 조회로 바꾼다. */
-    if (R->has_index) {
-        if (j.ar_side == 1 && j.ar_idx == 0 && j.al_side == 0) {
-            j.use_index = 1;
-            j.outer_key_idx = j.al_idx;
-        } else if (j.al_side == 1 && j.al_idx == 0 && j.ar_side == 0) {
-            j.use_index = 1;
-            j.outer_key_idx = j.ar_idx;
+    /* 체인 테이블들을 찾는다: tabs[0]=FROM, tabs[k]=k번째 JOIN 대상 */
+    m.tabs[0] = find_table(db, sel->table);
+    if (!m.tabs[0]) {
+        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->table);
+        return -1;
+    }
+    for (int k = 1; k < m.ntabs; k++) {
+        m.tabs[k] = find_table(db, sel->joins[k - 1].table);
+        if (!m.tabs[k]) {
+            fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", sel->joins[k - 1].table);
+            return -1;
         }
     }
 
-    int lc = L->schema.num_columns, rc = R->schema.num_columns;
-    int comb = lc + rc;
-
-    /* 헤더: 양 테이블 컬럼을 table.col 로 한정해 출력 */
-    for (int i = 0; i < lc; i++) {
-        if (i) {
-            fprintf(out, " | ");
+    /* 각 조인 레벨의 ON을 해소하고 인덱스 NLJ 가능 여부를 정한다 */
+    int used_index = 0;
+    for (int k = 1; k < m.ntabs; k++) {
+        const JoinClause *jc = &sel->joins[k - 1];
+        if (resolve_chain_ref(m.tabs, m.ntabs, jc->l_tbl, jc->l_col, &m.on_at[k], &m.on_ai[k]) != 0 ||
+            resolve_chain_ref(m.tabs, m.ntabs, jc->r_tbl, jc->r_col, &m.on_bt[k], &m.on_bi[k]) != 0) {
+            fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
+            return -1;
         }
-        fprintf(out, "%s.%s", L->schema.table, L->schema.columns[i].name);
+        m.use_idx[k] = 0;
+        if (m.tabs[k]->has_index) {
+            /* 한 변이 Tk의 PK(첫 컬럼)이고 다른 변이 앞 테이블(<k)이면 점 조회 가능 */
+            if (m.on_at[k] == k && m.on_ai[k] == 0 && m.on_bt[k] < k) {
+                m.use_idx[k] = 1;
+                m.key_t[k] = m.on_bt[k];
+                m.key_i[k] = m.on_bi[k];
+            } else if (m.on_bt[k] == k && m.on_bi[k] == 0 && m.on_at[k] < k) {
+                m.use_idx[k] = 1;
+                m.key_t[k] = m.on_at[k];
+                m.key_i[k] = m.on_ai[k];
+            }
+        }
+        if (m.use_idx[k]) {
+            used_index = 1;
+        }
     }
-    for (int i = 0; i < rc; i++) {
-        fprintf(out, " | %s.%s", R->schema.table, R->schema.columns[i].name);
-    }
-    fprintf(out, "\n");
 
-    db->used_index = j.use_index;
-    const char *idxnote = j.use_index ? ", 인덱스 조인" : "";
+    /* 결합 행에서 각 테이블의 컬럼 시작 위치(off)와 총 컬럼 수 */
+    int comb = 0;
+    for (int t = 0; t < m.ntabs; t++) {
+        m.off[t] = comb;
+        comb += m.tabs[t]->schema.num_columns;
+    }
+    m.comb_ncols = comb;
+
+    /* 헤더: 모든 테이블 컬럼을 table.col 로 한정해 출력 */
+    {
+        int first = 1;
+        for (int t = 0; t < m.ntabs; t++) {
+            for (int i = 0; i < m.tabs[t]->schema.num_columns; i++) {
+                if (!first) {
+                    fprintf(out, " | ");
+                }
+                first = 0;
+                fprintf(out, "%s.%s", m.tabs[t]->schema.table, m.tabs[t]->schema.columns[i].name);
+            }
+        }
+        fprintf(out, "\n");
+    }
+
+    db->used_index = used_index;
+    const char *idxnote = used_index ? ", 인덱스 조인" : "";
 
     if (sel->order_col[0] == '\0') {
         /* ORDER BY 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
-        heap_scan(&L->heap, join_outer_visit, &j);
-        fprintf(out, "(%d행%s)\n", j.count, idxnote);
+        mjoin_descend(&m, 0);
+        fprintf(out, "(%d행%s)\n", m.count, idxnote);
         return 0;
     }
 
     /* ORDER BY: 결합 행을 모아 정렬한 뒤 LIMIT만큼 출력한다(조인 위의 Sort 노드). */
-    int oside, oidx;
-    if (resolve_ref(L, R, sel->order_tbl, sel->order_col, &oside, &oidx) != 0) {
+    int oti, oci;
+    if (resolve_chain_ref(m.tabs, m.ntabs, sel->order_tbl, sel->order_col, &oti, &oci) != 0) {
         fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
         return -1;
     }
-    int ocomb = (oside == 0) ? oidx : lc + oidx; /* 결합 행에서의 위치 */
+    int ocomb = m.off[oti] + oci; /* 결합 행에서의 위치 */
 
-    j.materialize = 1;
-    j.comb_ncols = comb;
-    j.matcap = SELECT_MAX_ROWS;
-    j.matbuf = malloc((size_t)SELECT_MAX_ROWS * comb * sizeof(Value));
-    if (!j.matbuf) {
+    m.materialize = 1;
+    m.matcap = SELECT_MAX_ROWS;
+    m.matbuf = malloc((size_t)SELECT_MAX_ROWS * comb * sizeof(Value));
+    if (!m.matbuf) {
         fprintf(out, "ERROR: 메모리 부족\n");
         return -1;
     }
-    heap_scan(&L->heap, join_outer_visit, &j);
+    mjoin_descend(&m, 0);
 
     g_sort_ci = ocomb;
-    qsort(j.matbuf, j.matcount, (size_t)comb * sizeof(Value), row_cmp);
+    qsort(m.matbuf, m.matcount, (size_t)comb * sizeof(Value), row_cmp);
     if (sel->order_desc) {
-        Value tmp[2 * SQL_MAX_COLS];
-        for (int i = 0, k = j.matcount - 1; i < k; i++, k--) {
-            memcpy(tmp, j.matbuf + (size_t)i * comb, (size_t)comb * sizeof(Value));
-            memcpy(j.matbuf + (size_t)i * comb, j.matbuf + (size_t)k * comb,
+        Value tmp[MJOIN_MAX_TABS * SQL_MAX_COLS];
+        for (int i = 0, k = m.matcount - 1; i < k; i++, k--) {
+            memcpy(tmp, m.matbuf + (size_t)i * comb, (size_t)comb * sizeof(Value));
+            memcpy(m.matbuf + (size_t)i * comb, m.matbuf + (size_t)k * comb,
                    (size_t)comb * sizeof(Value));
-            memcpy(j.matbuf + (size_t)k * comb, tmp, (size_t)comb * sizeof(Value));
+            memcpy(m.matbuf + (size_t)k * comb, tmp, (size_t)comb * sizeof(Value));
         }
     }
 
     int printed = 0;
-    for (int i = 0; i < j.matcount; i++) {
+    for (int i = 0; i < m.matcount; i++) {
         if (sel->limit >= 0 && printed >= sel->limit) {
             break;
         }
-        Value *row = j.matbuf + (size_t)i * comb;
+        Value *row = m.matbuf + (size_t)i * comb;
         for (int c = 0; c < comb; c++) {
             if (c) {
                 fprintf(out, " | ");
@@ -715,13 +734,13 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "\n");
         printed++;
     }
-    free(j.matbuf);
+    free(m.matbuf);
     fprintf(out, "(%d행%s)\n", printed, idxnote);
     return 0;
 }
 
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
-    if (sel->join.has_join) {
+    if (sel->num_joins > 0) {
         return exec_select_join(db, sel, out);
     }
 

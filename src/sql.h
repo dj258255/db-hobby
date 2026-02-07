@@ -90,17 +90,19 @@ typedef struct {
     int num_values;
 } InsertStmt;
 
-/* INNER JOIN ... ON <l> = <r>. has_join==0 이면 단일 테이블. */
+/* INNER JOIN <table> ON <l> = <r>. 체인의 한 마디. */
 typedef struct {
-    int has_join;
-    char table[SQL_NAME_LEN];                       /* JOIN 대상(오른쪽) 테이블 */
+    char table[SQL_NAME_LEN];                       /* JOIN 대상 테이블 */
     char l_tbl[SQL_NAME_LEN], l_col[SQL_NAME_LEN];  /* ON 왼쪽 컬럼 참조 */
     char r_tbl[SQL_NAME_LEN], r_col[SQL_NAME_LEN];  /* ON 오른쪽 컬럼 참조 */
-} JoinSpec;
+} JoinClause;
+
+#define SQL_MAX_JOINS 4 /* FROM 외에 최대 4개까지 JOIN으로 잇는다 */
 
 typedef struct {
-    char table[SQL_NAME_LEN];
-    JoinSpec join;
+    char table[SQL_NAME_LEN]; /* FROM 테이블 */
+    int num_joins;            /* 0이면 단일 테이블 */
+    JoinClause joins[SQL_MAX_JOINS];
     Where where;
     char order_tbl[SQL_NAME_LEN]; /* ORDER BY 컬럼의 테이블 한정자 ("" 이면 없음) */
     char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음 */

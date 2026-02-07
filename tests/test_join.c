@@ -29,7 +29,7 @@ static char *run(Database *db, const char *sql) {
 /* 테스트가 만드는 파일들을 모두 지운다(카탈로그 + 테이블별 .tbl/.idx). */
 static void cleanup(const char *base) {
     char p[700];
-    const char *tbls[] = {"users", "orders"};
+    const char *tbls[] = {"users", "orders", "products"};
     unlink(base);
     for (size_t i = 0; i < sizeof(tbls) / sizeof(tbls[0]); i++) {
         snprintf(p, sizeof(p), "%s.%s.tbl", base, tbls[i]);
@@ -130,6 +130,31 @@ int main(void) {
     {
         char *lee = strstr(o, "lee"), *kim = strstr(o, "kim");
         CHECK(lee && kim && lee < kim, "ORDER BY users.name DESC -> lee 먼저");
+    }
+    free(o);
+
+    /* 3-테이블 체인 조인: users - orders - products */
+    o = run(&db, "CREATE TABLE products (pid INT, pname TEXT)"); free(o);
+    o = run(&db, "INSERT INTO products VALUES (10, 'A')"); free(o);
+    o = run(&db, "INSERT INTO products VALUES (11, 'B')"); free(o); /* oid 12에 매칭되는 product 없음 */
+
+    o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid "
+                 "JOIN products ON orders.oid = products.pid");
+    CHECK(strstr(o, "users.id") && strstr(o, "orders.oid") && strstr(o, "products.pname"),
+          "3-way 헤더에 세 테이블 컬럼");
+    CHECK(strstr(o, "(2행") != NULL, "users x orders x products -> 2행 (book-A, pen-B)");
+    CHECK(strstr(o, "book") && strstr(o, "A") && strstr(o, "pen") && strstr(o, "B") &&
+              !strstr(o, "desk"),
+          "kim-book-A, kim-pen-B (desk는 매칭 product 없음)");
+    CHECK(db.used_index == 1, "products PK가 ON 컬럼 -> 그 레벨은 인덱스 조인");
+    free(o);
+
+    /* 3-way + WHERE + ORDER BY */
+    o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid "
+                 "JOIN products ON orders.oid = products.pid ORDER BY products.pname DESC");
+    {
+        char *a = strstr(o, " A"), *b = strstr(o, " B");
+        CHECK(a && b && b < a && strstr(o, "(2행"), "ORDER BY products.pname DESC -> B 먼저");
     }
     free(o);
 
