@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (152 checks across 12 suites).
+covered by tests (163 checks across 12 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -78,9 +78,9 @@ mydb.orders.idx   orders PK index
 ```
 CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
-SELECT * FROM <t> [JOIN <t2> ON <colref> = <colref>]
+SELECT * FROM <t> [JOIN <t2> ON <colref> = <colref>]...
                   [WHERE <cond> [AND <cond>] [OR ...]]
-                  [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
+                  [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
 UPDATE <t> SET <col> = <value> [WHERE ...]
 DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
@@ -93,9 +93,11 @@ An `=`, `<`, `>`, `<=`, or `>=` on the first column (an `INT` primary key) uses
 the B+Tree index -- `=` is an O(log n) point lookup, the others walk the linked
 leaf chain as a range scan. `!=`, conditions on other columns, and compound
 `AND` conditions fall back to a full scan -- the kind of choice a query planner
-makes. `ORDER BY`/`LIMIT` take a materialize path (collect, sort, truncate),
-and `JOIN` is a nested-loop join. Transactions use a no-steal + force-at-commit
-policy across every table and roll back both the heap and the index.
+makes. `ORDER BY`/`LIMIT` take a materialize path (collect, sort, truncate).
+`JOIN` is a recursive N-way nested-loop join; a level whose `ON` ties its table's
+primary key to an already-joined table uses the index (`btree_search`) instead of
+scanning -- an index nested-loop join. Transactions use a no-steal +
+force-at-commit policy across every table and roll back both the heap and the index.
 
 See `DESIGN.md` for the full layer map and build order.
 
@@ -103,11 +105,11 @@ See `DESIGN.md` for the full layer map and build order.
 
 Kept simple on purpose: the first column of each table is treated as a unique
 integer primary key; `WHERE` is in disjunctive normal form (AND-groups joined by
-OR, no parentheses); `JOIN` is a single INNER JOIN with one `=` in `ON` and can't
-yet combine with `ORDER BY`; and there is no isolation/concurrency (one
-transaction at a time). B+Tree deletion isn't implemented (deleted rows are
-tombstoned in the heap, so a stale index entry is harmless). These are noted in
-the code where they matter.
+OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
+to 4 tables with no aliases (so a table can't join itself); and there is no
+isolation/concurrency (one transaction at a time). B+Tree deletion isn't
+implemented (deleted rows are tombstoned in the heap, so a stale index entry is
+harmless). These are noted in the code where they matter.
 
 ## License
 
