@@ -437,9 +437,11 @@ static int exec_select_sorted(Table *t, const SelectStmt *sel, FILE *out) {
 
     if (sel->order_col[0] != '\0') {
         int ci = -1;
-        for (int i = 0; i < ncols; i++) {
-            if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) {
-                ci = i;
+        if (sel->order_tbl[0] == '\0' || strcmp(sel->order_tbl, t->schema.table) == 0) {
+            for (int i = 0; i < ncols; i++) {
+                if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) {
+                    ci = i;
+                }
             }
         }
         if (ci < 0) {
@@ -486,12 +488,18 @@ typedef struct {
      * 안쪽 전체 스캔 대신 바깥 행의 키로 점 조회한다. */
     int use_index;     /* 1이면 인덱스 NLJ */
     int outer_key_idx; /* 바깥(L) 행에서 조인 키를 꺼낼 컬럼 위치 */
+    /* ORDER BY가 있으면 출력 대신 결합 행을 모은다(정렬은 다 모은 뒤에 한다). */
+    int materialize;
+    Value *matbuf; /* matcap * comb_ncols 평면 배열 */
+    int comb_ncols;
+    int matcap;
+    int matcount;
     FILE *out;
     int count;
     const Value *lrow; /* 바깥 루프의 현재 행 */
 } JoinCtx;
 
-/* 결합된 (lrow, rrow) 한 쌍을 ON·WHERE로 거른 뒤 출력한다.
+/* 결합된 (lrow, rrow) 한 쌍을 ON·WHERE로 거른 뒤 출력(또는 버퍼에 수집)한다.
  * LIMIT에 도달했으면 1을 돌려 바깥/안쪽 루프를 멈추게 한다. */
 static int join_emit(JoinCtx *j, const Value *lrow, const Value *rrow) {
     const Value *a = (j->al_side == 0) ? &lrow[j->al_idx] : &rrow[j->al_idx];
@@ -502,14 +510,26 @@ static int join_emit(JoinCtx *j, const Value *lrow, const Value *rrow) {
     if (!where_matches_join(&j->L->schema, lrow, &j->R->schema, rrow, &j->sel->where)) {
         return 0;
     }
+    int lc = j->L->schema.num_columns;
+    int rc = j->R->schema.num_columns;
+    if (j->materialize) {
+        /* ORDER BY 경로: 결합 행(L 컬럼들 + R 컬럼들)을 버퍼에 모은다. LIMIT은 정렬 후 적용. */
+        if (j->matcount < j->matcap) {
+            Value *dst = j->matbuf + (size_t)j->matcount * j->comb_ncols;
+            memcpy(dst, lrow, (size_t)lc * sizeof(Value));
+            memcpy(dst + lc, rrow, (size_t)rc * sizeof(Value));
+            j->matcount++;
+        }
+        return 0;
+    }
     /* 결합 행 출력: 왼쪽 컬럼들 다음 오른쪽 컬럼들 */
-    for (int i = 0; i < j->L->schema.num_columns; i++) {
+    for (int i = 0; i < lc; i++) {
         if (i) {
             fprintf(j->out, " | ");
         }
         print_value(j->out, &lrow[i]);
     }
-    for (int i = 0; i < j->R->schema.num_columns; i++) {
+    for (int i = 0; i < rc; i++) {
         fprintf(j->out, " | ");
         print_value(j->out, &rrow[i]);
     }
@@ -606,12 +626,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", !L ? sel->table : sel->join.table);
         return -1;
     }
-    if (sel->order_col[0] != '\0') {
-        fprintf(out, "ERROR: JOIN과 ORDER BY는 아직 함께 못 씁니다\n");
-        return -1;
-    }
-
-    JoinCtx j = {L, R, sel, 0, 0, 0, 0, 0, 0, out, 0, NULL};
+    JoinCtx j = {.L = L, .R = R, .sel = sel, .out = out};
     if (resolve_ref(L, R, sel->join.l_tbl, sel->join.l_col, &j.al_side, &j.al_idx) != 0 ||
         resolve_ref(L, R, sel->join.r_tbl, sel->join.r_col, &j.ar_side, &j.ar_idx) != 0) {
         fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
@@ -630,21 +645,78 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         }
     }
 
+    int lc = L->schema.num_columns, rc = R->schema.num_columns;
+    int comb = lc + rc;
+
     /* 헤더: 양 테이블 컬럼을 table.col 로 한정해 출력 */
-    for (int i = 0; i < L->schema.num_columns; i++) {
+    for (int i = 0; i < lc; i++) {
         if (i) {
             fprintf(out, " | ");
         }
         fprintf(out, "%s.%s", L->schema.table, L->schema.columns[i].name);
     }
-    for (int i = 0; i < R->schema.num_columns; i++) {
+    for (int i = 0; i < rc; i++) {
         fprintf(out, " | %s.%s", R->schema.table, R->schema.columns[i].name);
     }
     fprintf(out, "\n");
 
     db->used_index = j.use_index;
+    const char *idxnote = j.use_index ? ", 인덱스 조인" : "";
+
+    if (sel->order_col[0] == '\0') {
+        /* ORDER BY 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
+        heap_scan(&L->heap, join_outer_visit, &j);
+        fprintf(out, "(%d행%s)\n", j.count, idxnote);
+        return 0;
+    }
+
+    /* ORDER BY: 결합 행을 모아 정렬한 뒤 LIMIT만큼 출력한다(조인 위의 Sort 노드). */
+    int oside, oidx;
+    if (resolve_ref(L, R, sel->order_tbl, sel->order_col, &oside, &oidx) != 0) {
+        fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
+        return -1;
+    }
+    int ocomb = (oside == 0) ? oidx : lc + oidx; /* 결합 행에서의 위치 */
+
+    j.materialize = 1;
+    j.comb_ncols = comb;
+    j.matcap = SELECT_MAX_ROWS;
+    j.matbuf = malloc((size_t)SELECT_MAX_ROWS * comb * sizeof(Value));
+    if (!j.matbuf) {
+        fprintf(out, "ERROR: 메모리 부족\n");
+        return -1;
+    }
     heap_scan(&L->heap, join_outer_visit, &j);
-    fprintf(out, "(%d행%s)\n", j.count, j.use_index ? ", 인덱스 조인" : "");
+
+    g_sort_ci = ocomb;
+    qsort(j.matbuf, j.matcount, (size_t)comb * sizeof(Value), row_cmp);
+    if (sel->order_desc) {
+        Value tmp[2 * SQL_MAX_COLS];
+        for (int i = 0, k = j.matcount - 1; i < k; i++, k--) {
+            memcpy(tmp, j.matbuf + (size_t)i * comb, (size_t)comb * sizeof(Value));
+            memcpy(j.matbuf + (size_t)i * comb, j.matbuf + (size_t)k * comb,
+                   (size_t)comb * sizeof(Value));
+            memcpy(j.matbuf + (size_t)k * comb, tmp, (size_t)comb * sizeof(Value));
+        }
+    }
+
+    int printed = 0;
+    for (int i = 0; i < j.matcount; i++) {
+        if (sel->limit >= 0 && printed >= sel->limit) {
+            break;
+        }
+        Value *row = j.matbuf + (size_t)i * comb;
+        for (int c = 0; c < comb; c++) {
+            if (c) {
+                fprintf(out, " | ");
+            }
+            print_value(out, &row[c]);
+        }
+        fprintf(out, "\n");
+        printed++;
+    }
+    free(j.matbuf);
+    fprintf(out, "(%d행%s)\n", printed, idxnote);
     return 0;
 }
 

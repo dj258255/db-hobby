@@ -102,6 +102,7 @@ typedef struct {
     char table[SQL_NAME_LEN];
     JoinSpec join;
     Where where;
+    char order_tbl[SQL_NAME_LEN]; /* ORDER BY 컬럼의 테이블 한정자 ("" 이면 없음) */
     char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음 */
     int order_desc;               /* 1이면 DESC, 0이면 ASC */
     long limit;                   /* -1이면 LIMIT 없음 */

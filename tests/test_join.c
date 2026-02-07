@@ -112,6 +112,27 @@ int main(void) {
     CHECK(db.used_index == 0, "안쪽 비PK 조인 -> 전체 스캔");
     free(o);
 
+    /* JOIN + ORDER BY: 결합 행을 정렬 (orders.uid 오름차순 -> 1,1,2) */
+    o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid ORDER BY orders.oid");
+    {
+        char *book = strstr(o, "book"), *pen = strstr(o, "pen"), *desk = strstr(o, "desk");
+        CHECK(book && pen && desk && book < pen && pen < desk,
+              "ORDER BY orders.oid -> book(10), pen(11), desk(12)");
+    }
+    free(o);
+    /* JOIN + ORDER BY DESC + LIMIT */
+    o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid ORDER BY orders.oid DESC LIMIT 1");
+    CHECK(strstr(o, "desk") && !strstr(o, "book") && strstr(o, "(1행"),
+          "ORDER BY orders.oid DESC LIMIT 1 -> desk만");
+    free(o);
+    /* ORDER BY로 왼쪽 테이블 컬럼 정렬 (users.name DESC -> lee, kim, kim) */
+    o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid ORDER BY users.name DESC");
+    {
+        char *lee = strstr(o, "lee"), *kim = strstr(o, "kim");
+        CHECK(lee && kim && lee < kim, "ORDER BY users.name DESC -> lee 먼저");
+    }
+    free(o);
+
     /* 재오픈해도 두 테이블 다 살아 있다(카탈로그 + 파일별 영속) */
     db_close(&db);
     db_open(&db, path);

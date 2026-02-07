@@ -362,7 +362,7 @@ static void parse_select(Parser *p, Statement *st) {
     }
     if (p_accept(p, TOK_ORDER)) {
         p_expect(p, TOK_BY, "ORDER 다음에 BY가 필요합니다");
-        parse_name(p, s->order_col);
+        parse_colref(p, s->order_tbl, s->order_col);
         if (p_accept(p, TOK_DESC)) {
             s->order_desc = 1;
         } else {
