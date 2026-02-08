@@ -15,9 +15,10 @@
  * 지원 문법(학습용 최소 부분집합):
  *   CREATE TABLE <name> (<col> INT|TEXT, ...)
  *   INSERT INTO <name> VALUES (<int|'text'>, ...)
- *   SELECT * FROM <name> [JOIN <name> ON <colref> = <colref>]
+ *   SELECT <* | item, ...> FROM <name> [JOIN <name> ON <colref> = <colref>]...
  *                        [WHERE <cond> [AND <cond>] [OR ...]]
- *                        [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
+ *                        [GROUP BY <col>] [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
+ *   <item>   = <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
  *   <cond>   = <colref> <op> <val>,  <op> = =, !=, <, >, <=, >=
  *   <colref> = [<table>.]<col>
  */
@@ -100,11 +101,27 @@ typedef struct {
 
 #define SQL_MAX_JOINS 4 /* FROM 외에 최대 4개까지 JOIN으로 잇는다 */
 
+/* 집계 함수 종류. AGG_NONE이면 일반 컬럼(투영). */
+typedef enum { AGG_NONE, AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG } AggFunc;
+
+/* SELECT 목록의 한 항목: 일반 컬럼이거나 집계 FUNC(arg). */
+typedef struct {
+    AggFunc agg;            /* AGG_NONE이면 일반 컬럼 */
+    int star;               /* COUNT(*) 처럼 인자가 * 이면 1 */
+    char col[SQL_NAME_LEN]; /* 컬럼 이름 (star면 무시) */
+} SelectItem;
+
 typedef struct {
     char table[SQL_NAME_LEN]; /* FROM 테이블 */
     char alias[SQL_NAME_LEN]; /* FROM 테이블 별칭 ("" 이면 테이블명을 그대로 씀) */
     int num_joins;            /* 0이면 단일 테이블 */
     JoinClause joins[SQL_MAX_JOINS];
+    /* 투영/집계: select_star면 SELECT * (items 무시). 아니면 items가 출력 목록. */
+    int select_star;
+    int num_items;
+    SelectItem items[SQL_MAX_COLS];
+    int has_aggregate;            /* items에 집계가 하나라도 있으면 1 */
+    char group_col[SQL_NAME_LEN]; /* GROUP BY 컬럼 ("" 이면 없음) */
     Where where;
     char order_tbl[SQL_NAME_LEN]; /* ORDER BY 컬럼의 테이블 한정자 ("" 이면 없음) */
     char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음 */

@@ -17,7 +17,7 @@ typedef enum {
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
-    TOK_JOIN, TOK_ON,
+    TOK_JOIN, TOK_ON, TOK_GROUP,
     TOK_ERROR
 } TokType;
 
@@ -58,6 +58,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "LIMIT")) return TOK_LIMIT;
     if (!strcasecmp(s, "JOIN")) return TOK_JOIN;
     if (!strcasecmp(s, "ON")) return TOK_ON;
+    if (!strcasecmp(s, "GROUP")) return TOK_GROUP;
     return TOK_IDENT;
 }
 
@@ -342,11 +343,76 @@ static void parse_insert(Parser *p, Statement *st) {
     p_expect(p, TOK_RPAREN, ") 가 필요합니다");
 }
 
+static AggFunc agg_of(const char *s) {
+    if (!strcasecmp(s, "COUNT")) return AGG_COUNT;
+    if (!strcasecmp(s, "SUM")) return AGG_SUM;
+    if (!strcasecmp(s, "MIN")) return AGG_MIN;
+    if (!strcasecmp(s, "MAX")) return AGG_MAX;
+    if (!strcasecmp(s, "AVG")) return AGG_AVG;
+    return AGG_NONE;
+}
+
+/* SELECT 목록: * 또는 콤마로 구분된 항목들. 항목 = 일반 컬럼 또는 FUNC(arg). */
+static void parse_select_list(Parser *p, SelectStmt *s) {
+    if (p_accept(p, TOK_STAR)) {
+        s->select_star = 1;
+        return;
+    }
+    do {
+        if (s->num_items >= SQL_MAX_COLS) {
+            p_fail(p, "SELECT 항목이 너무 많습니다");
+            return;
+        }
+        SelectItem *it = &s->items[s->num_items];
+        it->agg = AGG_NONE;
+        it->star = 0;
+        it->col[0] = '\0';
+        if (p->cur.type != TOK_IDENT) {
+            p_fail(p, "컬럼 또는 집계 함수가 필요합니다");
+            return;
+        }
+        char name[SQL_NAME_LEN];
+        snprintf(name, sizeof(name), "%s", p->cur.text);
+        p_advance(p);
+        if (p->cur.type == TOK_LPAREN) { /* 집계: FUNC(...) */
+            AggFunc af = agg_of(name);
+            if (af == AGG_NONE) {
+                p_fail(p, "알 수 없는 집계 함수입니다");
+                return;
+            }
+            it->agg = af;
+            p_advance(p); /* ( */
+            if (p_accept(p, TOK_STAR)) {
+                it->star = 1;
+                if (af != AGG_COUNT) {
+                    p_fail(p, "*는 COUNT에만 쓸 수 있습니다");
+                    return;
+                }
+            } else {
+                char qt[SQL_NAME_LEN];
+                parse_colref(p, qt, it->col); /* 단일 테이블 집계라 한정자는 무시 */
+            }
+            p_expect(p, TOK_RPAREN, ") 가 필요합니다");
+            s->has_aggregate = 1;
+        } else if (p_accept(p, TOK_DOT)) { /* 한정 일반 컬럼 t.col */
+            if (p->cur.type != TOK_IDENT) {
+                p_fail(p, ". 다음에 컬럼 이름이 필요합니다");
+                return;
+            }
+            snprintf(it->col, SQL_NAME_LEN, "%s", p->cur.text);
+            p_advance(p);
+        } else { /* 한정 없는 일반 컬럼 */
+            snprintf(it->col, SQL_NAME_LEN, "%s", name);
+        }
+        s->num_items++;
+    } while (p_accept(p, TOK_COMMA));
+}
+
 static void parse_select(Parser *p, Statement *st) {
     st->type = STMT_SELECT;
     SelectStmt *s = &st->select;
     s->limit = -1; /* memset이 0으로 둔 걸 "LIMIT 없음"으로 바로잡는다 */
-    p_expect(p, TOK_STAR, "지금은 SELECT * 만 지원합니다");
+    parse_select_list(p, s);
     p_expect(p, TOK_FROM, "FROM이 필요합니다");
     parse_name(p, s->table);
     if (p->cur.type == TOK_IDENT) { /* 테이블 뒤 식별자는 별칭 (키워드는 별도 토큰이라 안 걸림) */
@@ -370,6 +436,11 @@ static void parse_select(Parser *p, Statement *st) {
     }
     if (p_accept(p, TOK_WHERE)) {
         parse_where(p, &s->where);
+    }
+    if (p_accept(p, TOK_GROUP)) {
+        p_expect(p, TOK_BY, "GROUP 다음에 BY가 필요합니다");
+        char qt[SQL_NAME_LEN];
+        parse_colref(p, qt, s->group_col); /* 단일 테이블 집계라 한정자는 무시 */
     }
     if (p_accept(p, TOK_ORDER)) {
         p_expect(p, TOK_BY, "ORDER 다음에 BY가 필요합니다");
