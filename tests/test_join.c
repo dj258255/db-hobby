@@ -107,9 +107,10 @@ int main(void) {
     CHECK(strstr(o, "(3행") != NULL, "orders x users (uid=id) -> 3행 (uid 9는 매칭 없음)");
     CHECK(db.used_index == 1, "안쪽 PK가 ON 컬럼 -> 인덱스 조인");
     free(o);
-    /* 안쪽 컬럼이 PK가 아니면(users x orders, uid는 PK 아님) 전체 스캔 */
+    /* 안쪽 컬럼이 PK가 아니면(users x orders, uid는 PK 아님) 해시 조인 */
     o = run(&db, "SELECT * FROM users JOIN orders ON users.id = orders.uid");
-    CHECK(db.used_index == 0, "안쪽 비PK 조인 -> 전체 스캔");
+    CHECK(db.used_index == 0 && strstr(o, "해시 조인") && strstr(o, "(3행"),
+          "안쪽 비PK 조인 -> 해시 조인 (결과는 3행 그대로)");
     free(o);
 
     /* JOIN + ORDER BY: 결합 행을 정렬 (orders.uid 오름차순 -> 1,1,2) */

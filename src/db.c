@@ -703,14 +703,105 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
     return 0;
 }
 
+/* ------------- 해시 조인용 해시 테이블 -------------
+ * 한 테이블을 조인 컬럼 값으로 색인한다(키 -> 그 키를 가진 행들의 사슬).
+ * 빌드 한 번 뒤 O(1) 탐사 — 인덱스가 없을 때 중첩 루프 대신 쓴다.
+ */
+#define HJOIN_BUCKETS 1024
+
+typedef struct HNode {
+    struct HNode *next;
+    Value key;
+    Value row[]; /* 그 테이블 한 행 (ncols개) — 가변 길이 멤버 */
+} HNode;
+
+typedef struct {
+    HNode *buckets[HJOIN_BUCKETS];
+    int ncols;
+} HashTab;
+
+static unsigned val_hash(const Value *v) {
+    if (v->type == VAL_INT) {
+        return (unsigned)((uint64_t)v->int_val * 2654435761u);
+    }
+    unsigned h = 2166136261u; /* FNV-1a */
+    for (const char *p = v->text_val; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void hash_insert(HashTab *ht, const Value *key, const Value *row) {
+    HNode *n = malloc(sizeof(HNode) + (size_t)ht->ncols * sizeof(Value));
+    if (!n) {
+        return;
+    }
+    n->key = *key;
+    memcpy(n->row, row, (size_t)ht->ncols * sizeof(Value));
+    unsigned b = val_hash(key) % HJOIN_BUCKETS;
+    n->next = ht->buckets[b];
+    ht->buckets[b] = n;
+}
+
+static HNode *hash_bucket(HashTab *ht, const Value *key) {
+    return ht->buckets[val_hash(key) % HJOIN_BUCKETS];
+}
+
+static void hash_free(HashTab *ht) {
+    if (!ht) {
+        return;
+    }
+    for (int b = 0; b < HJOIN_BUCKETS; b++) {
+        HNode *n = ht->buckets[b];
+        while (n) {
+            HNode *nx = n->next;
+            free(n);
+            n = nx;
+        }
+    }
+    free(ht);
+}
+
+/* 한 테이블을 col_idx 컬럼으로 해시 빌드한다 */
+typedef struct {
+    HashTab *ht;
+    const CreateStmt *schema;
+    int col_idx;
+} HBuildCtx;
+
+static int hbuild_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid;
+    (void)len;
+    HBuildCtx *c = ctx_;
+    Value row[SQL_MAX_COLS];
+    decode_row(c->schema, rec, row);
+    hash_insert(c->ht, &row[c->col_idx], row);
+    return 0;
+}
+
+static HashTab *hash_build(Table *t, int col_idx) {
+    HashTab *ht = calloc(1, sizeof(HashTab));
+    if (!ht) {
+        return NULL;
+    }
+    ht->ncols = t->schema.num_columns;
+    HBuildCtx c = {ht, &t->schema, col_idx};
+    heap_scan(&t->heap, hbuild_visit, &c);
+    return ht;
+}
+
 /* ------------- 실행기: JOIN (N-way 재귀 중첩 루프 조인) -------------
  * 테이블 체인 [T0(FROM), T1, T2, ...] 을 레벨별로 재귀한다. 레벨 k에서 Tk를
  * 스캔하며 행을 rows[k]에 담고, k번째 ON 조건(앞서 묶인 테이블을 참조)이 맞으면
  * 레벨 k+1로 내려간다. 모든 테이블이 묶이면 WHERE를 걸고 출력(또는 정렬용 수집).
- * 레벨마다, ON이 그 테이블의 PK를 앞 테이블 컬럼과 맞추고 인덱스가 있으면 전체
- * 스캔 대신 점 조회(인덱스 NLJ)로 바꾼다.
+ * 레벨마다 조인 방법을 따로 고른다(옵티마이저가 하는 일):
+ *   INDEX  ON이 Tk의 PK를 앞 테이블과 맞추고 인덱스가 있으면 점 조회(인덱스 NLJ)
+ *   HASH   그 외 ON이 Tk를 앞 테이블과 맞추면 Tk를 해시 빌드해 O(1) 탐사(해시 조인)
+ *   SCAN   둘 다 아니면 전체 스캔(중첩 루프)
  */
 #define MJOIN_MAX_TABS (1 + SQL_MAX_JOINS)
+enum { JM_SCAN, JM_INDEX, JM_HASH };
 
 typedef struct {
     Database *db;
@@ -721,9 +812,11 @@ typedef struct {
     /* 각 조인 레벨 k(1..ntabs-1)의 ON 양변을 (체인 테이블 idx, 컬럼 idx)로 해소 */
     int on_at[MJOIN_MAX_TABS], on_ai[MJOIN_MAX_TABS];
     int on_bt[MJOIN_MAX_TABS], on_bi[MJOIN_MAX_TABS];
-    /* 인덱스 NLJ 계획(레벨 k): use_idx[k]면 Tk를 점 조회. key는 앞 테이블의 (kt,ki) */
-    int use_idx[MJOIN_MAX_TABS];
-    int key_t[MJOIN_MAX_TABS], key_i[MJOIN_MAX_TABS];
+    /* 레벨별 조인 방법과 부속 정보 */
+    int method[MJOIN_MAX_TABS];                 /* JM_SCAN / JM_INDEX / JM_HASH */
+    int key_t[MJOIN_MAX_TABS], key_i[MJOIN_MAX_TABS]; /* probe 키 출처(앞 테이블) */
+    int hcol[MJOIN_MAX_TABS];                   /* HASH: Tk의 조인 컬럼 위치 */
+    HashTab *hash[MJOIN_MAX_TABS];              /* HASH: Tk를 색인한 해시 테이블 */
     int off[MJOIN_MAX_TABS]; /* 결합 행에서 각 테이블 컬럼의 시작 위치 */
     int comb_ncols;
     Value rows[MJOIN_MAX_TABS][SQL_MAX_COLS]; /* 레벨별 현재 행 */
@@ -816,7 +909,7 @@ static int mjoin_descend(MJoinCtx *m, int level) {
     if (level == m->ntabs) {
         return mjoin_emit(m);
     }
-    if (level >= 1 && m->use_idx[level]) {
+    if (level >= 1 && m->method[level] == JM_INDEX) {
         /* 인덱스 NLJ: 앞 테이블의 키로 Tk의 PK 인덱스를 점 조회 */
         const Value *k = &m->rows[m->key_t[level]][m->key_i[level]];
         if (k->type != VAL_INT) {
@@ -833,6 +926,22 @@ static int mjoin_descend(MJoinCtx *m, int level) {
         }
         decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
         return mjoin_descend(m, level + 1);
+    }
+    if (level >= 1 && m->method[level] == JM_HASH) {
+        /* 해시 조인: 앞 테이블의 키로 Tk 해시를 탐사. 같은 키의 행마다 내려간다. */
+        const Value *k = &m->rows[m->key_t[level]][m->key_i[level]];
+        for (HNode *n = hash_bucket(m->hash[level], k); n; n = n->next) {
+            if (!values_equal(&n->key, k)) {
+                continue; /* 버킷 충돌: 키가 진짜 같은 것만 */
+            }
+            memcpy(m->rows[level], n->row, (size_t)m->tabs[level]->schema.num_columns *
+                                               sizeof(Value));
+            int r = mjoin_descend(m, level + 1);
+            if (r) {
+                return r;
+            }
+        }
+        return 0;
     }
     MJoinLevel lv = {m, level};
     return heap_scan(&m->tabs[level]->heap, mjoin_visit, &lv);
@@ -871,20 +980,31 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
             fprintf(out, "ERROR: ON 절의 컬럼을 찾을 수 없습니다\n");
             return -1;
         }
-        m.use_idx[k] = 0;
-        if (m.tabs[k]->has_index) {
-            /* 한 변이 Tk의 PK(첫 컬럼)이고 다른 변이 앞 테이블(<k)이면 점 조회 가능 */
-            if (m.on_at[k] == k && m.on_ai[k] == 0 && m.on_bt[k] < k) {
-                m.use_idx[k] = 1;
-                m.key_t[k] = m.on_bt[k];
-                m.key_i[k] = m.on_bi[k];
-            } else if (m.on_bt[k] == k && m.on_bi[k] == 0 && m.on_at[k] < k) {
-                m.use_idx[k] = 1;
-                m.key_t[k] = m.on_at[k];
-                m.key_i[k] = m.on_ai[k];
+        /* Tk 쪽 ON 변과 앞 테이블 쪽 ON 변을 가른다. */
+        int kcol = -1;       /* Tk의 조인 컬럼 위치 */
+        int pt = -1, pi = -1; /* 앞 테이블의 (idx, 컬럼) = probe 키 출처 */
+        if (m.on_at[k] == k && m.on_bt[k] < k) {
+            kcol = m.on_ai[k];
+            pt = m.on_bt[k];
+            pi = m.on_bi[k];
+        } else if (m.on_bt[k] == k && m.on_at[k] < k) {
+            kcol = m.on_bi[k];
+            pt = m.on_at[k];
+            pi = m.on_ai[k];
+        }
+
+        m.method[k] = JM_SCAN;
+        if (kcol >= 0) {
+            m.key_t[k] = pt;
+            m.key_i[k] = pi;
+            if (kcol == 0 && m.tabs[k]->has_index) {
+                m.method[k] = JM_INDEX; /* Tk의 PK가 조인 키 -> 점 조회 */
+            } else {
+                m.method[k] = JM_HASH; /* 그 외 -> Tk를 조인 컬럼으로 해시 빌드 */
+                m.hcol[k] = kcol;
             }
         }
-        if (m.use_idx[k]) {
+        if (m.method[k] == JM_INDEX) {
             used_index = 1;
         }
     }
@@ -912,13 +1032,31 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "\n");
     }
 
+    /* 해시 조인 레벨은 Tk를 조인 컬럼으로 미리 해시 빌드한다(한 번). */
+    int used_hash = 0;
+    for (int k = 1; k < m.ntabs; k++) {
+        if (m.method[k] == JM_HASH) {
+            m.hash[k] = hash_build(m.tabs[k], m.hcol[k]);
+            if (!m.hash[k]) {
+                fprintf(out, "ERROR: 해시 빌드 실패(메모리 부족)\n");
+                for (int j = 1; j < k; j++) hash_free(m.hash[j]);
+                return -1;
+            }
+            used_hash = 1;
+        }
+    }
+
     db->used_index = used_index;
-    const char *idxnote = used_index ? ", 인덱스 조인" : "";
+    const char *note = "";
+    if (used_index && used_hash) note = ", 인덱스+해시 조인";
+    else if (used_index) note = ", 인덱스 조인";
+    else if (used_hash) note = ", 해시 조인";
 
     if (sel->order_col[0] == '\0') {
         /* ORDER BY 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
         mjoin_descend(&m, 0);
-        fprintf(out, "(%d행%s)\n", m.count, idxnote);
+        for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
+        fprintf(out, "(%d행%s)\n", m.count, note);
         return 0;
     }
 
@@ -927,6 +1065,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     if (resolve_chain_ref(m.tabs, m.tname, m.ntabs, sel->order_tbl, sel->order_col, &oti, &oci) !=
         0) {
         fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
+        for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
         return -1;
     }
     int ocomb = m.off[oti] + oci; /* 결합 행에서의 위치 */
@@ -936,9 +1075,11 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     m.matbuf = malloc((size_t)SELECT_MAX_ROWS * comb * sizeof(Value));
     if (!m.matbuf) {
         fprintf(out, "ERROR: 메모리 부족\n");
+        for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
         return -1;
     }
     mjoin_descend(&m, 0);
+    for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
 
     g_sort_ci = ocomb;
     qsort(m.matbuf, m.matcount, (size_t)comb * sizeof(Value), row_cmp);
@@ -968,7 +1109,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         printed++;
     }
     free(m.matbuf);
-    fprintf(out, "(%d행%s)\n", printed, idxnote);
+    fprintf(out, "(%d행%s)\n", printed, note);
     return 0;
 }
 
