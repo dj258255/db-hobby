@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (163 checks across 12 suites).
+covered by tests (182 checks across 13 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -56,7 +56,7 @@ Built bottom-up; each layer sits on the one below it.
 | `bufpool.c` | page cache with pin counts, dirty flags, LRU eviction | InnoDB buffer pool |
 | `heap.c` | table = a collection of pages; rows addressed by `RID = (page, slot)` | PG heap |
 | `sql.c` | hand-written lexer + recursive-descent parser (SQL -> AST) | every DB frontend |
-| `db.c` | executor + tuple codec + multi-table catalog + nested-loop join | pg_catalog, executor |
+| `db.c` | executor: tuple codec, multi-table catalog, joins (NLJ/index/hash), aggregates | pg_catalog, executor |
 | `btree.c` | on-disk B+Tree index for O(log n) lookups, with node splits | InnoDB clustered index |
 | `wal.c` | write-ahead log: durability and atomicity, with crash recovery | PG WAL / redo log |
 
@@ -78,13 +78,14 @@ mydb.orders.idx   orders PK index
 ```
 CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
-SELECT * FROM <t> [JOIN <t2> ON <colref> = <colref>]...
+SELECT <* | item, ...> FROM <t> [<alias>] [JOIN <t2> [<alias>] ON <colref> = <colref>]...
                   [WHERE <cond> [AND <cond>] [OR ...]]
-                  [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
+                  [GROUP BY <col>] [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
 UPDATE <t> SET <col> = <value> [WHERE ...]
 DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
 
+<item>   is  <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
 <cond>   is  <colref> <op> <value>,  <op> is one of  =  !=  <  >  <=  >=
 <colref> is  [<table>.]<col>
 ```
@@ -93,11 +94,13 @@ An `=`, `<`, `>`, `<=`, or `>=` on the first column (an `INT` primary key) uses
 the B+Tree index -- `=` is an O(log n) point lookup, the others walk the linked
 leaf chain as a range scan. `!=`, conditions on other columns, and compound
 `AND` conditions fall back to a full scan -- the kind of choice a query planner
-makes. `ORDER BY`/`LIMIT` take a materialize path (collect, sort, truncate).
-`JOIN` is a recursive N-way nested-loop join; a level whose `ON` ties its table's
-primary key to an already-joined table uses the index (`btree_search`) instead of
-scanning -- an index nested-loop join. Transactions use a no-steal +
-force-at-commit policy across every table and roll back both the heap and the index.
+makes. `ORDER BY`/`LIMIT` and `GROUP BY`/aggregates take a materialize path
+(collect, then sort / sort-group). `JOIN` is a recursive N-way join that picks a
+method per level like an optimizer: index nested-loop (`btree_search`) when the
+inner's primary key is the `ON` key, hash join (build a hash on the inner's join
+column, then O(1) probe) for any other equi-join, else a plain nested-loop scan.
+Transactions use a no-steal + force-at-commit policy across every table and roll
+back both the heap and the index.
 
 See `DESIGN.md` for the full layer map and build order.
 
@@ -106,7 +109,8 @@ See `DESIGN.md` for the full layer map and build order.
 Kept simple on purpose: the first column of each table is treated as a unique
 integer primary key; `WHERE` is in disjunctive normal form (AND-groups joined by
 OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
-to 4 tables with no aliases (so a table can't join itself); and there is no
+to 4 tables (aliases supported, so self-joins work); projection/aggregation and
+`GROUP BY` are single-table and don't combine with `ORDER BY`; and there is no
 isolation/concurrency (one transaction at a time). B+Tree deletion isn't
 implemented (deleted rows are tombstoned in the heap, so a stale index entry is
 harmless). These are noted in the code where they matter.
