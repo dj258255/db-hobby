@@ -17,7 +17,7 @@ typedef enum {
     TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
-    TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING,
+    TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
     TOK_ERROR
 } TokType;
 
@@ -60,6 +60,8 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "ON")) return TOK_ON;
     if (!strcasecmp(s, "GROUP")) return TOK_GROUP;
     if (!strcasecmp(s, "HAVING")) return TOK_HAVING;
+    if (!strcasecmp(s, "LEFT")) return TOK_LEFT;
+    if (!strcasecmp(s, "OUTER")) return TOK_OUTER;
     return TOK_IDENT;
 }
 
@@ -427,12 +429,21 @@ static void parse_select(Parser *p, Statement *st) {
     if (p->cur.type == TOK_IDENT) { /* 테이블 뒤 식별자는 별칭 (키워드는 별도 토큰이라 안 걸림) */
         parse_name(p, s->alias);
     }
-    while (p_accept(p, TOK_JOIN)) {
+    for (;;) {
+        int is_left = 0;
+        if (p_accept(p, TOK_LEFT)) {
+            p_accept(p, TOK_OUTER); /* OUTER는 선택 */
+            is_left = 1;
+            p_expect(p, TOK_JOIN, "LEFT 다음에 JOIN이 필요합니다");
+        } else if (!p_accept(p, TOK_JOIN)) {
+            break;
+        }
         if (s->num_joins >= SQL_MAX_JOINS) {
             p_fail(p, "JOIN이 너무 많습니다");
             break;
         }
         JoinClause *jc = &s->joins[s->num_joins];
+        jc->is_left = is_left;
         parse_name(p, jc->table);
         if (p->cur.type == TOK_IDENT) {
             parse_name(p, jc->alias);

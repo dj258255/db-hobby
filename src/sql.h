@@ -32,7 +32,8 @@ typedef enum { COL_INT, COL_TEXT } ColType;
 /* WHERE 비교 연산자 */
 typedef enum { CMP_EQ, CMP_NE, CMP_LT, CMP_GT, CMP_LE, CMP_GE } CmpOp;
 
-typedef enum { VAL_INT, VAL_TEXT } ValueType;
+/* VAL_NULL은 저장 행엔 안 생기고, LEFT JOIN의 미매칭 오른쪽 컬럼 등 결과에만 등장한다. */
+typedef enum { VAL_INT, VAL_TEXT, VAL_NULL } ValueType;
 typedef struct {
     ValueType type;
     long int_val;                /* VAL_INT */
@@ -91,8 +92,9 @@ typedef struct {
     int num_values;
 } InsertStmt;
 
-/* INNER JOIN <table> [<alias>] ON <l> = <r>. 체인의 한 마디. */
+/* [LEFT] JOIN <table> [<alias>] ON <l> = <r>. 체인의 한 마디. */
 typedef struct {
+    int is_left;                                    /* 1이면 LEFT (OUTER) JOIN, 0이면 INNER */
     char table[SQL_NAME_LEN];                       /* JOIN 대상 테이블 */
     char alias[SQL_NAME_LEN];                       /* 별칭 ("" 이면 테이블명을 그대로 씀) */
     char l_tbl[SQL_NAME_LEN], l_col[SQL_NAME_LEN];  /* ON 왼쪽 컬럼 참조 */

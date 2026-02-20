@@ -73,7 +73,9 @@ static RID rid_decode(int64_t v) {
 }
 
 static void print_value(FILE *out, const Value *v) {
-    if (v->type == VAL_INT) {
+    if (v->type == VAL_NULL) {
+        fprintf(out, "NULL");
+    } else if (v->type == VAL_INT) {
         fprintf(out, "%ld", v->int_val);
     } else {
         fprintf(out, "%s", v->text_val);
@@ -204,6 +206,9 @@ static int cond_eval(const Value *cell, const Condition *cond) {
 }
 
 static int values_equal(const Value *a, const Value *b) {
+    if (a->type == VAL_NULL || b->type == VAL_NULL) {
+        return 0; /* NULL은 무엇과도(NULL과도) 같지 않다 */
+    }
     if (a->type != b->type) {
         return 0;
     }
@@ -426,6 +431,9 @@ static int g_sort_ci;
 static int row_cmp(const void *a, const void *b) {
     const Value *x = (const Value *)a + g_sort_ci;
     const Value *y = (const Value *)b + g_sort_ci;
+    if (x->type == VAL_NULL || y->type == VAL_NULL) { /* NULL은 가장 작게(먼저) */
+        return (x->type == VAL_NULL) - (y->type == VAL_NULL);
+    }
     if (x->type == VAL_INT) {
         if (x->int_val < y->int_val) return -1;
         if (x->int_val > y->int_val) return 1;
@@ -499,6 +507,9 @@ static int exec_select_sorted(Table *t, const char *tname, const SelectStmt *sel
  */
 
 static int value_less(const Value *a, const Value *b) {
+    if (a->type == VAL_NULL || b->type == VAL_NULL) {
+        return a->type == VAL_NULL && b->type != VAL_NULL; /* NULL < 비NULL */
+    }
     if (a->type == VAL_INT) {
         return a->int_val < b->int_val;
     }
@@ -516,9 +527,10 @@ static const char *agg_name(AggFunc a) {
     }
 }
 
-/* 집계 출력 셀: 숫자(num) 또는 문자열(text). 집계 결과를 정렬·HAVING·출력에 쓴다.
+/* 집계 출력 셀: NULL이거나 숫자(num)이거나 문자열(text).
  * COUNT/SUM/AVG와 INT MIN/MAX는 num, TEXT MIN/MAX와 투영 TEXT는 text. */
 typedef struct {
+    int is_null;
     int is_text;
     double num;
     char text[SQL_TEXT_LEN];
@@ -528,10 +540,12 @@ typedef struct {
  * ci는 그 항목의 컬럼 위치(COUNT(*)는 무시). */
 static OutCell compute_cell(const SelectItem *it, int ci, const Value *rows, int ncols, int s,
                             int e) {
-    OutCell c = {0, 0.0, {0}};
+    OutCell c = {0, 0, 0.0, {0}};
     if (it->agg == AGG_NONE) { /* 투영/그룹 키: 구간 첫 행의 대표값 */
         const Value *v = &rows[(size_t)s * ncols + ci];
-        if (v->type == VAL_TEXT) {
+        if (v->type == VAL_NULL) {
+            c.is_null = 1;
+        } else if (v->type == VAL_TEXT) {
             c.is_text = 1;
             snprintf(c.text, sizeof(c.text), "%s", v->text_val);
         } else {
@@ -539,40 +553,61 @@ static OutCell compute_cell(const SelectItem *it, int ci, const Value *rows, int
         }
         return c;
     }
-    if (it->agg == AGG_COUNT) {
-        c.num = e - s;
+    if (it->agg == AGG_COUNT && it->star) {
+        c.num = e - s; /* COUNT(*): NULL 포함 전체 행 수 */
         return c;
     }
-    if (e == s) {
-        return c; /* 빈 구간 -> 0 */
+    /* COUNT(col)/SUM/AVG/MIN/MAX 는 NULL을 건너뛴다 */
+    if (it->agg == AGG_COUNT) {
+        int cnt = 0;
+        for (int r = s; r < e; r++) {
+            if (rows[(size_t)r * ncols + ci].type != VAL_NULL) cnt++;
+        }
+        c.num = cnt;
+        return c;
     }
     if (it->agg == AGG_SUM || it->agg == AGG_AVG) {
         long sum = 0;
-        for (int r = s; r < e; r++) sum += rows[(size_t)r * ncols + ci].int_val;
-        c.num = (it->agg == AGG_SUM) ? (double)sum : (double)sum / (e - s);
+        int cnt = 0;
+        for (int r = s; r < e; r++) {
+            const Value *cell = &rows[(size_t)r * ncols + ci];
+            if (cell->type == VAL_NULL) continue;
+            sum += cell->int_val;
+            cnt++;
+        }
+        if (cnt == 0) {
+            c.is_null = 1; /* 전부 NULL(또는 빈 구간) -> NULL */
+            return c;
+        }
+        c.num = (it->agg == AGG_SUM) ? (double)sum : (double)sum / cnt;
         return c;
     }
-    /* MIN / MAX (INT 또는 TEXT) */
-    Value best = rows[(size_t)s * ncols + ci];
-    for (int r = s + 1; r < e; r++) {
+    /* MIN / MAX (INT 또는 TEXT), NULL 무시 */
+    const Value *best = NULL;
+    for (int r = s; r < e; r++) {
         const Value *cell = &rows[(size_t)r * ncols + ci];
-        if (it->agg == AGG_MIN) {
-            if (value_less(cell, &best)) best = *cell;
-        } else {
-            if (value_less(&best, cell)) best = *cell;
+        if (cell->type == VAL_NULL) continue;
+        if (!best || (it->agg == AGG_MIN ? value_less(cell, best) : value_less(best, cell))) {
+            best = cell;
         }
     }
-    if (best.type == VAL_TEXT) {
+    if (!best) {
+        c.is_null = 1;
+        return c;
+    }
+    if (best->type == VAL_TEXT) {
         c.is_text = 1;
-        snprintf(c.text, sizeof(c.text), "%s", best.text_val);
+        snprintf(c.text, sizeof(c.text), "%s", best->text_val);
     } else {
-        c.num = (double)best.int_val;
+        c.num = (double)best->int_val;
     }
     return c;
 }
 
 static void print_cell(FILE *out, const SelectItem *it, const OutCell *c) {
-    if (c->is_text) {
+    if (c->is_null) {
+        fprintf(out, "NULL");
+    } else if (c->is_text) {
         fprintf(out, "%s", c->text);
     } else if (it->agg == AGG_AVG) {
         fprintf(out, "%g", c->num);
@@ -581,11 +616,12 @@ static void print_cell(FILE *out, const SelectItem *it, const OutCell *c) {
     }
 }
 
-/* 출력 행을 정렬 컬럼으로 비교(파일 정적 인덱스, 단일 스레드라 안전). */
+/* 출력 행을 정렬 컬럼으로 비교(파일 정적 인덱스, 단일 스레드라 안전). NULL은 가장 작게. */
 static int g_out_ci;
 static int outrow_cmp(const void *a, const void *b) {
     const OutCell *x = (const OutCell *)a + g_out_ci;
     const OutCell *y = (const OutCell *)b + g_out_ci;
+    if (x->is_null || y->is_null) return x->is_null - y->is_null;
     if (x->is_text) return strcmp(x->text, y->text);
     if (x->num < y->num) return -1;
     if (x->num > y->num) return 1;
@@ -964,6 +1000,8 @@ typedef struct {
     int key_t[MJOIN_MAX_TABS], key_i[MJOIN_MAX_TABS]; /* probe 키 출처(앞 테이블) */
     int hcol[MJOIN_MAX_TABS];                   /* HASH: Tk의 조인 컬럼 위치 */
     HashTab *hash[MJOIN_MAX_TABS];              /* HASH: Tk를 색인한 해시 테이블 */
+    int is_left[MJOIN_MAX_TABS];                /* 레벨 k가 LEFT JOIN이면 1 */
+    int matched[MJOIN_MAX_TABS];                /* 레벨 k에서 이번 외부행이 매칭됐나(LEFT 판단용) */
     int off[MJOIN_MAX_TABS]; /* 결합 행에서 각 테이블 컬럼의 시작 위치 */
     int comb_ncols;
     Value rows[MJOIN_MAX_TABS][SQL_MAX_COLS]; /* 레벨별 현재 행 */
@@ -1048,33 +1086,44 @@ static int mjoin_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
         if (!values_equal(a, b)) {
             return 0;
         }
+        m->matched[level] = 1; /* LEFT 판단용: 이 외부행이 매칭됐다 */
     }
     return mjoin_descend(m, level + 1);
+}
+
+/* 레벨 k 테이블의 컬럼들을 NULL로 채운다(LEFT JOIN 미매칭 시). */
+static void mjoin_null_fill(MJoinCtx *m, int level) {
+    int nc = m->tabs[level]->schema.num_columns;
+    for (int i = 0; i < nc; i++) {
+        m->rows[level][i].type = VAL_NULL;
+    }
 }
 
 static int mjoin_descend(MJoinCtx *m, int level) {
     if (level == m->ntabs) {
         return mjoin_emit(m);
     }
+    int is_left = (level >= 1 && m->is_left[level]);
+    if (level >= 1) {
+        m->matched[level] = 0; /* 이번 외부행에 대한 매칭 추적 리셋 */
+    }
+    int r = 0;
     if (level >= 1 && m->method[level] == JM_INDEX) {
         /* 인덱스 NLJ: 앞 테이블의 키로 Tk의 PK 인덱스를 점 조회 */
         const Value *k = &m->rows[m->key_t[level]][m->key_i[level]];
-        if (k->type != VAL_INT) {
-            return 0;
+        if (k->type == VAL_INT) {
+            bval_t encoded;
+            if (btree_search(&m->tabs[level]->index, k->int_val, &encoded) == 0) {
+                uint8_t recbuf[PAGE_SIZE];
+                uint16_t len2;
+                if (heap_get(&m->tabs[level]->heap, rid_decode(encoded), recbuf, &len2) == 0) {
+                    decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
+                    m->matched[level] = 1;
+                    r = mjoin_descend(m, level + 1);
+                }
+            }
         }
-        bval_t encoded;
-        if (btree_search(&m->tabs[level]->index, k->int_val, &encoded) != 0) {
-            return 0;
-        }
-        uint8_t recbuf[PAGE_SIZE];
-        uint16_t len2;
-        if (heap_get(&m->tabs[level]->heap, rid_decode(encoded), recbuf, &len2) != 0) {
-            return 0;
-        }
-        decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
-        return mjoin_descend(m, level + 1);
-    }
-    if (level >= 1 && m->method[level] == JM_HASH) {
+    } else if (level >= 1 && m->method[level] == JM_HASH) {
         /* 해시 조인: 앞 테이블의 키로 Tk 해시를 탐사. 같은 키의 행마다 내려간다. */
         const Value *k = &m->rows[m->key_t[level]][m->key_i[level]];
         for (HNode *n = hash_bucket(m->hash[level], k); n; n = n->next) {
@@ -1083,15 +1132,25 @@ static int mjoin_descend(MJoinCtx *m, int level) {
             }
             memcpy(m->rows[level], n->row, (size_t)m->tabs[level]->schema.num_columns *
                                                sizeof(Value));
-            int r = mjoin_descend(m, level + 1);
+            m->matched[level] = 1;
+            r = mjoin_descend(m, level + 1);
             if (r) {
                 return r;
             }
         }
-        return 0;
+    } else {
+        MJoinLevel lv = {m, level};
+        r = heap_scan(&m->tabs[level]->heap, mjoin_visit, &lv);
     }
-    MJoinLevel lv = {m, level};
-    return heap_scan(&m->tabs[level]->heap, mjoin_visit, &lv);
+    if (r) {
+        return r;
+    }
+    /* LEFT JOIN인데 이번 외부행에 매칭이 하나도 없었다 -> 오른쪽을 NULL로 채워 보존 */
+    if (is_left && !m->matched[level]) {
+        mjoin_null_fill(m, level);
+        return mjoin_descend(m, level + 1);
+    }
+    return 0;
 }
 
 static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
@@ -1114,6 +1173,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
             return -1;
         }
         m.tname[k] = jc0->alias[0] ? jc0->alias : m.tabs[k]->schema.table;
+        m.is_left[k] = jc0->is_left;
     }
 
     /* 각 조인 레벨의 ON을 해소하고 인덱스 NLJ 가능 여부를 정한다 */

@@ -218,6 +218,26 @@ int main(void) {
           "조인 투영 name, item -> 3행");
     free(o);
 
+    /* LEFT JOIN: 매칭 없는 왼쪽 행(park)도 오른쪽 NULL로 보존 (해시 경로) */
+    o = run(&db, "SELECT * FROM users LEFT JOIN orders ON users.id = orders.uid");
+    CHECK(strstr(o, "3 | park | NULL | NULL | NULL") && strstr(o, "kim") && strstr(o, "(4행"),
+          "LEFT JOIN -> park 보존(NULL), 4행");
+    free(o);
+
+    /* LEFT JOIN + 집계: COUNT(*)는 NULL 행도 세고, COUNT(col)은 NULL을 건너뛴다 */
+    o = run(&db, "SELECT users.name, COUNT(*), COUNT(orders.oid) FROM users LEFT JOIN orders "
+                 "ON users.id = orders.uid GROUP BY users.name");
+    CHECK(strstr(o, "kim | 2 | 2") && strstr(o, "lee | 1 | 1") && strstr(o, "park | 1 | 0"),
+          "LEFT 집계: park COUNT(*)=1, COUNT(orders.oid)=0");
+    free(o);
+
+    /* LEFT JOIN 인덱스 경로: 매칭 없는 주문(uid 9)의 user를 NULL로 */
+    o = run(&db, "SELECT * FROM orders LEFT JOIN users ON orders.uid = users.id");
+    CHECK(strstr(o, "13 | 9 | ghost | NULL | NULL") && strstr(o, "(4행") &&
+              db.used_index == 1,
+          "LEFT JOIN(인덱스) -> ghost의 user NULL, 4행");
+    free(o);
+
     /* 재오픈해도 두 테이블 다 살아 있다(카탈로그 + 파일별 영속) */
     db_close(&db);
     db_open(&db, path);
