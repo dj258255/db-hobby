@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (182 checks across 13 suites).
+covered by tests (188 checks across 13 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -80,7 +80,8 @@ CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
 SELECT <* | item, ...> FROM <t> [<alias>] [JOIN <t2> [<alias>] ON <colref> = <colref>]...
                   [WHERE <cond> [AND <cond>] [OR ...]]
-                  [GROUP BY <col>] [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
+                  [GROUP BY <col>] [HAVING <item> <op> <value>]
+                  [ORDER BY <colref | position> [ASC|DESC]] [LIMIT <n>]
 UPDATE <t> SET <col> = <value> [WHERE ...]
 DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
@@ -95,7 +96,9 @@ the B+Tree index -- `=` is an O(log n) point lookup, the others walk the linked
 leaf chain as a range scan. `!=`, conditions on other columns, and compound
 `AND` conditions fall back to a full scan -- the kind of choice a query planner
 makes. `ORDER BY`/`LIMIT` and `GROUP BY`/aggregates take a materialize path
-(collect, then sort / sort-group). `JOIN` is a recursive N-way join that picks a
+(collect, then sort / sort-group); grouped results can be filtered with `HAVING`
+and ordered by an output column or position (so `ORDER BY 2 DESC` gives top-N by
+an aggregate). `JOIN` is a recursive N-way join that picks a
 method per level like an optimizer: index nested-loop (`btree_search`) when the
 inner's primary key is the `ON` key, hash join (build a hash on the inner's join
 column, then O(1) probe) for any other equi-join, else a plain nested-loop scan.
@@ -109,9 +112,9 @@ See `DESIGN.md` for the full layer map and build order.
 Kept simple on purpose: the first column of each table is treated as a unique
 integer primary key; `WHERE` is in disjunctive normal form (AND-groups joined by
 OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
-to 4 tables (aliases supported, so self-joins work); projection/aggregation and
-`GROUP BY` are single-table and don't combine with `ORDER BY`; and there is no
-isolation/concurrency (one transaction at a time). B+Tree deletion isn't
+to 4 tables (aliases supported, so self-joins work); projection/aggregation,
+`GROUP BY`, and `HAVING` are single-table (no aggregation over joins yet); and
+there is no isolation/concurrency (one transaction at a time). B+Tree deletion isn't
 implemented (deleted rows are tombstoned in the heap, so a stale index entry is
 harmless). These are noted in the code where they matter.
 
