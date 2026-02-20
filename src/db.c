@@ -516,41 +516,80 @@ static const char *agg_name(AggFunc a) {
     }
 }
 
-/* rows의 [s,e) 구간(ncols 폭)에 대해 한 SELECT 항목의 값을 출력한다.
+/* 집계 출력 셀: 숫자(num) 또는 문자열(text). 집계 결과를 정렬·HAVING·출력에 쓴다.
+ * COUNT/SUM/AVG와 INT MIN/MAX는 num, TEXT MIN/MAX와 투영 TEXT는 text. */
+typedef struct {
+    int is_text;
+    double num;
+    char text[SQL_TEXT_LEN];
+} OutCell;
+
+/* rows의 [s,e) 구간(ncols 폭)에 대해 한 SELECT 항목의 값을 셀로 계산한다.
  * ci는 그 항목의 컬럼 위치(COUNT(*)는 무시). */
-static void print_item_value(FILE *out, const SelectItem *it, int ci, const Value *rows,
-                             int ncols, int s, int e) {
-    if (it->agg == AGG_NONE) { /* 투영/그룹 키: 구간 첫 행의 값(대표값) */
-        print_value(out, &rows[(size_t)s * ncols + ci]);
-        return;
+static OutCell compute_cell(const SelectItem *it, int ci, const Value *rows, int ncols, int s,
+                            int e) {
+    OutCell c = {0, 0.0, {0}};
+    if (it->agg == AGG_NONE) { /* 투영/그룹 키: 구간 첫 행의 대표값 */
+        const Value *v = &rows[(size_t)s * ncols + ci];
+        if (v->type == VAL_TEXT) {
+            c.is_text = 1;
+            snprintf(c.text, sizeof(c.text), "%s", v->text_val);
+        } else {
+            c.num = (double)v->int_val;
+        }
+        return c;
     }
     if (it->agg == AGG_COUNT) {
-        fprintf(out, "%d", e - s);
-        return;
+        c.num = e - s;
+        return c;
     }
-    if (e == s) { /* 빈 구간 */
-        fprintf(out, "0");
-        return;
+    if (e == s) {
+        return c; /* 빈 구간 -> 0 */
     }
-    long sum = 0;
+    if (it->agg == AGG_SUM || it->agg == AGG_AVG) {
+        long sum = 0;
+        for (int r = s; r < e; r++) sum += rows[(size_t)r * ncols + ci].int_val;
+        c.num = (it->agg == AGG_SUM) ? (double)sum : (double)sum / (e - s);
+        return c;
+    }
+    /* MIN / MAX (INT 또는 TEXT) */
     Value best = rows[(size_t)s * ncols + ci];
-    for (int r = s; r < e; r++) {
+    for (int r = s + 1; r < e; r++) {
         const Value *cell = &rows[(size_t)r * ncols + ci];
-        if (it->agg == AGG_SUM || it->agg == AGG_AVG) {
-            sum += cell->int_val;
-        } else if (it->agg == AGG_MIN) {
+        if (it->agg == AGG_MIN) {
             if (value_less(cell, &best)) best = *cell;
-        } else if (it->agg == AGG_MAX) {
+        } else {
             if (value_less(&best, cell)) best = *cell;
         }
     }
-    if (it->agg == AGG_SUM) {
-        fprintf(out, "%ld", sum);
-    } else if (it->agg == AGG_AVG) {
-        fprintf(out, "%g", (double)sum / (e - s));
-    } else { /* MIN / MAX */
-        print_value(out, &best);
+    if (best.type == VAL_TEXT) {
+        c.is_text = 1;
+        snprintf(c.text, sizeof(c.text), "%s", best.text_val);
+    } else {
+        c.num = (double)best.int_val;
     }
+    return c;
+}
+
+static void print_cell(FILE *out, const SelectItem *it, const OutCell *c) {
+    if (c->is_text) {
+        fprintf(out, "%s", c->text);
+    } else if (it->agg == AGG_AVG) {
+        fprintf(out, "%g", c->num);
+    } else {
+        fprintf(out, "%ld", (long)c->num); /* COUNT/SUM/MIN/MAX(int)/투영 INT */
+    }
+}
+
+/* 출력 행을 정렬 컬럼으로 비교(파일 정적 인덱스, 단일 스레드라 안전). */
+static int g_out_ci;
+static int outrow_cmp(const void *a, const void *b) {
+    const OutCell *x = (const OutCell *)a + g_out_ci;
+    const OutCell *y = (const OutCell *)b + g_out_ci;
+    if (x->is_text) return strcmp(x->text, y->text);
+    if (x->num < y->num) return -1;
+    if (x->num > y->num) return 1;
+    return 0;
 }
 
 static int exec_select_project(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
@@ -591,9 +630,17 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
             return -1;
         }
     }
-    if (sel->order_col[0] != '\0' && (grouped || sel->has_aggregate)) {
-        fprintf(out, "ERROR: GROUP BY/집계와 ORDER BY는 아직 함께 못 씁니다\n");
-        return -1;
+
+    /* HAVING 집계의 컬럼 위치 해소 */
+    int hci = -1;
+    if (sel->has_having && !(sel->having_agg.agg == AGG_COUNT && sel->having_agg.star)) {
+        for (int i = 0; i < ncols; i++) {
+            if (strcmp(t->schema.columns[i].name, sel->having_agg.col) == 0) hci = i;
+        }
+        if (hci < 0) {
+            fprintf(out, "ERROR: HAVING 컬럼이 없습니다 (%s)\n", sel->having_agg.col);
+            return -1;
+        }
     }
 
     /* 헤더 */
@@ -626,10 +673,17 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
     heap_scan(&t->heap, mat_visit, &m);
     int n = m.count;
 
-    /* 순수 투영(그룹/집계 없음): 각 행을 한 그룹으로 본다. ORDER BY면 먼저 정렬. */
+    /* 순수 투영(그룹/집계 없음): 각 행을 그대로 투영한다. ORDER BY면 원본 행을 정렬. */
     if (!grouped && !sel->has_aggregate) {
-        if (sel->order_col[0] != '\0') {
-            int oc = -1;
+        int oc = -1;
+        if (sel->order_pos > 0) { /* ORDER BY <위치> -> 그 항목의 원본 컬럼 */
+            if (sel->order_pos > sel->num_items) {
+                fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
+                free(rows);
+                return -1;
+            }
+            oc = item_ci[sel->order_pos - 1];
+        } else if (sel->order_col[0] != '\0') {
             if (sel->order_tbl[0] == '\0' || strcmp(sel->order_tbl, tname) == 0) {
                 for (int i = 0; i < ncols; i++) {
                     if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) oc = i;
@@ -640,6 +694,8 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
                 free(rows);
                 return -1;
             }
+        }
+        if (oc >= 0) {
             g_sort_ci = oc;
             qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
             if (sel->order_desc) {
@@ -657,7 +713,8 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
             if (sel->limit >= 0 && printed >= sel->limit) break;
             for (int k = 0; k < sel->num_items; k++) {
                 if (k) fprintf(out, " | ");
-                print_item_value(out, &sel->items[k], item_ci[k], rows, ncols, r, r + 1);
+                OutCell c = compute_cell(&sel->items[k], item_ci[k], rows, ncols, r, r + 1);
+                print_cell(out, &sel->items[k], &c);
             }
             fprintf(out, "\n");
             printed++;
@@ -667,38 +724,110 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
         return 0;
     }
 
-    /* 그룹/집계: 그룹 키로 정렬한 뒤 연속 구간마다 한 줄씩 집계 출력 */
-    int printed = 0;
+    /* 그룹/집계: 출력 행(그룹마다 한 줄)을 버퍼에 모은다.
+     *   1) 그룹 키로 정렬해 연속 구간(run)을 그룹으로 본다(집계만이면 전체가 한 그룹)
+     *   2) 각 그룹에 HAVING 적용 -> 통과한 그룹만 출력 행으로 계산
+     *   3) ORDER BY로 출력 행 정렬, LIMIT만큼 출력 */
+    OutCell *outbuf = malloc((size_t)SELECT_MAX_ROWS * sel->num_items * sizeof(OutCell));
+    if (!outbuf) {
+        fprintf(out, "ERROR: 메모리 부족\n");
+        free(rows);
+        return -1;
+    }
+    int outcount = 0;
     if (grouped) {
         g_sort_ci = gci;
         qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
-        int s = 0;
-        while (s < n) {
-            int e = s + 1;
+    }
+    int s = 0;
+    while (s < n || (s == 0 && !grouped)) { /* 집계만이면 빈 테이블에도 그룹 1개(전체) */
+        int e;
+        if (grouped) {
+            e = s + 1;
             while (e < n &&
                    values_equal(&rows[(size_t)s * ncols + gci], &rows[(size_t)e * ncols + gci])) {
                 e++;
             }
-            if (sel->limit < 0 || printed < sel->limit) {
-                for (int k = 0; k < sel->num_items; k++) {
-                    if (k) fprintf(out, " | ");
-                    print_item_value(out, &sel->items[k], item_ci[k], rows, ncols, s, e);
-                }
-                fprintf(out, "\n");
-                printed++;
-            }
-            s = e;
+        } else {
+            e = n; /* 전체가 한 그룹 */
         }
-    } else {
-        /* 집계만(GROUP BY 없음): 전체가 한 그룹 -> 한 줄 */
+        int pass = 1;
+        if (sel->has_having) {
+            OutCell hc = compute_cell(&sel->having_agg, hci, rows, ncols, s, e);
+            const Value *hv = &sel->having_val;
+            if (hc.is_text) {
+                pass = (hv->type == VAL_TEXT) &&
+                       cmp_apply(sel->having_op, (long)strcmp(hc.text, hv->text_val));
+            } else {
+                pass = (hv->type == VAL_INT) &&
+                       cmp_apply(sel->having_op,
+                                 (hc.num < hv->int_val) ? -1 : (hc.num > hv->int_val ? 1 : 0));
+            }
+        }
+        if (pass && outcount < SELECT_MAX_ROWS) {
+            OutCell *orow = outbuf + (size_t)outcount * sel->num_items;
+            for (int k = 0; k < sel->num_items; k++) {
+                orow[k] = compute_cell(&sel->items[k], item_ci[k], rows, ncols, s, e);
+            }
+            outcount++;
+        }
+        if (!grouped) break;
+        s = e;
+    }
+
+    /* ORDER BY: 출력 컬럼(위치 또는 투영 컬럼명) 기준으로 출력 행 정렬 */
+    int oc = -1;
+    if (sel->order_pos > 0) {
+        if (sel->order_pos > sel->num_items) {
+            fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
+            free(rows);
+            free(outbuf);
+            return -1;
+        }
+        oc = sel->order_pos - 1;
+    } else if (sel->order_col[0] != '\0') {
+        for (int k = 0; k < sel->num_items; k++) {
+            if (sel->items[k].agg == AGG_NONE && strcmp(sel->items[k].col, sel->order_col) == 0) {
+                oc = k;
+            }
+        }
+        if (oc < 0) {
+            fprintf(out, "ERROR: ORDER BY는 출력 컬럼(또는 위치)이어야 합니다 (%s)\n",
+                    sel->order_col);
+            free(rows);
+            free(outbuf);
+            return -1;
+        }
+    }
+    if (oc >= 0) {
+        g_out_ci = oc;
+        qsort(outbuf, outcount, (size_t)sel->num_items * sizeof(OutCell), outrow_cmp);
+        if (sel->order_desc) {
+            OutCell tmp[SQL_MAX_COLS];
+            for (int i = 0, j = outcount - 1; i < j; i++, j--) {
+                memcpy(tmp, outbuf + (size_t)i * sel->num_items,
+                       (size_t)sel->num_items * sizeof(OutCell));
+                memcpy(outbuf + (size_t)i * sel->num_items, outbuf + (size_t)j * sel->num_items,
+                       (size_t)sel->num_items * sizeof(OutCell));
+                memcpy(outbuf + (size_t)j * sel->num_items, tmp,
+                       (size_t)sel->num_items * sizeof(OutCell));
+            }
+        }
+    }
+
+    int printed = 0;
+    for (int i = 0; i < outcount; i++) {
+        if (sel->limit >= 0 && printed >= sel->limit) break;
+        OutCell *orow = outbuf + (size_t)i * sel->num_items;
         for (int k = 0; k < sel->num_items; k++) {
             if (k) fprintf(out, " | ");
-            print_item_value(out, &sel->items[k], item_ci[k], rows, ncols, 0, n);
+            print_cell(out, &sel->items[k], &orow[k]);
         }
         fprintf(out, "\n");
-        printed = 1;
+        printed++;
     }
     free(rows);
+    free(outbuf);
     fprintf(out, "(%d행)\n", printed);
     return 0;
 }

@@ -97,6 +97,45 @@ int main(void) {
           "투영 ORDER BY amt DESC LIMIT 1 -> 300");
     free(o);
 
+    /* GROUP BY + ORDER BY <위치> DESC: 집계값 기준 정렬 (count: sales 3 > eng 2) */
+    o = run(&db, "SELECT dept, COUNT(*) FROM sales GROUP BY dept ORDER BY 2 DESC");
+    {
+        char *sales = strstr(o, "sales"), *eng = strstr(o, "eng");
+        CHECK(sales && eng && sales < eng, "ORDER BY 2 DESC -> sales(3) 먼저, eng(2)");
+    }
+    free(o);
+
+    /* 상위 N: 부서별 매출 합 1등만 */
+    o = run(&db, "SELECT dept, SUM(amt) FROM sales GROUP BY dept ORDER BY 2 DESC LIMIT 1");
+    CHECK(strstr(o, "sales | 500") && !strstr(o, "eng") && strstr(o, "(1행"),
+          "매출 합 top 1 -> sales | 500");
+    free(o);
+
+    /* ORDER BY 그룹 컬럼명 (dept 내림차순) */
+    o = run(&db, "SELECT dept, COUNT(*) FROM sales GROUP BY dept ORDER BY dept DESC");
+    {
+        char *sales = strstr(o, "sales"), *eng = strstr(o, "eng");
+        CHECK(sales && eng && sales < eng, "ORDER BY dept DESC -> sales, eng");
+    }
+    free(o);
+
+    /* HAVING: 주문 2건 초과인 그룹만 (sales=3만 통과) */
+    o = run(&db, "SELECT dept, COUNT(*) FROM sales GROUP BY dept HAVING COUNT(*) > 2");
+    CHECK(strstr(o, "sales | 3") && !strstr(o, "eng") && strstr(o, "(1행"),
+          "HAVING COUNT(*) > 2 -> sales만");
+    free(o);
+
+    /* HAVING SUM: 매출 합 400 초과인 부서만 */
+    o = run(&db, "SELECT dept, SUM(amt) FROM sales GROUP BY dept HAVING SUM(amt) > 400");
+    CHECK(strstr(o, "sales | 500") && !strstr(o, "eng | 300") && strstr(o, "(1행"),
+          "HAVING SUM(amt) > 400 -> sales만");
+    free(o);
+
+    /* HAVING + ORDER BY 함께 */
+    o = run(&db, "SELECT dept, COUNT(*) FROM sales GROUP BY dept HAVING COUNT(*) >= 2 ORDER BY 2 DESC");
+    CHECK(strstr(o, "(2행") != NULL, "HAVING으로 둘 다 통과 + 정렬 -> 2행");
+    free(o);
+
     /* 재오픈 후에도 집계 동작 */
     db_close(&db);
     db_open(&db, path);

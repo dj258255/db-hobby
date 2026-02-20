@@ -122,9 +122,15 @@ typedef struct {
     SelectItem items[SQL_MAX_COLS];
     int has_aggregate;            /* items에 집계가 하나라도 있으면 1 */
     char group_col[SQL_NAME_LEN]; /* GROUP BY 컬럼 ("" 이면 없음) */
+    /* HAVING: 집계 조건으로 그룹을 거른다. has_having이면 having_agg <op> having_val. */
+    int has_having;
+    SelectItem having_agg;
+    CmpOp having_op;
+    Value having_val;
     Where where;
     char order_tbl[SQL_NAME_LEN]; /* ORDER BY 컬럼의 테이블 한정자 ("" 이면 없음) */
-    char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음 */
+    char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음(또는 order_pos 사용) */
+    int order_pos;                /* ORDER BY <위치> (1-based, 출력 컬럼). 0이면 미사용 */
     int order_desc;               /* 1이면 DESC, 0이면 ASC */
     long limit;                   /* -1이면 LIMIT 없음 */
 } SelectStmt;
