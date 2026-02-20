@@ -186,6 +186,38 @@ int main(void) {
           "self-join + WHERE e.name='bob' -> bob/ceo 1행");
     free(o);
 
+    /* 조인 결과 집계: 사용자별 주문 수/합 (kim 2건, lee 1건; park는 주문 없어 빠짐) */
+    o = run(&db, "SELECT users.name, COUNT(*), SUM(orders.oid) FROM users JOIN orders "
+                 "ON users.id = orders.uid GROUP BY users.name");
+    CHECK(strstr(o, "users.name | COUNT(*) | SUM(orders.oid)"), "조인 집계 헤더(한정 컬럼)");
+    CHECK(strstr(o, "kim | 2 | 21") && strstr(o, "lee | 1 | 12") && !strstr(o, "park") &&
+              strstr(o, "(2행"),
+          "GROUP BY users.name -> kim(2,21), lee(1,12)");
+    free(o);
+
+    /* 조인 집계 + ORDER BY <위치> DESC */
+    o = run(&db, "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.uid "
+                 "GROUP BY users.name ORDER BY 2 DESC");
+    {
+        char *kim = strstr(o, "kim"), *lee = strstr(o, "lee");
+        CHECK(kim && lee && kim < lee, "조인 집계 ORDER BY 2 DESC -> kim(2) 먼저");
+    }
+    free(o);
+
+    /* 조인 집계 + HAVING */
+    o = run(&db, "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.uid "
+                 "GROUP BY users.name HAVING COUNT(*) > 1");
+    CHECK(strstr(o, "kim") && !strstr(o, "lee") && strstr(o, "(1행"),
+          "조인 집계 HAVING COUNT(*) > 1 -> kim만");
+    free(o);
+
+    /* 조인 투영(집계 아님): 고른 컬럼만 */
+    o = run(&db, "SELECT users.name, orders.item FROM users JOIN orders ON users.id = orders.uid");
+    CHECK(strstr(o, "users.name | orders.item") && strstr(o, "kim | book") &&
+              strstr(o, "lee | desk") && strstr(o, "(3행"),
+          "조인 투영 name, item -> 3행");
+    free(o);
+
     /* 재오픈해도 두 테이블 다 살아 있다(카탈로그 + 파일별 영속) */
     db_close(&db);
     db_open(&db, path);

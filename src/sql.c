@@ -357,6 +357,7 @@ static AggFunc agg_of(const char *s) {
 static void parse_select_item(Parser *p, SelectItem *it) {
     it->agg = AGG_NONE;
     it->star = 0;
+    it->tbl[0] = '\0';
     it->col[0] = '\0';
     if (p->cur.type != TOK_IDENT) {
         p_fail(p, "컬럼 또는 집계 함수가 필요합니다");
@@ -380,8 +381,7 @@ static void parse_select_item(Parser *p, SelectItem *it) {
                 return;
             }
         } else {
-            char qt[SQL_NAME_LEN];
-            parse_colref(p, qt, it->col); /* 단일 테이블 집계라 한정자는 무시 */
+            parse_colref(p, it->tbl, it->col); /* [tbl.]col */
         }
         p_expect(p, TOK_RPAREN, ") 가 필요합니다");
     } else if (p_accept(p, TOK_DOT)) { /* 한정 일반 컬럼 t.col */
@@ -389,6 +389,7 @@ static void parse_select_item(Parser *p, SelectItem *it) {
             p_fail(p, ". 다음에 컬럼 이름이 필요합니다");
             return;
         }
+        snprintf(it->tbl, SQL_NAME_LEN, "%s", name);
         snprintf(it->col, SQL_NAME_LEN, "%s", p->cur.text);
         p_advance(p);
     } else { /* 한정 없는 일반 컬럼 */
@@ -447,8 +448,7 @@ static void parse_select(Parser *p, Statement *st) {
     }
     if (p_accept(p, TOK_GROUP)) {
         p_expect(p, TOK_BY, "GROUP 다음에 BY가 필요합니다");
-        char qt[SQL_NAME_LEN];
-        parse_colref(p, qt, s->group_col); /* 단일 테이블 집계라 한정자는 무시 */
+        parse_colref(p, s->group_tbl, s->group_col);
     }
     if (p_accept(p, TOK_HAVING)) {
         s->has_having = 1;

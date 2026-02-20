@@ -108,6 +108,7 @@ typedef enum { AGG_NONE, AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG } AggFunc
 typedef struct {
     AggFunc agg;            /* AGG_NONE이면 일반 컬럼 */
     int star;               /* COUNT(*) 처럼 인자가 * 이면 1 */
+    char tbl[SQL_NAME_LEN]; /* 테이블 한정자 ("" 이면 없음) — 조인 집계에서 모호성 해소 */
     char col[SQL_NAME_LEN]; /* 컬럼 이름 (star면 무시) */
 } SelectItem;
 
@@ -121,6 +122,7 @@ typedef struct {
     int num_items;
     SelectItem items[SQL_MAX_COLS];
     int has_aggregate;            /* items에 집계가 하나라도 있으면 1 */
+    char group_tbl[SQL_NAME_LEN]; /* GROUP BY 컬럼의 테이블 한정자 ("" 이면 없음) */
     char group_col[SQL_NAME_LEN]; /* GROUP BY 컬럼 ("" 이면 없음) */
     /* HAVING: 집계 조건으로 그룹을 거른다. has_having이면 having_agg <op> having_val. */
     int has_having;

@@ -592,10 +592,42 @@ static int outrow_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static int exec_select_project(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
-    int ncols = t->schema.num_columns;
+/* 결합 행의 한 컬럼: 실효 테이블 이름 + 컬럼명 + INT 여부. 단일 테이블/조인 공통. */
+typedef struct {
+    const char *tbl;
+    const char *col;
+    int is_int;
+} ColRef;
 
-    /* 각 항목의 컬럼 위치를 해소하고 타입을 검증한다 */
+/* [qtbl.]col 을 cols에서 찾는다(없으면 -1). qtbl 없으면 이름으로 첫 매치. */
+static int find_col(const ColRef *cols, int ncols, const char *qtbl, const char *col) {
+    for (int i = 0; i < ncols; i++) {
+        if (qtbl[0] && strcmp(qtbl, cols[i].tbl) != 0) continue;
+        if (strcmp(cols[i].col, col) == 0) return i;
+    }
+    return -1;
+}
+
+static void print_item_label(FILE *out, const SelectItem *it) {
+    if (it->agg == AGG_NONE) {
+        if (it->tbl[0]) fprintf(out, "%s.%s", it->tbl, it->col);
+        else fprintf(out, "%s", it->col);
+    } else if (it->star) {
+        fprintf(out, "%s(*)", agg_name(it->agg));
+    } else if (it->tbl[0]) {
+        fprintf(out, "%s(%s.%s)", agg_name(it->agg), it->tbl, it->col);
+    } else {
+        fprintf(out, "%s(%s)", agg_name(it->agg), it->col);
+    }
+}
+
+/* 투영/집계/GROUP BY/HAVING/ORDER BY/LIMIT를 "이미 모은 행 집합"에 적용해 출력한다.
+ * rows: n행, 각 행 ncols 폭. cols[i]: i번째 컬럼의 (실효테이블, 이름, INT여부).
+ * 단일 테이블이면 한 테이블 컬럼들, 조인이면 결합 컬럼들을 넘기면 같은 코드로 동작한다.
+ * rows는 호출자가 소유(여기서 free하지 않음). */
+static int aggregate_rowset(const SelectStmt *sel, Value *rows, int n, int ncols,
+                            const ColRef *cols, FILE *out) {
+    /* 항목 컬럼 해소 + 타입 검증 */
     int item_ci[SQL_MAX_COLS];
     for (int k = 0; k < sel->num_items; k++) {
         const SelectItem *it = &sel->items[k];
@@ -603,15 +635,12 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
             item_ci[k] = -1;
             continue;
         }
-        int ci = -1;
-        for (int i = 0; i < ncols; i++) {
-            if (strcmp(t->schema.columns[i].name, it->col) == 0) ci = i;
-        }
+        int ci = find_col(cols, ncols, it->tbl, it->col);
         if (ci < 0) {
             fprintf(out, "ERROR: 그런 컬럼이 없습니다 (%s)\n", it->col);
             return -1;
         }
-        if ((it->agg == AGG_SUM || it->agg == AGG_AVG) && t->schema.columns[ci].type != COL_INT) {
+        if ((it->agg == AGG_SUM || it->agg == AGG_AVG) && !cols[ci].is_int) {
             fprintf(out, "ERROR: %s 는 INT 컬럼에만 쓸 수 있습니다 (%s)\n", agg_name(it->agg),
                     it->col);
             return -1;
@@ -622,21 +651,16 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
     int grouped = (sel->group_col[0] != '\0');
     int gci = -1;
     if (grouped) {
-        for (int i = 0; i < ncols; i++) {
-            if (strcmp(t->schema.columns[i].name, sel->group_col) == 0) gci = i;
-        }
+        gci = find_col(cols, ncols, sel->group_tbl, sel->group_col);
         if (gci < 0) {
             fprintf(out, "ERROR: GROUP BY 컬럼이 없습니다 (%s)\n", sel->group_col);
             return -1;
         }
     }
 
-    /* HAVING 집계의 컬럼 위치 해소 */
     int hci = -1;
     if (sel->has_having && !(sel->having_agg.agg == AGG_COUNT && sel->having_agg.star)) {
-        for (int i = 0; i < ncols; i++) {
-            if (strcmp(t->schema.columns[i].name, sel->having_agg.col) == 0) hci = i;
-        }
+        hci = find_col(cols, ncols, sel->having_agg.tbl, sel->having_agg.col);
         if (hci < 0) {
             fprintf(out, "ERROR: HAVING 컬럼이 없습니다 (%s)\n", sel->having_agg.col);
             return -1;
@@ -646,52 +670,23 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
     /* 헤더 */
     for (int k = 0; k < sel->num_items; k++) {
         if (k) fprintf(out, " | ");
-        const SelectItem *it = &sel->items[k];
-        if (it->agg == AGG_NONE) {
-            fprintf(out, "%s", it->col);
-        } else if (it->star) {
-            fprintf(out, "%s(*)", agg_name(it->agg));
-        } else {
-            fprintf(out, "%s(%s)", agg_name(it->agg), it->col);
-        }
+        print_item_label(out, &sel->items[k]);
     }
     fprintf(out, "\n");
 
-    /* WHERE에 맞는 행을 모은다 */
-    Value *rows = malloc((size_t)SELECT_MAX_ROWS * ncols * sizeof(Value));
-    if (!rows) {
-        fprintf(out, "ERROR: 메모리 부족\n");
-        return -1;
-    }
-    MatCtx m = {.schema = &t->schema,
-                .tname = tname,
-                .where = &sel->where,
-                .rows = rows,
-                .ncols = ncols,
-                .cap = SELECT_MAX_ROWS,
-                .count = 0};
-    heap_scan(&t->heap, mat_visit, &m);
-    int n = m.count;
-
-    /* 순수 투영(그룹/집계 없음): 각 행을 그대로 투영한다. ORDER BY면 원본 행을 정렬. */
+    /* 순수 투영(그룹/집계 없음): 각 행을 그대로 투영. ORDER BY면 원본 행을 정렬. */
     if (!grouped && !sel->has_aggregate) {
         int oc = -1;
-        if (sel->order_pos > 0) { /* ORDER BY <위치> -> 그 항목의 원본 컬럼 */
+        if (sel->order_pos > 0) {
             if (sel->order_pos > sel->num_items) {
                 fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
-                free(rows);
                 return -1;
             }
             oc = item_ci[sel->order_pos - 1];
         } else if (sel->order_col[0] != '\0') {
-            if (sel->order_tbl[0] == '\0' || strcmp(sel->order_tbl, tname) == 0) {
-                for (int i = 0; i < ncols; i++) {
-                    if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) oc = i;
-                }
-            }
+            oc = find_col(cols, ncols, sel->order_tbl, sel->order_col);
             if (oc < 0) {
                 fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
-                free(rows);
                 return -1;
             }
         }
@@ -699,12 +694,15 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
             g_sort_ci = oc;
             qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
             if (sel->order_desc) {
-                Value tmp[SQL_MAX_COLS];
-                for (int i = 0, j = n - 1; i < j; i++, j--) {
-                    memcpy(tmp, rows + (size_t)i * ncols, (size_t)ncols * sizeof(Value));
-                    memcpy(rows + (size_t)i * ncols, rows + (size_t)j * ncols,
-                           (size_t)ncols * sizeof(Value));
-                    memcpy(rows + (size_t)j * ncols, tmp, (size_t)ncols * sizeof(Value));
+                Value *tmp = malloc((size_t)ncols * sizeof(Value));
+                if (tmp) {
+                    for (int i = 0, j = n - 1; i < j; i++, j--) {
+                        memcpy(tmp, rows + (size_t)i * ncols, (size_t)ncols * sizeof(Value));
+                        memcpy(rows + (size_t)i * ncols, rows + (size_t)j * ncols,
+                               (size_t)ncols * sizeof(Value));
+                        memcpy(rows + (size_t)j * ncols, tmp, (size_t)ncols * sizeof(Value));
+                    }
+                    free(tmp);
                 }
             }
         }
@@ -719,19 +717,14 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
             fprintf(out, "\n");
             printed++;
         }
-        free(rows);
         fprintf(out, "(%d행)\n", printed);
         return 0;
     }
 
-    /* 그룹/집계: 출력 행(그룹마다 한 줄)을 버퍼에 모은다.
-     *   1) 그룹 키로 정렬해 연속 구간(run)을 그룹으로 본다(집계만이면 전체가 한 그룹)
-     *   2) 각 그룹에 HAVING 적용 -> 통과한 그룹만 출력 행으로 계산
-     *   3) ORDER BY로 출력 행 정렬, LIMIT만큼 출력 */
+    /* 그룹/집계: 출력 행(그룹마다 한 줄)을 버퍼에 모은다. */
     OutCell *outbuf = malloc((size_t)SELECT_MAX_ROWS * sel->num_items * sizeof(OutCell));
     if (!outbuf) {
         fprintf(out, "ERROR: 메모리 부족\n");
-        free(rows);
         return -1;
     }
     int outcount = 0;
@@ -740,7 +733,7 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
         qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
     }
     int s = 0;
-    while (s < n || (s == 0 && !grouped)) { /* 집계만이면 빈 테이블에도 그룹 1개(전체) */
+    while (s < n || (s == 0 && !grouped)) { /* 집계만이면 빈 입력에도 그룹 1개(전체) */
         int e;
         if (grouped) {
             e = s + 1;
@@ -749,7 +742,7 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
                 e++;
             }
         } else {
-            e = n; /* 전체가 한 그룹 */
+            e = n;
         }
         int pass = 1;
         if (sel->has_having) {
@@ -775,12 +768,11 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
         s = e;
     }
 
-    /* ORDER BY: 출력 컬럼(위치 또는 투영 컬럼명) 기준으로 출력 행 정렬 */
+    /* ORDER BY: 출력 컬럼(위치 또는 투영 컬럼명) 기준 정렬 */
     int oc = -1;
     if (sel->order_pos > 0) {
         if (sel->order_pos > sel->num_items) {
             fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
-            free(rows);
             free(outbuf);
             return -1;
         }
@@ -794,7 +786,6 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
         if (oc < 0) {
             fprintf(out, "ERROR: ORDER BY는 출력 컬럼(또는 위치)이어야 합니다 (%s)\n",
                     sel->order_col);
-            free(rows);
             free(outbuf);
             return -1;
         }
@@ -826,10 +817,37 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
         fprintf(out, "\n");
         printed++;
     }
-    free(rows);
     free(outbuf);
     fprintf(out, "(%d행)\n", printed);
     return 0;
+}
+
+/* 단일 테이블 투영/집계: WHERE에 맞는 행을 모아 aggregate_rowset에 넘긴다. */
+static int exec_select_project(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
+    int ncols = t->schema.num_columns;
+    Value *rows = malloc((size_t)SELECT_MAX_ROWS * ncols * sizeof(Value));
+    if (!rows) {
+        fprintf(out, "ERROR: 메모리 부족\n");
+        return -1;
+    }
+    MatCtx m = {.schema = &t->schema,
+                .tname = tname,
+                .where = &sel->where,
+                .rows = rows,
+                .ncols = ncols,
+                .cap = SELECT_MAX_ROWS,
+                .count = 0};
+    heap_scan(&t->heap, mat_visit, &m);
+
+    ColRef cols[SQL_MAX_COLS];
+    for (int i = 0; i < ncols; i++) {
+        cols[i].tbl = tname;
+        cols[i].col = t->schema.columns[i].name;
+        cols[i].is_int = (t->schema.columns[i].type == COL_INT);
+    }
+    int rc = aggregate_rowset(sel, rows, m.count, ncols, cols, out);
+    free(rows);
+    return rc;
 }
 
 /* ------------- 해시 조인용 해시 테이블 -------------
@@ -1146,22 +1164,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     }
     m.comb_ncols = comb;
 
-    /* 헤더: 모든 테이블 컬럼을 table.col 로 한정해 출력 */
-    {
-        int first = 1;
-        for (int t = 0; t < m.ntabs; t++) {
-            for (int i = 0; i < m.tabs[t]->schema.num_columns; i++) {
-                if (!first) {
-                    fprintf(out, " | ");
-                }
-                first = 0;
-                fprintf(out, "%s.%s", m.tname[t], m.tabs[t]->schema.columns[i].name);
-            }
-        }
-        fprintf(out, "\n");
-    }
-
-    /* 해시 조인 레벨은 Tk를 조인 컬럼으로 미리 해시 빌드한다(한 번). */
+    /* 해시 조인 레벨은 Tk를 조인 컬럼으로 미리 해시 빌드한다(한 번). 양 경로 공통. */
     int used_hash = 0;
     for (int k = 1; k < m.ntabs; k++) {
         if (m.method[k] == JM_HASH) {
@@ -1180,6 +1183,51 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     if (used_index && used_hash) note = ", 인덱스+해시 조인";
     else if (used_index) note = ", 인덱스 조인";
     else if (used_hash) note = ", 해시 조인";
+
+    /* SELECT * 가 아니면(투영/집계): 결합 행을 전부 모아 공통 집계기로 넘긴다.
+     * 조인이 만든 결합 행이 곧 집계의 입력 — 두 실행기가 한 함수로 만난다. */
+    if (!sel->select_star) {
+        Value *matbuf = malloc((size_t)SELECT_MAX_ROWS * comb * sizeof(Value));
+        if (!matbuf) {
+            fprintf(out, "ERROR: 메모리 부족\n");
+            for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
+            return -1;
+        }
+        m.materialize = 1;
+        m.matbuf = matbuf;
+        m.matcap = SELECT_MAX_ROWS;
+        mjoin_descend(&m, 0);
+        for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
+
+        ColRef cols[MJOIN_MAX_TABS * SQL_MAX_COLS];
+        int ci = 0;
+        for (int t = 0; t < m.ntabs; t++) {
+            for (int i = 0; i < m.tabs[t]->schema.num_columns; i++) {
+                cols[ci].tbl = m.tname[t];
+                cols[ci].col = m.tabs[t]->schema.columns[i].name;
+                cols[ci].is_int = (m.tabs[t]->schema.columns[i].type == COL_INT);
+                ci++;
+            }
+        }
+        int rc = aggregate_rowset(sel, matbuf, m.matcount, comb, cols, out);
+        free(matbuf);
+        return rc;
+    }
+
+    /* 헤더: 모든 테이블 컬럼을 table.col 로 한정해 출력 (SELECT *) */
+    {
+        int first = 1;
+        for (int t = 0; t < m.ntabs; t++) {
+            for (int i = 0; i < m.tabs[t]->schema.num_columns; i++) {
+                if (!first) {
+                    fprintf(out, " | ");
+                }
+                first = 0;
+                fprintf(out, "%s.%s", m.tname[t], m.tabs[t]->schema.columns[i].name);
+            }
+        }
+        fprintf(out, "\n");
+    }
 
     if (sel->order_col[0] == '\0') {
         /* ORDER BY 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
@@ -1243,12 +1291,8 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
 }
 
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
-    /* 투영/집계(SELECT * 가 아님)는 단일 테이블만 지원한다. */
-    if (!sel->select_star && sel->num_joins > 0) {
-        fprintf(out, "ERROR: 투영/집계는 아직 단일 테이블만 됩니다\n");
-        return -1;
-    }
     if (sel->num_joins > 0) {
+        /* 조인: SELECT * 는 스트리밍, 투영/집계는 결합 행을 모아 처리 (둘 다 안에서 분기) */
         return exec_select_join(db, sel, out);
     }
 
