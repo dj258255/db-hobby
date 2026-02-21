@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (200 checks across 13 suites).
+covered by tests (202 checks across 13 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -89,6 +89,7 @@ BEGIN | COMMIT | ROLLBACK
 
 <item>   is  <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
 <cond>   is  <colref> <op> <value>  |  <colref> IS [NOT] NULL
+                                   |  <colref> IN (SELECT <col> FROM <t> [WHERE ...])
 <op>     is one of  =  !=  <  >  <=  >=
 <colref> is  [<table>.]<col>
 ```
@@ -108,7 +109,8 @@ column, then O(1) probe) for any other equi-join, else a plain nested-loop scan.
 the one place `NULL` appears (it never lives in stored rows), so `COUNT(*)` counts
 those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
 for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
-DISTINCT` dedupes output rows. Transactions use a
+DISTINCT` dedupes output rows. `IN (SELECT ...)` runs an uncorrelated subquery
+once into a value set, then tests membership. Transactions use a
 no-steal + force-at-commit policy across every table and roll back both the heap
 and the index.
 
@@ -121,8 +123,9 @@ integer primary key; `WHERE` is in disjunctive normal form (AND-groups joined by
 OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
 to 4 tables (`INNER` and `LEFT`, aliases supported, so self-joins work);
 projection, aggregation, `GROUP BY`, and `HAVING` work over a single table or a
-join result; `NULL` only arises from `LEFT JOIN` (no nullable stored columns); and
-there is no isolation/concurrency (one transaction at a time). B+Tree deletion isn't
+join result; `NULL` only arises from `LEFT JOIN` (no nullable stored columns); subqueries are
+uncorrelated and single-table/single-column; and there is no isolation/concurrency
+(one transaction at a time). B+Tree deletion isn't
 implemented (deleted rows are tombstoned in the heap, so a stale index entry is
 harmless). These are noted in the code where they matter.
 
