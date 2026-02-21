@@ -18,7 +18,7 @@ typedef enum {
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
-    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT,
+    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN,
     TOK_ERROR
 } TokType;
 
@@ -67,6 +67,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "NOT")) return TOK_NOT;
     if (!strcasecmp(s, "NULL")) return TOK_NULL;
     if (!strcasecmp(s, "DISTINCT")) return TOK_DISTINCT;
+    if (!strcasecmp(s, "IN")) return TOK_IN;
     return TOK_IDENT;
 }
 
@@ -268,6 +269,8 @@ static void parse_where_op(Parser *p, CmpOp *out) {
     }
 }
 
+static void parse_select_stmt(Parser *p, SelectStmt *s); /* 서브쿼리용 전방 선언 */
+
 /* 한 AND 묶음: cond (AND cond)* */
 static void parse_and_group(Parser *p, AndGroup *g) {
     g->count = 0;
@@ -278,7 +281,19 @@ static void parse_and_group(Parser *p, AndGroup *g) {
         }
         Condition *c = &g->conds[g->count];
         parse_colref(p, c->tbl, c->col);
-        if (p_accept(p, TOK_IS)) { /* IS [NOT] NULL — 값 없는 조건 */
+        if (p_accept(p, TOK_IN)) { /* col IN (SELECT ...) 서브쿼리 */
+            p_expect(p, TOK_LPAREN, "IN 다음에 ( 가 필요합니다");
+            p_expect(p, TOK_SELECT, "IN ( 다음에 SELECT 서브쿼리가 필요합니다");
+            SelectStmt *sub = calloc(1, sizeof(SelectStmt));
+            if (!sub) {
+                p_fail(p, "메모리 부족");
+                return;
+            }
+            parse_select_stmt(p, sub);
+            p_expect(p, TOK_RPAREN, "서브쿼리 뒤에 ) 가 필요합니다");
+            c->in_sub = 1;
+            c->sub = sub;
+        } else if (p_accept(p, TOK_IS)) { /* IS [NOT] NULL — 값 없는 조건 */
             c->op = p_accept(p, TOK_NOT) ? CMP_IS_NOT_NULL : CMP_IS_NULL;
             p_expect(p, TOK_NULL, "IS [NOT] 다음에 NULL이 필요합니다");
         } else {
@@ -432,10 +447,9 @@ static void parse_select_list(Parser *p, SelectStmt *s) {
     } while (p_accept(p, TOK_COMMA));
 }
 
-static void parse_select(Parser *p, Statement *st) {
-    st->type = STMT_SELECT;
-    SelectStmt *s = &st->select;
-    s->limit = -1; /* memset이 0으로 둔 걸 "LIMIT 없음"으로 바로잡는다 */
+/* SELECT 본문(SELECT 키워드는 이미 소비됨)을 SelectStmt에 채운다. 서브쿼리도 이걸 쓴다. */
+static void parse_select_stmt(Parser *p, SelectStmt *s) {
+    s->limit = -1; /* memset/calloc이 0으로 둔 걸 "LIMIT 없음"으로 바로잡는다 */
     parse_select_list(p, s);
     p_expect(p, TOK_FROM, "FROM이 필요합니다");
     parse_name(p, s->table);
@@ -504,6 +518,11 @@ static void parse_select(Parser *p, Statement *st) {
     }
 }
 
+static void parse_select(Parser *p, Statement *st) {
+    st->type = STMT_SELECT;
+    parse_select_stmt(p, &st->select);
+}
+
 static void parse_delete(Parser *p, Statement *st) {
     st->type = STMT_DELETE;
     DeleteStmt *d = &st->del;
@@ -524,6 +543,34 @@ static void parse_update(Parser *p, Statement *st) {
     parse_value(p, &u->set_val);
     if (p_accept(p, TOK_WHERE)) {
         parse_where(p, &u->where);
+    }
+}
+
+/* Where 안의 서브쿼리·IN 집합을 재귀적으로 해제한다. */
+static void free_where(Where *w) {
+    for (int gi = 0; gi < w->count; gi++) {
+        AndGroup *g = &w->groups[gi];
+        for (int i = 0; i < g->count; i++) {
+            Condition *c = &g->conds[i];
+            if (c->in_sub) {
+                if (c->sub) {
+                    free_where(&c->sub->where); /* 서브쿼리 안의 서브쿼리도 */
+                    free(c->sub);
+                    c->sub = NULL;
+                }
+                free(c->in_set);
+                c->in_set = NULL;
+            }
+        }
+    }
+}
+
+void statement_free(Statement *st) {
+    switch (st->type) {
+        case STMT_SELECT: free_where(&st->select.where); break;
+        case STMT_DELETE: free_where(&st->del.where); break;
+        case STMT_UPDATE: free_where(&st->upd.where); break;
+        default: break;
     }
 }
 

@@ -138,6 +138,21 @@ int main(void) {
     CHECK(strstr(o, "(1행") != NULL, "LIMIT 1 -> 1행만");
     free(o);
 
+    /* 서브쿼리: id IN (SELECT ...) — 다른 테이블 값 집합에 멤버십 */
+    o = run(&db, "CREATE TABLE picks (uid INT)"); free(o);
+    o = run(&db, "INSERT INTO picks VALUES (2)"); free(o);
+    o = run(&db, "INSERT INTO picks VALUES (4)"); free(o);
+    o = run(&db, "SELECT * FROM users WHERE id IN (SELECT uid FROM picks)");
+    CHECK(strstr(o, "lee") && strstr(o, "amy") && !strstr(o, "kim") && !strstr(o, "park") &&
+              strstr(o, "(2행"),
+          "id IN (SELECT uid FROM picks) -> lee(2), amy(4)");
+    free(o);
+    /* 서브쿼리 안의 WHERE */
+    o = run(&db, "SELECT * FROM users WHERE id IN (SELECT uid FROM picks WHERE uid > 2)");
+    CHECK(strstr(o, "amy") && !strstr(o, "lee") && strstr(o, "(1행"),
+          "서브쿼리 WHERE: uid > 2 -> amy(4)만");
+    free(o);
+
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");
     CHECK(strstr(o, "2개 행 삭제됨") != NULL, "DELETE WHERE id >= 3 -> 2개 삭제");

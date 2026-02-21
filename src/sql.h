@@ -48,12 +48,20 @@ typedef struct {
     ColType type;
 } ColumnDef;
 
-/* WHERE 한 조건: [<tbl>.]<col> <op> <val>. tbl[0]=='\0' 이면 한정 없음. */
+typedef struct SelectStmt SelectStmt; /* 전방 선언: 조건이 서브쿼리를 품을 수 있다 */
+
+/* WHERE 한 조건: [<tbl>.]<col> <op> <val>, 또는 [<tbl>.]<col> IN (SELECT ...). */
 typedef struct {
     char tbl[SQL_NAME_LEN];
     char col[SQL_NAME_LEN];
     CmpOp op;
     Value val;
+    /* col IN (SELECT ...) 서브쿼리. in_sub면 sub가 (malloc된) 안쪽 쿼리.
+     * 실행 직전 prepare 단계가 sub를 한 번 돌려 in_set(값 집합)을 채운다. */
+    int in_sub;
+    SelectStmt *sub;
+    Value *in_set;
+    int in_set_n;
 } Condition;
 
 /* AND로 묶인 조건 묶음(DNF 한 항). 전부 참이어야 이 묶음이 참. */
@@ -117,7 +125,7 @@ typedef struct {
     char col[SQL_NAME_LEN]; /* 컬럼 이름 (star면 무시) */
 } SelectItem;
 
-typedef struct {
+struct SelectStmt {
     char table[SQL_NAME_LEN]; /* FROM 테이블 */
     char alias[SQL_NAME_LEN]; /* FROM 테이블 별칭 ("" 이면 테이블명을 그대로 씀) */
     int num_joins;            /* 0이면 단일 테이블 */
@@ -141,7 +149,7 @@ typedef struct {
     int order_pos;                /* ORDER BY <위치> (1-based, 출력 컬럼). 0이면 미사용 */
     int order_desc;               /* 1이면 DESC, 0이면 ASC */
     long limit;                   /* -1이면 LIMIT 없음 */
-} SelectStmt;
+};
 
 typedef struct {
     char table[SQL_NAME_LEN];
@@ -168,5 +176,8 @@ typedef struct {
 
 /* SQL 한 문장을 파싱한다. 0 성공, -1 실패(errbuf에 오류 메시지). */
 int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen);
+
+/* 파싱된 문장이 malloc한 것(서브쿼리·IN 집합)을 해제한다. db_exec가 실행 뒤 부른다. */
+void statement_free(Statement *st);
 
 #endif /* MINIDB_SQL_H */

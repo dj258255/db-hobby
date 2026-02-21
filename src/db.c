@@ -193,6 +193,21 @@ static const Value *cell_in(const CreateStmt *s, const char *tname, const char *
 
 /* 셀 하나에 <op> <val>을 적용. 셀이 없거나 타입이 안 맞으면 거짓. */
 static int cond_eval(const Value *cell, const Condition *cond) {
+    /* col IN (SELECT ...) — 미리 계산된 값 집합(in_set)에 멤버십 검사 */
+    if (cond->in_sub) {
+        if (!cell || cell->type == VAL_NULL) {
+            return 0;
+        }
+        for (int i = 0; i < cond->in_set_n; i++) {
+            const Value *v = &cond->in_set[i];
+            if (v->type != cell->type) continue;
+            if (cell->type == VAL_INT ? cell->int_val == v->int_val
+                                      : strcmp(cell->text_val, v->text_val) == 0) {
+                return 1;
+            }
+        }
+        return 0;
+    }
     /* IS [NOT] NULL — NULL을 검사하는 유일한 방법(=는 NULL에 항상 거짓) */
     if (cond->op == CMP_IS_NULL) {
         return cell && cell->type == VAL_NULL;
@@ -1431,6 +1446,82 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     return 0;
 }
 
+/* ------------- 서브쿼리 prepare: col IN (SELECT ...) -------------
+ * 상관 없는(uncorrelated) 서브쿼리라 바깥 스캔 전에 한 번만 돌려 값 집합을 만든다.
+ * 안쪽은 단일 테이블·단일 컬럼 투영만 지원(IN 멤버십엔 그걸로 충분).
+ */
+static int prepare_where(Database *db, Where *w);
+
+typedef struct {
+    const CreateStmt *schema;
+    const char *tname;
+    const Where *where;
+    int col;
+    Value *set;
+    int cap;
+    int n;
+} SubCtx;
+
+static int sub_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid;
+    (void)len;
+    SubCtx *c = ctx_;
+    Value row[SQL_MAX_COLS];
+    decode_row(c->schema, rec, row);
+    if (where_matches(c->schema, c->tname, c->where, row) && c->n < c->cap) {
+        c->set[c->n++] = row[c->col];
+    }
+    return 0;
+}
+
+static int run_subquery(Database *db, SelectStmt *sub, Value **out_set, int *out_n) {
+    /* 지원 형태: SELECT <컬럼> FROM <테이블> [WHERE ...] (조인·집계·* 없음) */
+    if (sub->num_joins != 0 || sub->select_star || sub->num_items != 1 ||
+        sub->items[0].agg != AGG_NONE || sub->group_col[0] != '\0') {
+        return -1;
+    }
+    Table *t = find_table(db, sub->table);
+    if (!t) {
+        return -1;
+    }
+    const char *tname = sub->alias[0] ? sub->alias : t->schema.table;
+    if (prepare_where(db, &sub->where) != 0) { /* 중첩 서브쿼리 먼저 */
+        return -1;
+    }
+    int col = -1;
+    for (int i = 0; i < t->schema.num_columns; i++) {
+        if (strcmp(t->schema.columns[i].name, sub->items[0].col) == 0) col = i;
+    }
+    if (col < 0) {
+        return -1;
+    }
+    Value *set = malloc((size_t)SELECT_MAX_ROWS * sizeof(Value));
+    if (!set) {
+        return -1;
+    }
+    SubCtx c = {&t->schema, tname, &sub->where, col, set, SELECT_MAX_ROWS, 0};
+    heap_scan(&t->heap, sub_visit, &c);
+    *out_set = set;
+    *out_n = c.n;
+    return 0;
+}
+
+/* WHERE 안의 모든 IN-서브쿼리를 한 번씩 실행해 in_set을 채운다(아직 안 채웠으면). */
+static int prepare_where(Database *db, Where *w) {
+    for (int gi = 0; gi < w->count; gi++) {
+        AndGroup *g = &w->groups[gi];
+        for (int i = 0; i < g->count; i++) {
+            Condition *c = &g->conds[i];
+            if (c->in_sub && !c->in_set) {
+                if (run_subquery(db, c->sub, &c->in_set, &c->in_set_n) != 0) {
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     if (sel->num_joins > 0) {
         /* 조인: SELECT * 는 스트리밍, 투영/집계는 결합 행을 모아 처리 (둘 다 안에서 분기) */
@@ -1471,7 +1562,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     const Condition *c0 = (sel->where.count == 1 && sel->where.groups[0].count == 1)
                               ? &sel->where.groups[0].conds[0]
                               : NULL;
-    int pk_cond = c0 && t->has_index &&
+    int pk_cond = c0 && !c0->in_sub && t->has_index &&
                   (c0->tbl[0] == '\0' || strcmp(c0->tbl, tname) == 0) &&
                   strcmp(c0->col, t->schema.columns[0].name) == 0 && c0->val.type == VAL_INT;
 
@@ -1719,6 +1810,17 @@ int db_exec(Database *db, const char *sql, FILE *out) {
     char err[128];
     if (sql_parse(sql, &st, err, sizeof(err)) != 0) {
         fprintf(out, "ERROR: %s\n", err);
+        statement_free(&st); /* 실패 전에 만든 서브쿼리 노드도 해제 */
+        return -1;
+    }
+    /* IN-서브쿼리가 있으면 바깥 스캔 전에 한 번씩 실행해 값 집합을 채운다. */
+    Where *w = (st.type == STMT_SELECT)   ? &st.select.where
+               : (st.type == STMT_DELETE) ? &st.del.where
+               : (st.type == STMT_UPDATE) ? &st.upd.where
+                                          : NULL;
+    if (w && prepare_where(db, w) != 0) {
+        fprintf(out, "ERROR: 서브쿼리를 실행할 수 없습니다 (지원 형태: SELECT <컬럼> FROM <테이블> [WHERE ...])\n");
+        statement_free(&st);
         return -1;
     }
     int rc;
@@ -1745,5 +1847,6 @@ int db_exec(Database *db, const char *sql, FILE *out) {
             }
         }
     }
+    statement_free(&st); /* 서브쿼리·IN 집합 해제 */
     return rc;
 }
