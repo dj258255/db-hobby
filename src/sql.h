@@ -29,8 +29,11 @@
 
 typedef enum { COL_INT, COL_TEXT } ColType;
 
-/* WHERE 비교 연산자 */
-typedef enum { CMP_EQ, CMP_NE, CMP_LT, CMP_GT, CMP_LE, CMP_GE } CmpOp;
+/* WHERE 비교 연산자. IS_NULL/IS_NOT_NULL은 값 피연산자가 없다. */
+typedef enum {
+    CMP_EQ, CMP_NE, CMP_LT, CMP_GT, CMP_LE, CMP_GE,
+    CMP_IS_NULL, CMP_IS_NOT_NULL
+} CmpOp;
 
 /* VAL_NULL은 저장 행엔 안 생기고, LEFT JOIN의 미매칭 오른쪽 컬럼 등 결과에만 등장한다. */
 typedef enum { VAL_INT, VAL_TEXT, VAL_NULL } ValueType;
@@ -120,6 +123,7 @@ typedef struct {
     int num_joins;            /* 0이면 단일 테이블 */
     JoinClause joins[SQL_MAX_JOINS];
     /* 투영/집계: select_star면 SELECT * (items 무시). 아니면 items가 출력 목록. */
+    int distinct; /* SELECT DISTINCT 이면 1 (출력 행 중복 제거) */
     int select_star;
     int num_items;
     SelectItem items[SQL_MAX_COLS];

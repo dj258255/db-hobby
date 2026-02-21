@@ -238,6 +238,20 @@ int main(void) {
           "LEFT JOIN(인덱스) -> ghost의 user NULL, 4행");
     free(o);
 
+    /* anti-join: LEFT JOIN + IS NULL = 주문이 하나도 없는 사용자 (park) */
+    o = run(&db, "SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid "
+                 "WHERE orders.oid IS NULL");
+    CHECK(strstr(o, "park") && !strstr(o, "kim") && !strstr(o, "lee") && strstr(o, "(1행"),
+          "anti-join (orders IS NULL) -> park만");
+    free(o);
+
+    /* IS NOT NULL + DISTINCT: 주문 있는 사용자 (kim, lee) */
+    o = run(&db, "SELECT DISTINCT users.name FROM users LEFT JOIN orders ON users.id = orders.uid "
+                 "WHERE orders.oid IS NOT NULL");
+    CHECK(strstr(o, "kim") && strstr(o, "lee") && !strstr(o, "park") && strstr(o, "(2행"),
+          "IS NOT NULL + DISTINCT -> kim, lee");
+    free(o);
+
     /* 재오픈해도 두 테이블 다 살아 있다(카탈로그 + 파일별 영속) */
     db_close(&db);
     db_open(&db, path);

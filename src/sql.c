@@ -18,6 +18,7 @@ typedef enum {
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
+    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT,
     TOK_ERROR
 } TokType;
 
@@ -62,6 +63,10 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "HAVING")) return TOK_HAVING;
     if (!strcasecmp(s, "LEFT")) return TOK_LEFT;
     if (!strcasecmp(s, "OUTER")) return TOK_OUTER;
+    if (!strcasecmp(s, "IS")) return TOK_IS;
+    if (!strcasecmp(s, "NOT")) return TOK_NOT;
+    if (!strcasecmp(s, "NULL")) return TOK_NULL;
+    if (!strcasecmp(s, "DISTINCT")) return TOK_DISTINCT;
     return TOK_IDENT;
 }
 
@@ -273,8 +278,13 @@ static void parse_and_group(Parser *p, AndGroup *g) {
         }
         Condition *c = &g->conds[g->count];
         parse_colref(p, c->tbl, c->col);
-        parse_where_op(p, &c->op);
-        parse_value(p, &c->val);
+        if (p_accept(p, TOK_IS)) { /* IS [NOT] NULL — 값 없는 조건 */
+            c->op = p_accept(p, TOK_NOT) ? CMP_IS_NOT_NULL : CMP_IS_NULL;
+            p_expect(p, TOK_NULL, "IS [NOT] 다음에 NULL이 필요합니다");
+        } else {
+            parse_where_op(p, &c->op);
+            parse_value(p, &c->val);
+        }
         g->count++;
     } while (p_accept(p, TOK_AND));
 }
@@ -399,8 +409,11 @@ static void parse_select_item(Parser *p, SelectItem *it) {
     }
 }
 
-/* SELECT 목록: * 또는 콤마로 구분된 항목들. */
+/* SELECT [DISTINCT] 목록: * 또는 콤마로 구분된 항목들. */
 static void parse_select_list(Parser *p, SelectStmt *s) {
+    if (p_accept(p, TOK_DISTINCT)) {
+        s->distinct = 1;
+    }
     if (p_accept(p, TOK_STAR)) {
         s->select_star = 1;
         return;

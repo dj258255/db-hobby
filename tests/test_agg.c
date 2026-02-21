@@ -136,6 +136,19 @@ int main(void) {
     CHECK(strstr(o, "(2행") != NULL, "HAVING으로 둘 다 통과 + 정렬 -> 2행");
     free(o);
 
+    /* DISTINCT: 중복 제거 (dept: eng×2, sales×3 -> eng, sales) */
+    o = run(&db, "SELECT DISTINCT dept FROM sales");
+    CHECK(strstr(o, "eng") && strstr(o, "sales") && strstr(o, "(2행"),
+          "DISTINCT dept -> eng, sales (2행)");
+    free(o);
+    /* DISTINCT 여러 컬럼 + ORDER BY */
+    o = run(&db, "SELECT DISTINCT dept FROM sales ORDER BY dept DESC");
+    {
+        char *sales = strstr(o, "sales"), *eng = strstr(o, "eng");
+        CHECK(sales && eng && sales < eng && strstr(o, "(2행"), "DISTINCT + ORDER BY DESC");
+    }
+    free(o);
+
     /* 재오픈 후에도 집계 동작 */
     db_close(&db);
     db_open(&db, path);
