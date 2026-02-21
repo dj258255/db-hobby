@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (196 checks across 13 suites).
+covered by tests (200 checks across 13 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -78,7 +78,8 @@ mydb.orders.idx   orders PK index
 ```
 CREATE TABLE <t> (<col> INT|TEXT, ...)
 INSERT INTO <t> VALUES (<int|'text'>, ...)
-SELECT <* | item, ...> FROM <t> [<alias>] [[LEFT] JOIN <t2> [<alias>] ON <colref> = <colref>]...
+SELECT [DISTINCT] <* | item, ...>
+       FROM <t> [<alias>] [[LEFT] JOIN <t2> [<alias>] ON <colref> = <colref>]...
                   [WHERE <cond> [AND <cond>] [OR ...]]
                   [GROUP BY <col>] [HAVING <item> <op> <value>]
                   [ORDER BY <colref | position> [ASC|DESC]] [LIMIT <n>]
@@ -87,7 +88,8 @@ DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
 
 <item>   is  <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
-<cond>   is  <colref> <op> <value>,  <op> is one of  =  !=  <  >  <=  >=
+<cond>   is  <colref> <op> <value>  |  <colref> IS [NOT] NULL
+<op>     is one of  =  !=  <  >  <=  >=
 <colref> is  [<table>.]<col>
 ```
 
@@ -104,7 +106,9 @@ inner's primary key is the `ON` key, hash join (build a hash on the inner's join
 column, then O(1) probe) for any other equi-join, else a plain nested-loop scan.
 `LEFT JOIN` preserves unmatched left rows by filling the right side with `NULL` --
 the one place `NULL` appears (it never lives in stored rows), so `COUNT(*)` counts
-those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s. Transactions use a
+those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
+for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
+DISTINCT` dedupes output rows. Transactions use a
 no-steal + force-at-commit policy across every table and roll back both the heap
 and the index.
 
