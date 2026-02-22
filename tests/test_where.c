@@ -152,6 +152,12 @@ int main(void) {
     CHECK(strstr(o, "amy") && !strstr(o, "lee") && strstr(o, "(1행"),
           "서브쿼리 WHERE: uid > 2 -> amy(4)만");
     free(o);
+    /* NOT IN: 집합(2,4)에 없는 id -> kim(1), park(3) */
+    o = run(&db, "SELECT * FROM users WHERE id NOT IN (SELECT uid FROM picks)");
+    CHECK(strstr(o, "kim") && strstr(o, "park") && !strstr(o, "lee") && !strstr(o, "amy") &&
+              strstr(o, "(2행"),
+          "id NOT IN (picks) -> kim(1), park(3)");
+    free(o);
 
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");

@@ -59,6 +59,7 @@ typedef struct {
     /* col IN (SELECT ...) 서브쿼리. in_sub면 sub가 (malloc된) 안쪽 쿼리.
      * 실행 직전 prepare 단계가 sub를 한 번 돌려 in_set(값 집합)을 채운다. */
     int in_sub;
+    int in_negate; /* NOT IN 이면 1 (멤버십 부정) */
     SelectStmt *sub;
     Value *in_set;
     int in_set_n;

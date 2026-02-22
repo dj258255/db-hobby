@@ -281,7 +281,11 @@ static void parse_and_group(Parser *p, AndGroup *g) {
         }
         Condition *c = &g->conds[g->count];
         parse_colref(p, c->tbl, c->col);
-        if (p_accept(p, TOK_IN)) { /* col IN (SELECT ...) 서브쿼리 */
+        int negate_in = p_accept(p, TOK_NOT); /* NOT IN */
+        if (negate_in) {
+            p_expect(p, TOK_IN, "NOT 다음에 IN이 필요합니다");
+        }
+        if (negate_in || p_accept(p, TOK_IN)) { /* col [NOT] IN (SELECT ...) 서브쿼리 */
             p_expect(p, TOK_LPAREN, "IN 다음에 ( 가 필요합니다");
             p_expect(p, TOK_SELECT, "IN ( 다음에 SELECT 서브쿼리가 필요합니다");
             SelectStmt *sub = calloc(1, sizeof(SelectStmt));
@@ -292,6 +296,7 @@ static void parse_and_group(Parser *p, AndGroup *g) {
             parse_select_stmt(p, sub);
             p_expect(p, TOK_RPAREN, "서브쿼리 뒤에 ) 가 필요합니다");
             c->in_sub = 1;
+            c->in_negate = negate_in;
             c->sub = sub;
         } else if (p_accept(p, TOK_IS)) { /* IS [NOT] NULL — 값 없는 조건 */
             c->op = p_accept(p, TOK_NOT) ? CMP_IS_NOT_NULL : CMP_IS_NULL;

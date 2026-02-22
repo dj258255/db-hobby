@@ -196,17 +196,19 @@ static int cond_eval(const Value *cell, const Condition *cond) {
     /* col IN (SELECT ...) — 미리 계산된 값 집합(in_set)에 멤버십 검사 */
     if (cond->in_sub) {
         if (!cell || cell->type == VAL_NULL) {
-            return 0;
+            return 0; /* NULL은 IN/NOT IN 둘 다 거짓(unknown) */
         }
+        int member = 0;
         for (int i = 0; i < cond->in_set_n; i++) {
             const Value *v = &cond->in_set[i];
             if (v->type != cell->type) continue;
             if (cell->type == VAL_INT ? cell->int_val == v->int_val
                                       : strcmp(cell->text_val, v->text_val) == 0) {
-                return 1;
+                member = 1;
+                break;
             }
         }
-        return 0;
+        return cond->in_negate ? !member : member;
     }
     /* IS [NOT] NULL — NULL을 검사하는 유일한 방법(=는 NULL에 항상 거짓) */
     if (cond->op == CMP_IS_NULL) {
