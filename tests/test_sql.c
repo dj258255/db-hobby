@@ -78,12 +78,19 @@ int main(void) {
     /* ORDER BY / LIMIT */
     CHECK(sql_parse("SELECT * FROM t ORDER BY name DESC LIMIT 3", &st, err, sizeof(err)) == 0,
           "ORDER BY ... LIMIT 파싱 성공");
-    CHECK(strcmp(st.select.order_col, "name") == 0 && st.select.order_desc == 1,
+    CHECK(st.select.num_order == 1 && strcmp(st.select.order_keys[0].col, "name") == 0 &&
+              st.select.order_keys[0].desc == 1,
           "ORDER BY name DESC");
     CHECK(st.select.limit == 3, "LIMIT 3");
     CHECK(sql_parse("SELECT * FROM t", &st, err, sizeof(err)) == 0 &&
-              st.select.order_col[0] == '\0' && st.select.limit == -1,
+              st.select.num_order == 0 && st.select.limit == -1,
           "ORDER BY·LIMIT 없으면 기본값");
+    /* 다중 컬럼 ORDER BY */
+    CHECK(sql_parse("SELECT * FROM t ORDER BY a, b DESC", &st, err, sizeof(err)) == 0 &&
+              st.select.num_order == 2 && strcmp(st.select.order_keys[0].col, "a") == 0 &&
+              st.select.order_keys[0].desc == 0 && strcmp(st.select.order_keys[1].col, "b") == 0 &&
+              st.select.order_keys[1].desc == 1,
+          "ORDER BY a, b DESC -> 키 2개");
 
     /* 오류 케이스 */
     CHECK(sql_parse("SELECT FROM users", &st, err, sizeof(err)) == -1, "잘못된 SELECT는 오류");

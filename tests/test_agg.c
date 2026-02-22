@@ -149,6 +149,16 @@ int main(void) {
     }
     free(o);
 
+    /* 다중 컬럼 ORDER BY: dept 오름차순, 그 안에서 amt 내림차순 */
+    o = run(&db, "SELECT dept, amt FROM sales ORDER BY dept, amt DESC");
+    {
+        char *e200 = strstr(o, "eng | 200"), *e100 = strstr(o, "eng | 100");
+        char *s300 = strstr(o, "sales | 300"), *s50 = strstr(o, "sales | 50");
+        CHECK(e200 && e100 && s300 && s50 && e200 < e100 && e100 < s300 && s300 < s50,
+              "ORDER BY dept, amt DESC -> eng(200,100), sales(300,150,50)");
+    }
+    free(o);
+
     /* 재오픈 후에도 집계 동작 */
     db_close(&db);
     db_open(&db, path);

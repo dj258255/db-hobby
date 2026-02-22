@@ -501,17 +501,25 @@ static void parse_select_stmt(Parser *p, SelectStmt *s) {
     }
     if (p_accept(p, TOK_ORDER)) {
         p_expect(p, TOK_BY, "ORDER 다음에 BY가 필요합니다");
-        if (p->cur.type == TOK_INT) { /* ORDER BY <위치> — 출력 컬럼 번호(1-based) */
-            s->order_pos = (int)p->cur.int_val;
-            p_advance(p);
-        } else {
-            parse_colref(p, s->order_tbl, s->order_col);
-        }
-        if (p_accept(p, TOK_DESC)) {
-            s->order_desc = 1;
-        } else {
-            p_accept(p, TOK_ASC); /* ASC는 기본값, 있어도 그만 */
-        }
+        do { /* 키 (, 키)* — 다중 컬럼 정렬 */
+            if (s->num_order >= SQL_MAX_ORDER) {
+                p_fail(p, "ORDER BY 키가 너무 많습니다");
+                break;
+            }
+            OrderKey *ok = &s->order_keys[s->num_order];
+            if (p->cur.type == TOK_INT) { /* ORDER BY <위치> — 출력 컬럼 번호(1-based) */
+                ok->pos = (int)p->cur.int_val;
+                p_advance(p);
+            } else {
+                parse_colref(p, ok->tbl, ok->col);
+            }
+            if (p_accept(p, TOK_DESC)) {
+                ok->desc = 1;
+            } else {
+                p_accept(p, TOK_ASC); /* ASC는 기본값, 있어도 그만 */
+            }
+            s->num_order++;
+        } while (p_accept(p, TOK_COMMA));
     }
     if (p_accept(p, TOK_LIMIT)) {
         if (p->cur.type != TOK_INT || p->cur.int_val < 0) {

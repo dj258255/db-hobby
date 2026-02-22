@@ -449,23 +449,32 @@ static int mat_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     return 0;
 }
 
-/* qsort 비교기는 컨텍스트를 못 받으니(이식성 위해 qsort_r 회피) 정렬 컬럼만
- * 파일 정적으로 둔다. 단일 스레드 학습용이라 안전. ASC로만 비교하고
- * DESC는 정렬 뒤 배열을 뒤집어 처리한다. */
-static int g_sort_ci;
+/* qsort 비교기는 컨텍스트를 못 받으니(이식성 위해 qsort_r 회피) 정렬 키 목록을
+ * 파일 정적으로 둔다. 단일 스레드 학습용이라 안전. 키마다 ASC/DESC를 적용한다. */
+static int g_sort_keys[SQL_MAX_ORDER]; /* 행 안의 컬럼 위치들 */
+static int g_sort_desc[SQL_MAX_ORDER];
+static int g_sort_n;
 
-static int row_cmp(const void *a, const void *b) {
-    const Value *x = (const Value *)a + g_sort_ci;
-    const Value *y = (const Value *)b + g_sort_ci;
-    if (x->type == VAL_NULL || y->type == VAL_NULL) { /* NULL은 가장 작게(먼저) */
+/* 두 값을 비교해 sign(-1/0/1). NULL은 가장 작게. */
+static int value_cmp(const Value *x, const Value *y) {
+    if (x->type == VAL_NULL || y->type == VAL_NULL) {
         return (x->type == VAL_NULL) - (y->type == VAL_NULL);
     }
     if (x->type == VAL_INT) {
-        if (x->int_val < y->int_val) return -1;
-        if (x->int_val > y->int_val) return 1;
-        return 0;
+        return (x->int_val < y->int_val) ? -1 : (x->int_val > y->int_val);
     }
-    return strcmp(x->text_val, y->text_val);
+    int c = strcmp(x->text_val, y->text_val);
+    return c < 0 ? -1 : (c > 0 ? 1 : 0);
+}
+
+static int row_cmp(const void *a, const void *b) {
+    const Value *x = a;
+    const Value *y = b;
+    for (int k = 0; k < g_sort_n; k++) {
+        int c = value_cmp(&x[g_sort_keys[k]], &y[g_sort_keys[k]]);
+        if (c) return g_sort_desc[k] ? -c : c;
+    }
+    return 0;
 }
 
 static int exec_select_sorted(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
@@ -484,32 +493,32 @@ static int exec_select_sorted(Table *t, const char *tname, const SelectStmt *sel
                 .count = 0};
     heap_scan(&t->heap, mat_visit, &m);
 
-    if (sel->order_col[0] != '\0') {
-        int ci = -1;
-        if (sel->order_tbl[0] == '\0' || strcmp(sel->order_tbl, tname) == 0) {
-            for (int i = 0; i < ncols; i++) {
-                if (strcmp(t->schema.columns[i].name, sel->order_col) == 0) {
-                    ci = i;
+    if (sel->num_order > 0) {
+        g_sort_n = sel->num_order;
+        for (int k = 0; k < sel->num_order; k++) {
+            const OrderKey *ok = &sel->order_keys[k];
+            int ci = -1;
+            if (ok->pos > 0) {
+                if (ok->pos > ncols) {
+                    fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
+                    free(rows);
+                    return -1;
+                }
+                ci = ok->pos - 1;
+            } else if (ok->tbl[0] == '\0' || strcmp(ok->tbl, tname) == 0) {
+                for (int i = 0; i < ncols; i++) {
+                    if (strcmp(t->schema.columns[i].name, ok->col) == 0) ci = i;
                 }
             }
-        }
-        if (ci < 0) {
-            fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
-            free(rows);
-            return -1;
-        }
-        g_sort_ci = ci;
-        qsort(rows, m.count, (size_t)ncols * sizeof(Value), row_cmp);
-        if (sel->order_desc) {
-            /* ASC 정렬 결과를 뒤집어 DESC로 만든다 */
-            Value tmp[SQL_MAX_COLS];
-            for (int i = 0, j = m.count - 1; i < j; i++, j--) {
-                memcpy(tmp, rows + (size_t)i * ncols, (size_t)ncols * sizeof(Value));
-                memcpy(rows + (size_t)i * ncols, rows + (size_t)j * ncols,
-                       (size_t)ncols * sizeof(Value));
-                memcpy(rows + (size_t)j * ncols, tmp, (size_t)ncols * sizeof(Value));
+            if (ci < 0) {
+                fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", ok->col);
+                free(rows);
+                return -1;
             }
+            g_sort_keys[k] = ci;
+            g_sort_desc[k] = ok->desc;
         }
+        qsort(rows, m.count, (size_t)ncols * sizeof(Value), row_cmp);
     }
 
     int count = 0;
@@ -642,15 +651,25 @@ static void print_cell(FILE *out, const SelectItem *it, const OutCell *c) {
     }
 }
 
-/* 출력 행을 정렬 컬럼으로 비교(파일 정적 인덱스, 단일 스레드라 안전). NULL은 가장 작게. */
-static int g_out_ci;
-static int outrow_cmp(const void *a, const void *b) {
-    const OutCell *x = (const OutCell *)a + g_out_ci;
-    const OutCell *y = (const OutCell *)b + g_out_ci;
+/* 출력 행을 정렬 키 목록으로 비교(파일 정적, 단일 스레드라 안전). NULL은 가장 작게. */
+static int g_out_keys[SQL_MAX_ORDER];
+static int g_out_desc[SQL_MAX_ORDER];
+static int g_out_n;
+static int outcell_cmp(const OutCell *x, const OutCell *y) {
     if (x->is_null || y->is_null) return x->is_null - y->is_null;
-    if (x->is_text) return strcmp(x->text, y->text);
-    if (x->num < y->num) return -1;
-    if (x->num > y->num) return 1;
+    if (x->is_text) {
+        int c = strcmp(x->text, y->text);
+        return c < 0 ? -1 : (c > 0 ? 1 : 0);
+    }
+    return (x->num < y->num) ? -1 : (x->num > y->num);
+}
+static int outrow_cmp(const void *a, const void *b) {
+    const OutCell *x = a;
+    const OutCell *y = b;
+    for (int k = 0; k < g_out_n; k++) {
+        int c = outcell_cmp(&x[g_out_keys[k]], &y[g_out_keys[k]]);
+        if (c) return g_out_desc[k] ? -c : c;
+    }
     return 0;
 }
 
@@ -688,41 +707,35 @@ static int outrows_equal(const OutCell *a, const OutCell *b, int n) {
     return 1;
 }
 
-/* 모인 출력 행들을 ORDER BY(출력 컬럼)로 정렬하고 LIMIT만큼 찍는다. outbuf는 호출자 소유. */
+/* 모인 출력 행들을 ORDER BY(출력 컬럼 목록)로 정렬하고 LIMIT만큼 찍는다. outbuf는 호출자 소유. */
 static int emit_out_rows(const SelectStmt *sel, OutCell *outbuf, int outcount, FILE *out) {
-    int oc = -1;
-    if (sel->order_pos > 0) {
-        if (sel->order_pos > sel->num_items) {
-            fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
-            return -1;
-        }
-        oc = sel->order_pos - 1;
-    } else if (sel->order_col[0] != '\0') {
-        for (int k = 0; k < sel->num_items; k++) {
-            if (sel->items[k].agg == AGG_NONE && strcmp(sel->items[k].col, sel->order_col) == 0) {
-                oc = k;
+    if (sel->num_order > 0) {
+        g_out_n = sel->num_order;
+        for (int k = 0; k < sel->num_order; k++) {
+            const OrderKey *ok = &sel->order_keys[k];
+            int oc = -1;
+            if (ok->pos > 0) {
+                if (ok->pos > sel->num_items) {
+                    fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
+                    return -1;
+                }
+                oc = ok->pos - 1;
+            } else {
+                for (int j = 0; j < sel->num_items; j++) {
+                    if (sel->items[j].agg == AGG_NONE && strcmp(sel->items[j].col, ok->col) == 0) {
+                        oc = j;
+                    }
+                }
+                if (oc < 0) {
+                    fprintf(out, "ERROR: ORDER BY는 출력 컬럼(또는 위치)이어야 합니다 (%s)\n",
+                            ok->col);
+                    return -1;
+                }
             }
+            g_out_keys[k] = oc;
+            g_out_desc[k] = ok->desc;
         }
-        if (oc < 0) {
-            fprintf(out, "ERROR: ORDER BY는 출력 컬럼(또는 위치)이어야 합니다 (%s)\n",
-                    sel->order_col);
-            return -1;
-        }
-    }
-    if (oc >= 0) {
-        g_out_ci = oc;
         qsort(outbuf, outcount, (size_t)sel->num_items * sizeof(OutCell), outrow_cmp);
-        if (sel->order_desc) {
-            OutCell tmp[SQL_MAX_COLS];
-            for (int i = 0, j = outcount - 1; i < j; i++, j--) {
-                memcpy(tmp, outbuf + (size_t)i * sel->num_items,
-                       (size_t)sel->num_items * sizeof(OutCell));
-                memcpy(outbuf + (size_t)i * sel->num_items, outbuf + (size_t)j * sel->num_items,
-                       (size_t)sel->num_items * sizeof(OutCell));
-                memcpy(outbuf + (size_t)j * sel->num_items, tmp,
-                       (size_t)sel->num_items * sizeof(OutCell));
-            }
-        }
     }
     int printed = 0;
     for (int i = 0; i < outcount; i++) {
@@ -858,35 +871,28 @@ static int aggregate_rowset(const SelectStmt *sel, Value *rows, int n, int ncols
             free(outbuf);
             return rc;
         }
-        int oc = -1;
-        if (sel->order_pos > 0) {
-            if (sel->order_pos > sel->num_items) {
-                fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
-                return -1;
-            }
-            oc = item_ci[sel->order_pos - 1];
-        } else if (sel->order_col[0] != '\0') {
-            oc = find_col(cols, ncols, sel->order_tbl, sel->order_col);
-            if (oc < 0) {
-                fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
-                return -1;
-            }
-        }
-        if (oc >= 0) {
-            g_sort_ci = oc;
-            qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
-            if (sel->order_desc) {
-                Value *tmp = malloc((size_t)ncols * sizeof(Value));
-                if (tmp) {
-                    for (int i = 0, j = n - 1; i < j; i++, j--) {
-                        memcpy(tmp, rows + (size_t)i * ncols, (size_t)ncols * sizeof(Value));
-                        memcpy(rows + (size_t)i * ncols, rows + (size_t)j * ncols,
-                               (size_t)ncols * sizeof(Value));
-                        memcpy(rows + (size_t)j * ncols, tmp, (size_t)ncols * sizeof(Value));
+        if (sel->num_order > 0) {
+            g_sort_n = sel->num_order;
+            for (int k = 0; k < sel->num_order; k++) {
+                const OrderKey *ok = &sel->order_keys[k];
+                int oc;
+                if (ok->pos > 0) {
+                    if (ok->pos > sel->num_items) {
+                        fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
+                        return -1;
                     }
-                    free(tmp);
+                    oc = item_ci[ok->pos - 1];
+                } else {
+                    oc = find_col(cols, ncols, ok->tbl, ok->col);
+                    if (oc < 0) {
+                        fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", ok->col);
+                        return -1;
+                    }
                 }
+                g_sort_keys[k] = oc;
+                g_sort_desc[k] = ok->desc;
             }
+            qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
         }
         int printed = 0;
         for (int r = 0; r < n; r++) {
@@ -911,7 +917,9 @@ static int aggregate_rowset(const SelectStmt *sel, Value *rows, int n, int ncols
     }
     int outcount = 0;
     if (grouped) {
-        g_sort_ci = gci;
+        g_sort_keys[0] = gci;
+        g_sort_desc[0] = 0;
+        g_sort_n = 1;
         qsort(rows, n, (size_t)ncols * sizeof(Value), row_cmp);
     }
     int s = 0;
@@ -1387,7 +1395,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "\n");
     }
 
-    if (sel->order_col[0] == '\0') {
+    if (sel->num_order == 0) {
         /* ORDER BY 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
         mjoin_descend(&m, 0);
         for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
@@ -1395,15 +1403,28 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         return 0;
     }
 
-    /* ORDER BY: 결합 행을 모아 정렬한 뒤 LIMIT만큼 출력한다(조인 위의 Sort 노드). */
-    int oti, oci;
-    if (resolve_chain_ref(m.tabs, m.tname, m.ntabs, sel->order_tbl, sel->order_col, &oti, &oci) !=
-        0) {
-        fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", sel->order_col);
-        for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
-        return -1;
+    /* ORDER BY: 결합 행을 모아 정렬한 뒤 LIMIT만큼 출력한다(조인 위의 Sort 노드).
+     * 각 키를 결합 행에서의 위치로 해소한다(다중 컬럼 가능). */
+    g_sort_n = sel->num_order;
+    for (int k = 0; k < sel->num_order; k++) {
+        const OrderKey *ok = &sel->order_keys[k];
+        int oti, oci;
+        if (ok->pos > 0) {
+            if (ok->pos > comb) {
+                fprintf(out, "ERROR: ORDER BY 위치가 범위를 벗어났습니다\n");
+                for (int j = 1; j < m.ntabs; j++) hash_free(m.hash[j]);
+                return -1;
+            }
+            g_sort_keys[k] = ok->pos - 1;
+        } else if (resolve_chain_ref(m.tabs, m.tname, m.ntabs, ok->tbl, ok->col, &oti, &oci) == 0) {
+            g_sort_keys[k] = m.off[oti] + oci; /* 결합 행에서의 위치 */
+        } else {
+            fprintf(out, "ERROR: ORDER BY 컬럼이 없습니다 (%s)\n", ok->col);
+            for (int j = 1; j < m.ntabs; j++) hash_free(m.hash[j]);
+            return -1;
+        }
+        g_sort_desc[k] = ok->desc;
     }
-    int ocomb = m.off[oti] + oci; /* 결합 행에서의 위치 */
 
     m.materialize = 1;
     m.matcap = SELECT_MAX_ROWS;
@@ -1416,17 +1437,7 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     mjoin_descend(&m, 0);
     for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
 
-    g_sort_ci = ocomb;
     qsort(m.matbuf, m.matcount, (size_t)comb * sizeof(Value), row_cmp);
-    if (sel->order_desc) {
-        Value tmp[MJOIN_MAX_TABS * SQL_MAX_COLS];
-        for (int i = 0, k = m.matcount - 1; i < k; i++, k--) {
-            memcpy(tmp, m.matbuf + (size_t)i * comb, (size_t)comb * sizeof(Value));
-            memcpy(m.matbuf + (size_t)i * comb, m.matbuf + (size_t)k * comb,
-                   (size_t)comb * sizeof(Value));
-            memcpy(m.matbuf + (size_t)k * comb, tmp, (size_t)comb * sizeof(Value));
-        }
-    }
 
     int printed = 0;
     for (int i = 0; i < m.matcount; i++) {
@@ -1553,7 +1564,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     db->used_index = 0;
 
     /* ORDER BY나 LIMIT이 있으면 모았다가 정렬/자르는 경로로 간다. */
-    if (sel->order_col[0] != '\0' || sel->limit >= 0) {
+    if (sel->num_order > 0 || sel->limit >= 0) {
         return exec_select_sorted(t, tname, sel, out);
     }
 

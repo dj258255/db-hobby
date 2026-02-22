@@ -126,6 +126,15 @@ typedef struct {
     char col[SQL_NAME_LEN]; /* 컬럼 이름 (star면 무시) */
 } SelectItem;
 
+/* ORDER BY 키 하나: [<tbl>.]<col> 또는 <pos>, 그리고 ASC/DESC. */
+#define SQL_MAX_ORDER 4
+typedef struct {
+    char tbl[SQL_NAME_LEN];
+    char col[SQL_NAME_LEN];
+    int pos;  /* ORDER BY <위치> (1-based). 0이면 col 사용 */
+    int desc; /* 1이면 DESC */
+} OrderKey;
+
 struct SelectStmt {
     char table[SQL_NAME_LEN]; /* FROM 테이블 */
     char alias[SQL_NAME_LEN]; /* FROM 테이블 별칭 ("" 이면 테이블명을 그대로 씀) */
@@ -145,11 +154,9 @@ struct SelectStmt {
     CmpOp having_op;
     Value having_val;
     Where where;
-    char order_tbl[SQL_NAME_LEN]; /* ORDER BY 컬럼의 테이블 한정자 ("" 이면 없음) */
-    char order_col[SQL_NAME_LEN]; /* "" 이면 ORDER BY 없음(또는 order_pos 사용) */
-    int order_pos;                /* ORDER BY <위치> (1-based, 출력 컬럼). 0이면 미사용 */
-    int order_desc;               /* 1이면 DESC, 0이면 ASC */
-    long limit;                   /* -1이면 LIMIT 없음 */
+    int num_order; /* ORDER BY 키 개수 (0이면 ORDER BY 없음) */
+    OrderKey order_keys[SQL_MAX_ORDER];
+    long limit; /* -1이면 LIMIT 없음 */
 };
 
 typedef struct {
