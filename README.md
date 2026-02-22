@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (205 checks across 13 suites).
+covered by tests (207 checks across 13 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -82,13 +82,14 @@ SELECT [DISTINCT] <* | item, ...>
        FROM <t> [<alias>] [[LEFT] JOIN <t2> [<alias>] ON <colref> = <colref>]...
                   [WHERE <cond> [AND <cond>] [OR ...]]
                   [GROUP BY <col>] [HAVING <item> <op> <value>]
-                  [ORDER BY <colref | position> [ASC|DESC], ...] [LIMIT <n>]
+                  [ORDER BY <colref | position> [ASC|DESC], ...] [LIMIT <n>] [OFFSET <n>]
 UPDATE <t> SET <col> = <value> [WHERE ...]
 DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
 
 <item>   is  <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
-<cond>   is  <colref> <op> <value>  |  <colref> IS [NOT] NULL
+<cond>   is  <colref> <op> <value>  |  <colref> <op> (SELECT <col> FROM <t> [WHERE ...])
+                                   |  <colref> IS [NOT] NULL
                                    |  <colref> [NOT] IN (SELECT <col> FROM <t> [WHERE ...])
 <op>     is one of  =  !=  <  >  <=  >=
 <colref> is  [<table>.]<col>
