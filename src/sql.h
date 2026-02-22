@@ -59,7 +59,8 @@ typedef struct {
     /* col IN (SELECT ...) 서브쿼리. in_sub면 sub가 (malloc된) 안쪽 쿼리.
      * 실행 직전 prepare 단계가 sub를 한 번 돌려 in_set(값 집합)을 채운다. */
     int in_sub;
-    int in_negate; /* NOT IN 이면 1 (멤버십 부정) */
+    int in_negate;  /* NOT IN 이면 1 (멤버십 부정) */
+    int scalar_sub; /* col <op> (SELECT ...) 스칼라 서브쿼리면 1 (in_set[0]과 비교) */
     SelectStmt *sub;
     Value *in_set;
     int in_set_n;
@@ -156,7 +157,8 @@ struct SelectStmt {
     Where where;
     int num_order; /* ORDER BY 키 개수 (0이면 ORDER BY 없음) */
     OrderKey order_keys[SQL_MAX_ORDER];
-    long limit; /* -1이면 LIMIT 없음 */
+    long limit;  /* -1이면 LIMIT 없음 */
+    long offset; /* 출력에서 건너뛸 행 수 (0이면 없음) */
 };
 
 typedef struct {

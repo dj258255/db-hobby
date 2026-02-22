@@ -196,7 +196,21 @@ static int cond_eval(const Value *cell, const Condition *cond) {
     /* col IN (SELECT ...) — 미리 계산된 값 집합(in_set)에 멤버십 검사 */
     if (cond->in_sub) {
         if (!cell || cell->type == VAL_NULL) {
-            return 0; /* NULL은 IN/NOT IN 둘 다 거짓(unknown) */
+            return 0; /* NULL은 IN/NOT IN/스칼라 비교 모두 거짓(unknown) */
+        }
+        if (cond->scalar_sub) { /* col <op> (SELECT ...) — 한 값과 비교 */
+            if (cond->in_set_n < 1) {
+                return 0; /* 빈 서브쿼리 -> NULL -> 거짓 */
+            }
+            const Value *v = &cond->in_set[0];
+            if (cell->type == VAL_INT && v->type == VAL_INT) {
+                long sign = (cell->int_val < v->int_val) ? -1 : (cell->int_val > v->int_val);
+                return cmp_apply(cond->op, sign);
+            }
+            if (cell->type == VAL_TEXT && v->type == VAL_TEXT) {
+                return cmp_apply(cond->op, (long)strcmp(cell->text_val, v->text_val));
+            }
+            return 0;
         }
         int member = 0;
         for (int i = 0; i < cond->in_set_n; i++) {
@@ -523,6 +537,7 @@ static int exec_select_sorted(Table *t, const char *tname, const SelectStmt *sel
 
     int count = 0;
     for (int i = 0; i < m.count; i++) {
+        if (i < sel->offset) continue; /* OFFSET: 앞 N행 건너뜀 */
         if (sel->limit >= 0 && count >= sel->limit) {
             break;
         }
@@ -739,6 +754,7 @@ static int emit_out_rows(const SelectStmt *sel, OutCell *outbuf, int outcount, F
     }
     int printed = 0;
     for (int i = 0; i < outcount; i++) {
+        if (i < sel->offset) continue; /* OFFSET */
         if (sel->limit >= 0 && printed >= sel->limit) break;
         OutCell *orow = outbuf + (size_t)i * sel->num_items;
         for (int k = 0; k < sel->num_items; k++) {
@@ -896,6 +912,7 @@ static int aggregate_rowset(const SelectStmt *sel, Value *rows, int n, int ncols
         }
         int printed = 0;
         for (int r = 0; r < n; r++) {
+            if (r < sel->offset) continue; /* OFFSET */
             if (sel->limit >= 0 && printed >= sel->limit) break;
             for (int k = 0; k < sel->num_items; k++) {
                 if (k) fprintf(out, " | ");
@@ -1395,16 +1412,16 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         fprintf(out, "\n");
     }
 
-    if (sel->num_order == 0) {
-        /* ORDER BY 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
+    if (sel->num_order == 0 && sel->offset == 0) {
+        /* ORDER BY/OFFSET 없음: 결합 행을 바로 출력하는 스트리밍 조인 */
         mjoin_descend(&m, 0);
         for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
         fprintf(out, "(%d행%s)\n", m.count, note);
         return 0;
     }
 
-    /* ORDER BY: 결합 행을 모아 정렬한 뒤 LIMIT만큼 출력한다(조인 위의 Sort 노드).
-     * 각 키를 결합 행에서의 위치로 해소한다(다중 컬럼 가능). */
+    /* ORDER BY나 OFFSET이 있으면 결합 행을 모은다(조인 위의 Sort 노드).
+     * ORDER BY 각 키를 결합 행에서의 위치로 해소한다(다중 컬럼 가능). */
     g_sort_n = sel->num_order;
     for (int k = 0; k < sel->num_order; k++) {
         const OrderKey *ok = &sel->order_keys[k];
@@ -1437,10 +1454,13 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
     mjoin_descend(&m, 0);
     for (int k = 1; k < m.ntabs; k++) hash_free(m.hash[k]);
 
-    qsort(m.matbuf, m.matcount, (size_t)comb * sizeof(Value), row_cmp);
+    if (sel->num_order > 0) {
+        qsort(m.matbuf, m.matcount, (size_t)comb * sizeof(Value), row_cmp);
+    }
 
     int printed = 0;
     for (int i = 0; i < m.matcount; i++) {
+        if (i < sel->offset) continue; /* OFFSET */
         if (sel->limit >= 0 && printed >= sel->limit) {
             break;
         }
@@ -1563,8 +1583,8 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
 
     db->used_index = 0;
 
-    /* ORDER BY나 LIMIT이 있으면 모았다가 정렬/자르는 경로로 간다. */
-    if (sel->num_order > 0 || sel->limit >= 0) {
+    /* ORDER BY/LIMIT/OFFSET이 있으면 모았다가 정렬/자르는 경로로 간다. */
+    if (sel->num_order > 0 || sel->limit >= 0 || sel->offset > 0) {
         return exec_select_sorted(t, tname, sel, out);
     }
 

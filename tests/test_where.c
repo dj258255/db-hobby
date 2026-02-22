@@ -158,6 +158,17 @@ int main(void) {
               strstr(o, "(2행"),
           "id NOT IN (picks) -> kim(1), park(3)");
     free(o);
+    /* 스칼라 서브쿼리: id = (SELECT ... ) -> 한 값과 비교 */
+    o = run(&db, "SELECT * FROM users WHERE id = (SELECT uid FROM picks WHERE uid = 2)");
+    CHECK(strstr(o, "lee") && !strstr(o, "kim") && !strstr(o, "amy") && strstr(o, "(1행"),
+          "id = (스칼라 서브쿼리) -> lee(2)");
+    free(o);
+    /* OFFSET: 정렬 후 앞 1행 건너뛰고 2행 (kim 건너뜀 -> lee, park) */
+    o = run(&db, "SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 1");
+    CHECK(strstr(o, "lee") && strstr(o, "park") && !strstr(o, "kim") && !strstr(o, "amy") &&
+              strstr(o, "(2행"),
+          "ORDER BY id LIMIT 2 OFFSET 1 -> lee, park");
+    free(o);
 
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");

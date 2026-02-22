@@ -18,7 +18,7 @@ typedef enum {
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
-    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN,
+    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN, TOK_OFFSET,
     TOK_ERROR
 } TokType;
 
@@ -68,6 +68,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "NULL")) return TOK_NULL;
     if (!strcasecmp(s, "DISTINCT")) return TOK_DISTINCT;
     if (!strcasecmp(s, "IN")) return TOK_IN;
+    if (!strcasecmp(s, "OFFSET")) return TOK_OFFSET;
     return TOK_IDENT;
 }
 
@@ -303,7 +304,22 @@ static void parse_and_group(Parser *p, AndGroup *g) {
             p_expect(p, TOK_NULL, "IS [NOT] 다음에 NULL이 필요합니다");
         } else {
             parse_where_op(p, &c->op);
-            parse_value(p, &c->val);
+            if (p->cur.type == TOK_LPAREN) { /* col <op> (SELECT ...) 스칼라 서브쿼리 */
+                p_advance(p); /* ( */
+                p_expect(p, TOK_SELECT, "( 다음에 SELECT 서브쿼리가 필요합니다");
+                SelectStmt *sub = calloc(1, sizeof(SelectStmt));
+                if (!sub) {
+                    p_fail(p, "메모리 부족");
+                    return;
+                }
+                parse_select_stmt(p, sub);
+                p_expect(p, TOK_RPAREN, "서브쿼리 뒤에 ) 가 필요합니다");
+                c->in_sub = 1;
+                c->scalar_sub = 1;
+                c->sub = sub;
+            } else {
+                parse_value(p, &c->val);
+            }
         }
         g->count++;
     } while (p_accept(p, TOK_AND));
@@ -526,6 +542,14 @@ static void parse_select_stmt(Parser *p, SelectStmt *s) {
             p_fail(p, "LIMIT 뒤에는 0 이상의 정수가 필요합니다");
         } else {
             s->limit = p->cur.int_val;
+            p_advance(p);
+        }
+    }
+    if (p_accept(p, TOK_OFFSET)) {
+        if (p->cur.type != TOK_INT || p->cur.int_val < 0) {
+            p_fail(p, "OFFSET 뒤에는 0 이상의 정수가 필요합니다");
+        } else {
+            s->offset = p->cur.int_val;
             p_advance(p);
         }
     }
