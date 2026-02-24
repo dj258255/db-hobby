@@ -29,7 +29,7 @@ static char *run(Database *db, const char *sql) {
 
 static void cleanup(const char *base) {
     char p[700];
-    const char *ext[] = {"t.tbl", "t.idx", "t.wal"};
+    const char *ext[] = {"t.tbl", "t.idx", "t.wal", "t.idx.wal"};
     unlink(base);
     for (size_t i = 0; i < sizeof(ext) / sizeof(ext[0]); i++) {
         snprintf(p, sizeof(p), "%s.%s", base, ext[i]);
@@ -57,10 +57,15 @@ int main(void) {
 
         db_close(&db); /* 크래시 흉내: 데이터엔 beta 없음, 로그엔 커밋된 채 남음 */
 
-        db_open(&db, path); /* wal_open이 로그를 redo */
+        db_open(&db, path); /* wal_open이 데이터·인덱스 로그를 둘 다 redo */
         o = run(&db, "SELECT * FROM t");
         CHECK(strstr(o, "alpha") && strstr(o, "beta"),
-              "크래시(커밋 후) -> 재시작 시 beta가 redo됨 (내구성)");
+              "크래시(커밋 후) -> 재시작 시 beta 데이터가 redo됨 (내구성)");
+        free(o);
+        /* WHERE id=2 는 인덱스 점 조회 -> 인덱스 항목까지 복구됐는지 확인 */
+        o = run(&db, "SELECT * FROM t WHERE id = 2");
+        CHECK(strstr(o, "beta") && strstr(o, "인덱스 사용"),
+              "크래시 후 인덱스도 redo됨 (id=2 인덱스 조회로 beta)");
         free(o);
         db_close(&db);
     }

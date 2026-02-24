@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "pager.h"
 #include "bufpool.h"
+#include "wal.h"
 
 /*
  * B+Tree 인덱스 — 키 -> 값을 O(log n)에 찾는다. (InnoDB clustered index,
@@ -13,7 +14,8 @@
  * 가운데 키를 부모로 올린다(split). 부모도 꽉 차면 또 쪼개지며, 루트까지
  * 올라가면 트리 높이가 1 자란다 — 그래서 항상 균형이 유지된다.
  *
- * 테이블 데이터와 섞이지 않도록 인덱스는 자기 파일을 따로 쓴다.
+ * 테이블 데이터와 섞이지 않도록 인덱스는 자기 파일(.idx)을 따로 쓰고, 데이터 파일처럼
+ * WAL(.idx.wal)로 감싼다 — 인덱스 페이저는 wal.data 안에 있다.
  * page 0 = 메타(루트 페이지 id 저장), page 1+ = 노드들.
  *
  * 학습용으로 키·값은 int64다. minidb에서는 키=INT 컬럼 값, 값=RID를 int64로 인코딩.
@@ -23,12 +25,12 @@ typedef int64_t bkey_t;
 typedef int64_t bval_t;
 
 typedef struct {
-    Pager pager;
+    Wal wal; /* 인덱스 파일(.idx)을 WAL로 감싼다. 페이저는 wal.data. */
     BufferPool *bp;
     page_id_t root;
 } BTree;
 
-/* 인덱스 파일을 연다(없으면 빈 트리 생성). 0 성공, -1 실패. */
+/* 인덱스 파일을 연다(없으면 빈 트리 생성). 로그 파일은 <path>.wal. 0 성공, -1 실패. */
 int btree_open(BTree *bt, const char *path);
 
 /* flush하고 닫는다. */

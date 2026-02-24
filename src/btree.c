@@ -1,6 +1,7 @@
 #include "btree.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /* 노드당 최대 키 수. 학습용으로 작게 잡아 분할/다단계가 잘 보이게 한다.
@@ -32,15 +33,18 @@ static void write_root(BTree *bt, page_id_t root) {
 }
 
 int btree_open(BTree *bt, const char *path) {
-    if (pager_open(&bt->pager, path) != 0) {
+    char wp[512];
+    snprintf(wp, sizeof(wp), "%s.wal", path);
+    if (wal_open(&bt->wal, path, wp) != 0) { /* 인덱스 페이저(wal.data)를 열고 복구 */
         return -1;
     }
-    bt->bp = bufpool_create(&bt->pager, 32);
+    /* dirty 노드가 WAL stage될 때까지 메모리에 머물러야 하므로(no-steal), stage 상한 이하로 둔다. */
+    bt->bp = bufpool_create(&bt->wal.data, 32);
     if (!bt->bp) {
-        pager_close(&bt->pager);
+        wal_close(&bt->wal);
         return -1;
     }
-    if (bt->pager.num_pages == 0) {
+    if (bt->wal.data.num_pages == 0) {
         /* 새 인덱스: page 0 = 메타, page 1 = 빈 루트 리프 */
         page_id_t meta_pid, root_pid;
         bufpool_new_page(bt->bp, &meta_pid); /* page 0 */
@@ -65,7 +69,7 @@ void btree_close(BTree *bt) {
         bufpool_flush_all(bt->bp);
         bufpool_destroy(bt->bp);
     }
-    pager_close(&bt->pager);
+    wal_close(&bt->wal);
 }
 
 /* pid 서브트리에 (key,val)을 넣는다. 노드가 분할되면 1을 반환하고 올라갈 분리키
