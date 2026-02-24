@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (209 checks across 14 suites).
+covered by tests (210 checks across 14 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -68,11 +68,13 @@ in its own files, and a catalog file lists which tables exist:
 ```
 mydb              catalog -- table names + schemas (like pg_class)
 mydb.users.tbl    users rows  (heap)
+mydb.users.wal    write-ahead log for the heap (commit atomicity + crash recovery)
 mydb.users.idx    users PK index (B+Tree)
-mydb.users.wal    users write-ahead log (commit atomicity + crash recovery)
+mydb.users.idx.wal  write-ahead log for the index
 mydb.orders.tbl   orders rows
+mydb.orders.wal
 mydb.orders.idx   orders PK index
-mydb.orders.wal   orders write-ahead log
+mydb.orders.idx.wal
 ```
 
 ## SQL supported
@@ -115,10 +117,10 @@ for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
 DISTINCT` dedupes output rows. `IN (SELECT ...)` runs an uncorrelated subquery
 once into a value set, then tests membership. Writes go through a **write-ahead
 log**: a commit (explicit or per-statement autocommit) stages the transaction's
-dirty data pages, logs them with a commit marker + `fsync`, and only then applies
-them to the table file -- so a crash mid-commit is recovered on reopen (redo if
-the marker is present, discard if not). Rollback discards dirty pages and truncates
-the data file.
+dirty pages -- for both the heap and the B+Tree index -- logs them with a commit
+marker + `fsync`, and only then applies them to the file, so a crash mid-commit is
+recovered on reopen (redo if the marker is present, discard if not). Rollback
+discards dirty pages and truncates the files.
 
 See `DESIGN.md` for the full layer map and build order.
 
