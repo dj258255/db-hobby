@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (207 checks across 13 suites).
+covered by tests (209 checks across 14 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -58,7 +58,7 @@ Built bottom-up; each layer sits on the one below it.
 | `sql.c` | hand-written lexer + recursive-descent parser (SQL -> AST) | every DB frontend |
 | `db.c` | executor: tuple codec, multi-table catalog, joins (NLJ/index/hash), aggregates | pg_catalog, executor |
 | `btree.c` | on-disk B+Tree index for O(log n) lookups, with node splits | InnoDB clustered index |
-| `wal.c` | write-ahead log: durability and atomicity, with crash recovery | PG WAL / redo log |
+| `wal.c` | write-ahead log on each table's data file: atomic commit + crash recovery | PG WAL / redo log |
 
 ### Storage layout
 
@@ -69,8 +69,10 @@ in its own files, and a catalog file lists which tables exist:
 mydb              catalog -- table names + schemas (like pg_class)
 mydb.users.tbl    users rows  (heap)
 mydb.users.idx    users PK index (B+Tree)
+mydb.users.wal    users write-ahead log (commit atomicity + crash recovery)
 mydb.orders.tbl   orders rows
 mydb.orders.idx   orders PK index
+mydb.orders.wal   orders write-ahead log
 ```
 
 ## SQL supported
@@ -111,9 +113,12 @@ the one place `NULL` appears (it never lives in stored rows), so `COUNT(*)` coun
 those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
 for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
 DISTINCT` dedupes output rows. `IN (SELECT ...)` runs an uncorrelated subquery
-once into a value set, then tests membership. Transactions use a
-no-steal + force-at-commit policy across every table and roll back both the heap
-and the index.
+once into a value set, then tests membership. Writes go through a **write-ahead
+log**: a commit (explicit or per-statement autocommit) stages the transaction's
+dirty data pages, logs them with a commit marker + `fsync`, and only then applies
+them to the table file -- so a crash mid-commit is recovered on reopen (redo if
+the marker is present, discard if not). Rollback discards dirty pages and truncates
+the data file.
 
 See `DESIGN.md` for the full layer map and build order.
 
@@ -125,10 +130,11 @@ OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
 to 4 tables (`INNER` and `LEFT`, aliases supported, so self-joins work);
 projection, aggregation, `GROUP BY`, and `HAVING` work over a single table or a
 join result; `NULL` only arises from `LEFT JOIN` (no nullable stored columns); subqueries are
-uncorrelated and single-table/single-column; and there is no isolation/concurrency
-(one transaction at a time). B+Tree deletion isn't
-implemented (deleted rows are tombstoned in the heap, so a stale index entry is
-harmless). These are noted in the code where they matter.
+uncorrelated and single-table/single-column; there is no isolation/concurrency
+(one transaction at a time); the WAL protects the data files but not the index
+(`.idx`) yet, and a transaction's dirty pages must fit in the buffer pool. B+Tree
+deletion isn't implemented (deleted rows are tombstoned in the heap, so a stale
+index entry is harmless). These are noted in the code where they matter.
 
 ## License
 
