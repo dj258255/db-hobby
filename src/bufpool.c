@@ -154,6 +154,21 @@ int bufpool_flush_all(BufferPool *bp) {
     return 0;
 }
 
+int bufpool_flush_cb(BufferPool *bp, bufpool_sink_fn sink, void *ctx) {
+    int n = 0;
+    for (size_t i = 0; i < bp->num_frames; i++) {
+        Frame *f = &bp->frames[i];
+        if (f->valid && f->dirty) {
+            if (sink(f->page_id, f->data, ctx) != 0) {
+                return -1;
+            }
+            f->dirty = 0; /* WAL이 받아갔으니 풀에선 clean. 적용은 WAL이 한다. */
+            n++;
+        }
+    }
+    return n;
+}
+
 void bufpool_set_no_steal(BufferPool *bp, int on) {
     bp->no_steal = on;
 }

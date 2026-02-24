@@ -110,19 +110,23 @@ static void catalog_write(Database *db) {
     fclose(f);
 }
 
-/* 테이블 파일(.tbl, .idx)을 열어 Heap/B+Tree를 준비한다. schema는 미리 채워둘 것. */
+/* 테이블 파일(.tbl, .idx, .wal)을 열어 Heap/B+Tree를 준비한다. schema는 미리 채워둘 것.
+ * wal_open이 .wal 로그를 읽어 크래시 복구(redo/discard)를 먼저 수행한다. */
 static int table_open_files(Table *t, const char *dbpath) {
-    char p[700];
+    char p[700], wp[710];
     snprintf(p, sizeof(p), "%s.%s.tbl", dbpath, t->schema.table);
-    if (pager_open(&t->pager, p) != 0) {
+    snprintf(wp, sizeof(wp), "%s.%s.wal", dbpath, t->schema.table);
+    if (wal_open(&t->wal, p, wp) != 0) { /* 데이터 페이저(wal.data)를 열고 복구 */
         return -1;
     }
-    t->bp = bufpool_create(&t->pager, 16);
+    /* 데이터 페이지를 캐시할 버퍼 풀. WAL을 거쳐 커밋하려면 dirty 페이지가 새지 않게
+     * stage될 때까지 메모리에 머물러야 하므로, stage 상한(WAL_MAX_STAGED)만큼 프레임을 둔다. */
+    t->bp = bufpool_create(&t->wal.data, WAL_MAX_STAGED);
     if (!t->bp) {
-        pager_close(&t->pager);
+        wal_close(&t->wal);
         return -1;
     }
-    heap_init(&t->heap, t->bp, &t->pager, 0); /* 테이블 파일은 순수 힙: page 0부터 */
+    heap_init(&t->heap, t->bp, &t->wal.data, 0); /* 테이블 파일은 순수 힙: page 0부터 */
     t->has_index = 0;
     if (t->schema.num_columns > 0 && t->schema.columns[0].type == COL_INT) {
         char ip[700];
@@ -144,7 +148,7 @@ static void table_close_files(Table *t) {
         bufpool_destroy(t->bp);
         t->bp = NULL;
     }
-    pager_close(&t->pager);
+    wal_close(&t->wal);
 }
 
 static Table *find_table(Database *db, const char *name) {
@@ -335,11 +339,13 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
         return -1;
     }
     /* 카탈로그엔 없지만 디스크에 옛 파일이 남아 있을 수 있으니 깨끗이 지우고 시작한다. */
-    char tp[700], ip[700];
+    char tp[700], ip[700], wp[710];
     snprintf(tp, sizeof(tp), "%s.%s.tbl", db->path, c->table);
     snprintf(ip, sizeof(ip), "%s.%s.idx", db->path, c->table);
+    snprintf(wp, sizeof(wp), "%s.%s.wal", db->path, c->table);
     unlink(tp);
     unlink(ip);
+    unlink(wp);
 
     Table *t = &db->tables[db->num_tables];
     t->schema = *c;
@@ -1734,10 +1740,30 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
 }
 
 /* ------------- 트랜잭션 -------------
- * no-steal + 커밋 시 force. 모든 테이블에 걸쳐 적용한다. 트랜잭션 중 바뀐 페이지는
- * 버퍼 풀 메모리에만 두고, COMMIT이면 flush+fsync(내구), ROLLBACK이면 dirty 프레임을
- * 버리고 할당분을 잘라 디스크 원본으로 되돌린다. 힙과 인덱스 둘 다 처리한다.
- * (DDL인 CREATE는 즉시 반영되며 트랜잭션에 묶이지 않는다 — 많은 DB의 동작과 같다.) */
+ * 데이터(.tbl)는 이제 WAL을 통해 커밋한다(write-ahead): 트랜잭션 중 바뀐 페이지는
+ * no-steal로 버퍼 풀에만 두고, COMMIT이면 그 dirty 페이지들을 WAL에 stage한 뒤
+ * wal_commit(로그+마커+fsync -> 데이터 적용 -> 로그 비움)으로 원자적으로 확정한다.
+ * 크래시가 커밋 도중 나도, 다음 wal_open이 마커 유무로 redo/discard를 결정한다.
+ * ROLLBACK은 dirty를 버리고 할당분을 잘라 되돌린다(아무것도 로그에 안 적었다).
+ * (인덱스(.idx)는 아직 WAL이 아니라 flush+fsync로 처리한다 — 같은 패턴으로 확장 가능.
+ *  DDL인 CREATE는 즉시 반영되며 트랜잭션에 묶이지 않는다.) */
+
+static int wal_stage_sink(page_id_t pid, const void *data, void *ctx) {
+    return wal_stage((Wal *)ctx, pid, data);
+}
+
+/* 테이블 데이터의 dirty 페이지를 WAL로 보내 원자적으로 커밋한다. */
+static int table_data_commit(Table *t) {
+    wal_begin(&t->wal);
+    int n = bufpool_flush_cb(t->bp, wal_stage_sink, &t->wal);
+    if (n < 0) {
+        return -1;
+    }
+    if (n > 0) {
+        return wal_commit(&t->wal);
+    }
+    return 0; /* 바뀐 게 없으면 로그 쓸 것도 없다 */
+}
 
 static int exec_begin(Database *db, FILE *out) {
     if (db->in_txn) {
@@ -1748,7 +1774,8 @@ static int exec_begin(Database *db, FILE *out) {
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
         bufpool_set_no_steal(t->bp, 1);
-        t->txn_data_pages = t->pager.num_pages;
+        wal_begin(&t->wal);
+        t->txn_data_pages = t->wal.data.num_pages;
         if (t->has_index) {
             bufpool_set_no_steal(t->index.bp, 1);
             t->txn_index_pages = t->index.pager.num_pages;
@@ -1765,8 +1792,7 @@ static int exec_commit(Database *db, FILE *out) {
     }
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
-        bufpool_flush_all(t->bp);
-        fsync(t->pager.fd);
+        table_data_commit(t); /* 데이터: WAL로 원자 커밋 */
         bufpool_set_no_steal(t->bp, 0);
         if (t->has_index) {
             bufpool_flush_all(t->index.bp);
@@ -1787,7 +1813,8 @@ static int exec_rollback(Database *db, FILE *out) {
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
         bufpool_discard_dirty(t->bp);
-        pager_truncate(&t->pager, t->txn_data_pages);
+        pager_truncate(&t->wal.data, t->txn_data_pages);
+        wal_begin(&t->wal); /* 혹시 stage된 것도 버린다(로그엔 아직 안 씀) */
         bufpool_set_no_steal(t->bp, 0);
         if (t->has_index) {
             bufpool_discard_dirty(t->index.bp);
@@ -1856,6 +1883,16 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         statement_free(&st);
         return -1;
     }
+    /* autocommit: 트랜잭션 밖 DML은 이 문장 하나가 곧 한 트랜잭션이다. WAL로 커밋될
+     * 때까지 데이터 dirty 페이지가 디스크로 새지 않게 no-steal을 켠다. */
+    int autocommit = !db->in_txn &&
+                     (st.type == STMT_CREATE || st.type == STMT_INSERT ||
+                      st.type == STMT_DELETE || st.type == STMT_UPDATE);
+    if (autocommit) {
+        for (int i = 0; i < db->num_tables; i++) {
+            bufpool_set_no_steal(db->tables[i].bp, 1);
+        }
+    }
     int rc;
     switch (st.type) {
         case STMT_CREATE: rc = exec_create(db, &st.create, out); break;
@@ -1868,16 +1905,20 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
         default: rc = -1;
     }
-    /* autocommit: 트랜잭션 밖에서 성공한 변경은 즉시 디스크에 반영해 클린으로 만든다.
-     * 그래야 이후 ROLLBACK이 이 변경까지 되돌리지 않는다. */
-    if (rc == 0 && !db->in_txn &&
-        (st.type == STMT_CREATE || st.type == STMT_INSERT || st.type == STMT_DELETE ||
-         st.type == STMT_UPDATE)) {
+    if (autocommit) {
         for (int i = 0; i < db->num_tables; i++) {
-            bufpool_flush_all(db->tables[i].bp);
-            if (db->tables[i].has_index) {
-                bufpool_flush_all(db->tables[i].index.bp);
+            Table *t = &db->tables[i];
+            if (rc == 0) {
+                table_data_commit(t); /* 데이터: WAL로 원자 커밋(로그+마커+fsync->적용) */
+                if (t->has_index) {
+                    bufpool_flush_all(t->index.bp);
+                    fsync(t->index.pager.fd);
+                }
+            } else {
+                bufpool_discard_dirty(t->bp); /* 실패한 문장의 데이터 변경은 버린다 */
+                wal_begin(&t->wal);
             }
+            bufpool_set_no_steal(t->bp, 0);
         }
     }
     statement_free(&st); /* 서브쿼리·IN 집합 해제 */

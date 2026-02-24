@@ -6,6 +6,7 @@
 #include "bufpool.h"
 #include "heap.h"
 #include "btree.h"
+#include "wal.h"
 #include "sql.h"
 
 /*
@@ -23,6 +24,7 @@
  *   <path>            카탈로그 — 어떤 테이블이 있고 스키마가 뭔지 (pg_class 격)
  *   <path>.<tbl>.tbl  그 테이블의 행 (Heap)
  *   <path>.<tbl>.idx  그 테이블의 PK 인덱스 (B+Tree)
+ *   <path>.<tbl>.wal  그 테이블 데이터의 쓰기 선행 로그 (커밋 원자성·크래시 복구)
  *
  * 학습용 단순화: 첫 컬럼(INT)을 유일 PK로 보고 인덱싱한다. 단일 INNER JOIN까지.
  */
@@ -31,7 +33,7 @@
 
 typedef struct {
     CreateStmt schema;
-    Pager pager;
+    Wal wal; /* 데이터 파일(.tbl)을 WAL로 감싼다. 데이터 페이저는 wal.data 안에 있다. */
     BufferPool *bp;
     Heap heap;
     BTree index; /* 첫 컬럼(INT PK) 인덱스 */

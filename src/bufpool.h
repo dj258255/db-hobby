@@ -40,6 +40,12 @@ void bufpool_unpin(BufferPool *bp, page_id_t page_id, int is_dirty);
 /* 모든 dirty 페이지를 디스크에 쓴다. 성공 0, 실패 -1. */
 int bufpool_flush_all(BufferPool *bp);
 
+/* dirty 페이지마다 sink(page_id, data, ctx)를 부르고, sink가 0을 주면 그 프레임을
+ * clean으로 표시한다(디스크엔 직접 안 쓴다 — WAL로 보내기 위함). 처리한 dirty 수를
+ * 반환, sink 실패 시 -1. 페이지는 풀에 그대로 캐시된다. */
+typedef int (*bufpool_sink_fn)(page_id_t page_id, const void *data, void *ctx);
+int bufpool_flush_cb(BufferPool *bp, bufpool_sink_fn sink, void *ctx);
+
 /* 트랜잭션용 no-steal 모드. 켜면 교체 시 dirty 프레임을 victim으로 안 고른다
  * (커밋 안 된 페이지가 디스크로 새는 걸 막는다). */
 void bufpool_set_no_steal(BufferPool *bp, int on);
