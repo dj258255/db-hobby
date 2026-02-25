@@ -15,6 +15,7 @@ covered by tests (218 checks across 14 suites).
 
 ```sh
 make test            # build and run the test suite
+make bench           # build (-O2) and run the benchmark (index vs scan, fsync cost)
 make repl            # build the REPL
 ./build/minidb my.db # open (or create) a database and type SQL
 ```
