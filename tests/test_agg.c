@@ -97,6 +97,27 @@ int main(void) {
           "투영 ORDER BY amt DESC LIMIT 1 -> 300");
     free(o);
 
+    /* 다중 키 ORDER BY: 첫 키(dept) 동률을 둘째 키(amt)가 가른다 */
+    o = run(&db, "SELECT * FROM sales ORDER BY dept ASC, amt DESC");
+    {
+        char *e2 = strstr(o, "eng | 200"), *e1 = strstr(o, "eng | 100");
+        char *s3 = strstr(o, "sales | 300"), *s15 = strstr(o, "sales | 150"),
+             *s5 = strstr(o, "sales | 50");
+        CHECK(e2 && e1 && s3 && s15 && s5 && e2 < e1 && e1 < s3 && s3 < s15 && s15 < s5,
+              "ORDER BY dept ASC, amt DESC -> eng(200,100), sales(300,150,50)");
+    }
+    free(o);
+    /* 키마다 방향이 독립인지: dept DESC, amt ASC */
+    o = run(&db, "SELECT * FROM sales ORDER BY dept DESC, amt ASC");
+    {
+        char *s5 = strstr(o, "sales | 50"), *s15 = strstr(o, "sales | 150"),
+             *s3 = strstr(o, "sales | 300");
+        char *e1 = strstr(o, "eng | 100"), *e2 = strstr(o, "eng | 200");
+        CHECK(s5 && s15 && s3 && e1 && e2 && s5 < s15 && s15 < s3 && s3 < e1 && e1 < e2,
+              "ORDER BY dept DESC, amt ASC -> sales(50,150,300), eng(100,200)");
+    }
+    free(o);
+
     /* GROUP BY + ORDER BY <위치> DESC: 집계값 기준 정렬 (count: sales 3 > eng 2) */
     o = run(&db, "SELECT dept, COUNT(*) FROM sales GROUP BY dept ORDER BY 2 DESC");
     {
