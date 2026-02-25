@@ -20,6 +20,8 @@
  *                        [GROUP BY <col>] [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
  *   <item>   = <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
  *   <cond>   = <colref> <op> <val>,  <op> = =, !=, <, >, <=, >=
+ *            | <colref> [NOT] BETWEEN <val> AND <val>   (양끝 포함)
+ *            | <colref> [NOT] LIKE '<패턴>'              (% = 임의 길이, _ = 한 글자)
  *   <colref> = [<table>.]<col>
  */
 
@@ -29,10 +31,12 @@
 
 typedef enum { COL_INT, COL_TEXT } ColType;
 
-/* WHERE 비교 연산자. IS_NULL/IS_NOT_NULL은 값 피연산자가 없다. */
+/* WHERE 비교 연산자. IS_NULL/IS_NOT_NULL은 값 피연산자가 없다.
+ * LIKE/NOT_LIKE는 val에 패턴(%, _ 와일드카드)을 담는다. BETWEEN은 파서가 >= AND <= 로 푼다. */
 typedef enum {
     CMP_EQ, CMP_NE, CMP_LT, CMP_GT, CMP_LE, CMP_GE,
-    CMP_IS_NULL, CMP_IS_NOT_NULL
+    CMP_IS_NULL, CMP_IS_NOT_NULL,
+    CMP_LIKE, CMP_NOT_LIKE
 } CmpOp;
 
 /* VAL_NULL은 저장 행엔 안 생기고, LEFT JOIN의 미매칭 오른쪽 컬럼 등 결과에만 등장한다. */

@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (210 checks across 14 suites).
+covered by tests (218 checks across 14 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -95,6 +95,8 @@ BEGIN | COMMIT | ROLLBACK
 <cond>   is  <colref> <op> <value>  |  <colref> <op> (SELECT <col> FROM <t> [WHERE ...])
                                    |  <colref> IS [NOT] NULL
                                    |  <colref> [NOT] IN (SELECT <col> FROM <t> [WHERE ...])
+                                   |  <colref> [NOT] BETWEEN <value> AND <value>
+                                   |  <colref> [NOT] LIKE '<pattern>'   (% = any run, _ = one char)
 <op>     is one of  =  !=  <  >  <=  >=
 <colref> is  [<table>.]<col>
 ```
@@ -115,7 +117,10 @@ the one place `NULL` appears (it never lives in stored rows), so `COUNT(*)` coun
 those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
 for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
 DISTINCT` dedupes output rows. `IN (SELECT ...)` runs an uncorrelated subquery
-once into a value set, then tests membership. Writes go through a **write-ahead
+once into a value set, then tests membership. `BETWEEN a AND b` is desugared at
+parse time into `>= a AND <= b` (inclusive); `LIKE`/`NOT LIKE` match `%` (any run)
+and `_` (one char) with a backtracking matcher -- both run as a full scan, not via
+the index. Writes go through a **write-ahead
 log**: a commit (explicit or per-statement autocommit) stages the transaction's
 dirty pages -- for both the heap and the B+Tree index -- logs them with a commit
 marker + `fsync`, and only then applies them to the file, so a crash mid-commit is

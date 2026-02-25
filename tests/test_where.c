@@ -170,6 +170,49 @@ int main(void) {
           "ORDER BY id LIMIT 2 OFFSET 1 -> lee, park");
     free(o);
 
+    /* BETWEEN: 양끝 포함. (col >= a) AND (col <= b)로 풀린다 */
+    o = run(&db, "SELECT * FROM users WHERE id BETWEEN 2 AND 3");
+    CHECK(strstr(o, "lee") && strstr(o, "park") && !strstr(o, "kim") && !strstr(o, "amy") &&
+              strstr(o, "(2행"),
+          "id BETWEEN 2 AND 3 -> lee, park (양끝 포함)");
+    free(o);
+    o = run(&db, "SELECT * FROM users WHERE id BETWEEN 1 AND 4");
+    CHECK(strstr(o, "kim") && strstr(o, "lee") && strstr(o, "park") && strstr(o, "amy") &&
+              strstr(o, "(4행"),
+          "id BETWEEN 1 AND 4 -> 전부");
+    free(o);
+    /* BETWEEN과 다른 조건을 AND로 (BETWEEN이 이미 2조건이라 총 3조건) */
+    o = run(&db, "SELECT * FROM users WHERE id BETWEEN 2 AND 4 AND name != 'amy'");
+    CHECK(strstr(o, "lee") && strstr(o, "park") && !strstr(o, "amy") && !strstr(o, "kim") &&
+              strstr(o, "(2행"),
+          "id BETWEEN 2 AND 4 AND name != 'amy' -> lee, park");
+    free(o);
+
+    /* LIKE: %=임의 길이, _=한 글자 */
+    o = run(&db, "SELECT * FROM users WHERE name LIKE 'p%'");
+    CHECK(strstr(o, "park") && !strstr(o, "kim") && !strstr(o, "amy") && strstr(o, "(1행"),
+          "name LIKE 'p%' -> park");
+    free(o);
+    o = run(&db, "SELECT * FROM users WHERE name LIKE '%a%'");
+    CHECK(strstr(o, "park") && strstr(o, "amy") && !strstr(o, "kim") && !strstr(o, "lee") &&
+              strstr(o, "(2행"),
+          "name LIKE '%a%' -> park, amy");
+    free(o);
+    o = run(&db, "SELECT * FROM users WHERE name LIKE '_ee'");
+    CHECK(strstr(o, "lee") && !strstr(o, "kim") && !strstr(o, "park") && strstr(o, "(1행"),
+          "name LIKE '_ee' -> lee (정확히 세 글자)");
+    free(o);
+    /* NOT LIKE */
+    o = run(&db, "SELECT * FROM users WHERE name NOT LIKE '%a%'");
+    CHECK(strstr(o, "kim") && strstr(o, "lee") && !strstr(o, "park") && !strstr(o, "amy") &&
+              strstr(o, "(2행"),
+          "name NOT LIKE '%a%' -> kim, lee");
+    free(o);
+    /* LIKE는 풀 스캔(인덱스 점/범위 조회 대상 아님) */
+    o = run(&db, "SELECT * FROM users WHERE name LIKE 'k%'");
+    CHECK(db.used_index == 0, "LIKE는 인덱스 안 씀(풀 스캔)");
+    free(o);
+
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");
     CHECK(strstr(o, "2개 행 삭제됨") != NULL, "DELETE WHERE id >= 3 -> 2개 삭제");

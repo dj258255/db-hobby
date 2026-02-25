@@ -174,9 +174,40 @@ static int cmp_apply(CmpOp op, long sign) {
         case CMP_LE: return sign <= 0;
         case CMP_GE: return sign >= 0;
         case CMP_IS_NULL:     /* cond_eval에서 따로 처리 */
-        case CMP_IS_NOT_NULL: return 0;
+        case CMP_IS_NOT_NULL:
+        case CMP_LIKE:        /* LIKE류는 like_match로 따로 처리 */
+        case CMP_NOT_LIKE: return 0;
     }
     return 0;
+}
+
+/* SQL LIKE 패턴 매칭. '%' = 임의 길이(0+) 문자열, '_' = 정확히 한 글자.
+ * 그 외 문자는 그대로 일치해야 한다(대소문자 구분 — minidb TEXT 비교가 strcmp라 일관).
+ *
+ * 백트래킹 two-pointer 방식: '%'를 만나면 그 위치(star)와 그때의 입력 위치(ss)를
+ * 기억해 두고 일단 '%'가 0글자를 먹었다고 보고 전진한다. 뒤에서 막히면 star로
+ * 되돌아가 '%'가 한 글자 더 먹은 셈 치고(ss++) 다시 시도한다. 재귀 없이 O(n*m).
+ * (ESCAPE 절은 학습 범위 밖이라 '\%' 같은 이스케이프는 지원하지 않는다.) */
+static int like_match(const char *s, const char *pat) {
+    const char *star = NULL, *ss = NULL;
+    while (*s) {
+        if (*pat == '%') {
+            star = pat++;   /* '%' 위치 기억, 일단 0글자 먹은 걸로 보고 패턴만 전진 */
+            ss = s;
+        } else if (*pat == '_' || *pat == *s) {
+            pat++;
+            s++;
+        } else if (star) {
+            pat = star + 1; /* 막혔다 -> 마지막 '%'가 한 글자 더 먹은 셈 치고 재시도 */
+            s = ++ss;
+        } else {
+            return 0;
+        }
+    }
+    while (*pat == '%') {
+        pat++; /* 남은 패턴이 전부 '%'면 빈 문자열에 매칭되니 건너뛴다 */
+    }
+    return *pat == '\0';
 }
 
 /* 한 스키마에서 [qtbl.]col 에 해당하는 셀을 찾는다. 없으면 NULL.
@@ -237,6 +268,14 @@ static int cond_eval(const Value *cell, const Condition *cond) {
     }
     if (!cell) {
         return 0;
+    }
+    /* col [NOT] LIKE '패턴' — TEXT끼리만, 와일드카드 매칭 */
+    if (cond->op == CMP_LIKE || cond->op == CMP_NOT_LIKE) {
+        if (cell->type != VAL_TEXT || cond->val.type != VAL_TEXT) {
+            return 0;
+        }
+        int m = like_match(cell->text_val, cond->val.text_val);
+        return cond->op == CMP_NOT_LIKE ? !m : m;
     }
     const Value *wv = &cond->val;
     if (cell->type == VAL_INT && wv->type == VAL_INT) {

@@ -18,7 +18,7 @@ typedef enum {
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
-    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN, TOK_OFFSET,
+    TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN, TOK_OFFSET, TOK_BETWEEN, TOK_LIKE,
     TOK_ERROR
 } TokType;
 
@@ -69,6 +69,8 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "DISTINCT")) return TOK_DISTINCT;
     if (!strcasecmp(s, "IN")) return TOK_IN;
     if (!strcasecmp(s, "OFFSET")) return TOK_OFFSET;
+    if (!strcasecmp(s, "BETWEEN")) return TOK_BETWEEN;
+    if (!strcasecmp(s, "LIKE")) return TOK_LIKE;
     return TOK_IDENT;
 }
 
@@ -282,11 +284,21 @@ static void parse_and_group(Parser *p, AndGroup *g) {
         }
         Condition *c = &g->conds[g->count];
         parse_colref(p, c->tbl, c->col);
-        int negate_in = p_accept(p, TOK_NOT); /* NOT IN */
-        if (negate_in) {
-            p_expect(p, TOK_IN, "NOT 다음에 IN이 필요합니다");
+        int negate = p_accept(p, TOK_NOT); /* NOT IN / NOT LIKE */
+        if (negate) { /* NOT 다음엔 IN 또는 LIKE만 온다 */
+            if (p->cur.type != TOK_IN && p->cur.type != TOK_LIKE) {
+                p_fail(p, "NOT 다음에 IN 또는 LIKE가 필요합니다");
+                return;
+            }
         }
-        if (negate_in || p_accept(p, TOK_IN)) { /* col [NOT] IN (SELECT ...) 서브쿼리 */
+        if (p_accept(p, TOK_LIKE)) { /* col [NOT] LIKE '패턴' — %, _ 와일드카드 */
+            c->op = negate ? CMP_NOT_LIKE : CMP_LIKE;
+            parse_value(p, &c->val);
+            if (c->val.type != VAL_TEXT) {
+                p_fail(p, "LIKE 패턴은 문자열이어야 합니다");
+                return;
+            }
+        } else if (p_accept(p, TOK_IN)) { /* col [NOT] IN (SELECT ...) 서브쿼리 */
             p_expect(p, TOK_LPAREN, "IN 다음에 ( 가 필요합니다");
             p_expect(p, TOK_SELECT, "IN ( 다음에 SELECT 서브쿼리가 필요합니다");
             SelectStmt *sub = calloc(1, sizeof(SelectStmt));
@@ -297,8 +309,24 @@ static void parse_and_group(Parser *p, AndGroup *g) {
             parse_select_stmt(p, sub);
             p_expect(p, TOK_RPAREN, "서브쿼리 뒤에 ) 가 필요합니다");
             c->in_sub = 1;
-            c->in_negate = negate_in;
+            c->in_negate = negate;
             c->sub = sub;
+        } else if (p_accept(p, TOK_BETWEEN)) {
+            /* col BETWEEN a AND b 는 문법 설탕 — (col >= a) AND (col <= b)로 푼다.
+             * 양끝 포함(inclusive). 두 번째 조건을 같은 AND 묶음에 직접 더한다. */
+            c->op = CMP_GE;
+            parse_value(p, &c->val);
+            p_expect(p, TOK_AND, "BETWEEN <값> 다음에 AND가 필요합니다");
+            g->count++;
+            if (g->count >= SQL_MAX_CONDS) {
+                p_fail(p, "AND 조건이 너무 많습니다");
+                return;
+            }
+            Condition *c2 = &g->conds[g->count];
+            snprintf(c2->tbl, SQL_NAME_LEN, "%s", c->tbl);
+            snprintf(c2->col, SQL_NAME_LEN, "%s", c->col);
+            c2->op = CMP_LE;
+            parse_value(p, &c2->val);
         } else if (p_accept(p, TOK_IS)) { /* IS [NOT] NULL — 값 없는 조건 */
             c->op = p_accept(p, TOK_NOT) ? CMP_IS_NOT_NULL : CMP_IS_NULL;
             p_expect(p, TOK_NULL, "IS [NOT] 다음에 NULL이 필요합니다");
