@@ -298,19 +298,48 @@ static void parse_and_group(Parser *p, AndGroup *g) {
                 p_fail(p, "LIKE 패턴은 문자열이어야 합니다");
                 return;
             }
-        } else if (p_accept(p, TOK_IN)) { /* col [NOT] IN (SELECT ...) 서브쿼리 */
+        } else if (p_accept(p, TOK_IN)) { /* col [NOT] IN (...) — 서브쿼리 또는 값 목록 */
             p_expect(p, TOK_LPAREN, "IN 다음에 ( 가 필요합니다");
-            p_expect(p, TOK_SELECT, "IN ( 다음에 SELECT 서브쿼리가 필요합니다");
-            SelectStmt *sub = calloc(1, sizeof(SelectStmt));
-            if (!sub) {
-                p_fail(p, "메모리 부족");
-                return;
+            if (p->cur.type == TOK_SELECT) { /* col [NOT] IN (SELECT ...) 서브쿼리 */
+                p_advance(p); /* SELECT */
+                SelectStmt *sub = calloc(1, sizeof(SelectStmt));
+                if (!sub) {
+                    p_fail(p, "메모리 부족");
+                    return;
+                }
+                parse_select_stmt(p, sub);
+                p_expect(p, TOK_RPAREN, "서브쿼리 뒤에 ) 가 필요합니다");
+                c->in_sub = 1;
+                c->in_negate = negate;
+                c->sub = sub;
+            } else { /* col [NOT] IN (v1, v2, ...) — 값 목록을 파싱 때 바로 in_set에 채운다 */
+                int cap = 8, n = 0;
+                Value *set = malloc(sizeof(Value) * cap);
+                if (!set) {
+                    p_fail(p, "메모리 부족");
+                    return;
+                }
+                do {
+                    if (n >= cap) {
+                        cap *= 2;
+                        Value *bigger = realloc(set, sizeof(Value) * cap);
+                        if (!bigger) {
+                            free(set);
+                            p_fail(p, "메모리 부족");
+                            return;
+                        }
+                        set = bigger;
+                    }
+                    parse_value(p, &set[n]);
+                    n++;
+                } while (p_accept(p, TOK_COMMA));
+                p_expect(p, TOK_RPAREN, "IN 값 목록 뒤에 ) 가 필요합니다");
+                /* 멤버십 머신(in_sub) 재사용 — sub는 NULL이라 prepare_where가 건너뛴다 */
+                c->in_sub = 1;
+                c->in_negate = negate;
+                c->in_set = set;
+                c->in_set_n = n;
             }
-            parse_select_stmt(p, sub);
-            p_expect(p, TOK_RPAREN, "서브쿼리 뒤에 ) 가 필요합니다");
-            c->in_sub = 1;
-            c->in_negate = negate;
-            c->sub = sub;
         } else if (p_accept(p, TOK_BETWEEN)) {
             /* col BETWEEN a AND b 는 문법 설탕 — (col >= a) AND (col <= b)로 푼다.
              * 양끝 포함(inclusive). 두 번째 조건을 같은 AND 묶음에 직접 더한다. */

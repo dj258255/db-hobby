@@ -213,6 +213,33 @@ int main(void) {
     CHECK(db.used_index == 0, "LIKE는 인덱스 안 씀(풀 스캔)");
     free(o);
 
+    /* IN (값 목록): 서브쿼리 없이 리터럴 집합에 멤버십 */
+    o = run(&db, "SELECT * FROM users WHERE id IN (1, 3)");
+    CHECK(strstr(o, "kim") && strstr(o, "park") && !strstr(o, "lee") && !strstr(o, "amy") &&
+              strstr(o, "(2행"),
+          "id IN (1, 3) -> kim, park");
+    free(o);
+    o = run(&db, "SELECT * FROM users WHERE id IN (2)");
+    CHECK(strstr(o, "lee") && !strstr(o, "kim") && strstr(o, "(1행"),
+          "id IN (2) -> lee (값 하나)");
+    free(o);
+    /* TEXT 값 목록 */
+    o = run(&db, "SELECT * FROM users WHERE name IN ('lee', 'amy')");
+    CHECK(strstr(o, "lee") && strstr(o, "amy") && !strstr(o, "kim") && !strstr(o, "park") &&
+              strstr(o, "(2행"),
+          "name IN ('lee', 'amy') -> lee, amy");
+    free(o);
+    /* NOT IN (값 목록) */
+    o = run(&db, "SELECT * FROM users WHERE id NOT IN (1, 3)");
+    CHECK(strstr(o, "lee") && strstr(o, "amy") && !strstr(o, "kim") && !strstr(o, "park") &&
+              strstr(o, "(2행"),
+          "id NOT IN (1, 3) -> lee, amy");
+    free(o);
+    /* 값 목록 IN은 PK라도 풀 스캔(멤버십 경로) */
+    o = run(&db, "SELECT * FROM users WHERE id IN (1, 3)");
+    CHECK(db.used_index == 0, "IN (값 목록)은 인덱스 안 씀(멤버십 풀 스캔)");
+    free(o);
+
     /* DELETE with range */
     o = run(&db, "DELETE FROM users WHERE id >= 3");
     CHECK(strstr(o, "2개 행 삭제됨") != NULL, "DELETE WHERE id >= 3 -> 2개 삭제");

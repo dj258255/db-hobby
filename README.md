@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (218 checks across 14 suites).
+covered by tests (223 checks across 14 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -95,6 +95,7 @@ BEGIN | COMMIT | ROLLBACK
 <item>   is  <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
 <cond>   is  <colref> <op> <value>  |  <colref> <op> (SELECT <col> FROM <t> [WHERE ...])
                                    |  <colref> IS [NOT] NULL
+                                   |  <colref> [NOT] IN (<value>, ...)
                                    |  <colref> [NOT] IN (SELECT <col> FROM <t> [WHERE ...])
                                    |  <colref> [NOT] BETWEEN <value> AND <value>
                                    |  <colref> [NOT] LIKE '<pattern>'   (% = any run, _ = one char)
@@ -117,8 +118,9 @@ column, then O(1) probe) for any other equi-join, else a plain nested-loop scan.
 the one place `NULL` appears (it never lives in stored rows), so `COUNT(*)` counts
 those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
 for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
-DISTINCT` dedupes output rows. `IN (SELECT ...)` runs an uncorrelated subquery
-once into a value set, then tests membership. `BETWEEN a AND b` is desugared at
+DISTINCT` dedupes output rows. `IN (1, 2, 3)` tests membership against a literal
+value set; `IN (SELECT ...)` runs an uncorrelated subquery once into a value set,
+then tests membership the same way. `BETWEEN a AND b` is desugared at
 parse time into `>= a AND <= b` (inclusive); `LIKE`/`NOT LIKE` match `%` (any run)
 and `_` (one char) with a backtracking matcher -- both run as a full scan, not via
 the index. Writes go through a **write-ahead

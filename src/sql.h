@@ -20,6 +20,7 @@
  *                        [GROUP BY <col>] [ORDER BY <colref> [ASC|DESC]] [LIMIT <n>]
  *   <item>   = <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
  *   <cond>   = <colref> <op> <val>,  <op> = =, !=, <, >, <=, >=
+ *            | <colref> [NOT] IN (<val>, ... | SELECT ...)
  *            | <colref> [NOT] BETWEEN <val> AND <val>   (양끝 포함)
  *            | <colref> [NOT] LIKE '<패턴>'              (% = 임의 길이, _ = 한 글자)
  *   <colref> = [<table>.]<col>
@@ -60,8 +61,9 @@ typedef struct {
     char col[SQL_NAME_LEN];
     CmpOp op;
     Value val;
-    /* col IN (SELECT ...) 서브쿼리. in_sub면 sub가 (malloc된) 안쪽 쿼리.
-     * 실행 직전 prepare 단계가 sub를 한 번 돌려 in_set(값 집합)을 채운다. */
+    /* col IN (...) 멤버십. in_sub면 in_set(값 집합)에 멤버십 검사를 한다.
+     *  - IN (SELECT ...): sub가 (malloc된) 안쪽 쿼리. prepare 단계가 한 번 돌려 in_set을 채운다.
+     *  - IN (v1, v2, ...): 파서가 파싱 때 in_set을 바로 채우고 sub는 NULL(prepare가 건너뜀). */
     int in_sub;
     int in_negate;  /* NOT IN 이면 1 (멤버십 부정) */
     int scalar_sub; /* col <op> (SELECT ...) 스칼라 서브쿼리면 1 (in_set[0]과 비교) */
