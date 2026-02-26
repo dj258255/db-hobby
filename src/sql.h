@@ -13,7 +13,7 @@
  *        v  Select{ table: "users", where: id = 1 }
  *
  * 지원 문법(학습용 최소 부분집합):
- *   CREATE TABLE <name> (<col> INT|TEXT, ...)
+ *   CREATE TABLE <name> (<col> INT|TEXT [NOT NULL], ...)
  *   INSERT INTO <name> VALUES (<int|'text'>, ...)
  *   SELECT <* | item, ...> FROM <name> [JOIN <name> ON <colref> = <colref>]...
  *                        [WHERE <cond> [AND <cond>] [OR ...]]
@@ -51,6 +51,7 @@ typedef struct {
 typedef struct {
     char name[SQL_NAME_LEN];
     ColType type;
+    int not_null; /* NOT NULL 제약 (1이면 이 컬럼에 NULL 금지). 첫 컬럼(PK)은 항상 NOT NULL. */
 } ColumnDef;
 
 typedef struct SelectStmt SelectStmt; /* 전방 선언: 조건이 서브쿼리를 품을 수 있다 */

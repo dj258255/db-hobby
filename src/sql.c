@@ -424,6 +424,11 @@ static void parse_create(Parser *p, Statement *st) {
             p_fail(p, "컬럼 타입(INT 또는 TEXT)이 필요합니다");
             break;
         }
+        col->not_null = 0;
+        if (p_accept(p, TOK_NOT)) { /* 선택적 NOT NULL 제약 */
+            p_expect(p, TOK_NULL, "NOT 다음에 NULL이 필요합니다");
+            col->not_null = 1;
+        }
         c->num_columns++;
         if (!p_accept(p, TOK_COMMA)) {
             break;

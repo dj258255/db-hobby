@@ -422,10 +422,15 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", in->table);
         return -1;
     }
-    /* 첫 컬럼은 유일 PK(인덱스 키)라 NULL일 수 없다. 진짜 DB의 PK NOT NULL과 같다. */
-    if (t->has_index && in->num_values >= 1 && in->values[0].type == VAL_NULL) {
-        fprintf(out, "ERROR: 기본 키(첫 컬럼)는 NULL일 수 없습니다\n");
-        return -1;
+    /* NOT NULL 검증: 명시적 NOT NULL 컬럼, 그리고 첫 컬럼(PK=인덱스 키)은 NULL 금지.
+     * 진짜 DB의 PK NOT NULL + 컬럼 제약과 같다. */
+    for (int i = 0; i < in->num_values && i < t->schema.num_columns; i++) {
+        int is_pk = (i == 0 && t->has_index);
+        if ((is_pk || t->schema.columns[i].not_null) && in->values[i].type == VAL_NULL) {
+            fprintf(out, "ERROR: '%s' 컬럼은 NULL일 수 없습니다%s\n",
+                    t->schema.columns[i].name, is_pk ? " (기본 키)" : "");
+            return -1;
+        }
     }
     uint8_t buf[PAGE_SIZE];
     uint16_t len;

@@ -280,6 +280,19 @@ int main(void) {
     }
     free(o);
 
+    /* NOT NULL 제약: 선언한 컬럼은 NULL 거부 */
+    o = run(&db, "CREATE TABLE nn (id INT, name TEXT NOT NULL)"); free(o);
+    o = run(&db, "INSERT INTO nn VALUES (1, NULL)");
+    CHECK(strstr(o, "ERROR") && strstr(o, "name") && !strstr(o, "기본 키"),
+          "NOT NULL 컬럼에 NULL -> 거부(컬럼명 표시)");
+    free(o);
+    o = run(&db, "INSERT INTO nn VALUES (1, 'a')");
+    CHECK(strstr(o, "삽입됨"), "NOT NULL 컬럼에 값 -> 허용");
+    free(o);
+    o = run(&db, "SELECT * FROM nn");
+    CHECK(strstr(o, "(1행"), "NOT NULL 거부 후 행 1개만(거부된 건 안 들어감)");
+    free(o);
+
     db_close(&db);
     unlink(path);
     unlink(idx);
