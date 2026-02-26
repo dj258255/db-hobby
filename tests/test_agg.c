@@ -180,6 +180,15 @@ int main(void) {
     }
     free(o);
 
+    /* 저장된 NULL은 집계가 건너뛴다 (COUNT(*)는 행을, COUNT(col)/SUM은 NULL 아닌 값을) */
+    o = run(&db, "CREATE TABLE na (id INT, v INT)"); free(o);
+    o = run(&db, "INSERT INTO na VALUES (1, 10)"); free(o);
+    o = run(&db, "INSERT INTO na VALUES (2, NULL)"); free(o);
+    o = run(&db, "SELECT COUNT(*), COUNT(v), SUM(v) FROM na");
+    CHECK(strstr(o, "2 | 1 | 10"),
+          "NULL: COUNT(*)=2, COUNT(v)=1, SUM(v)=10 (NULL 건너뜀)");
+    free(o);
+
     /* 재오픈 후에도 집계 동작 */
     db_close(&db);
     db_open(&db, path);

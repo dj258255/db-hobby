@@ -250,6 +250,36 @@ int main(void) {
           "범위 삭제 후 kim, lee만");
     free(o);
 
+    /* NULL 저장: nullable 컬럼 (PK 첫 컬럼은 NOT NULL) */
+    o = run(&db, "CREATE TABLE nt (id INT, name TEXT)"); free(o);
+    o = run(&db, "INSERT INTO nt VALUES (1, 'a')"); free(o);
+    o = run(&db, "INSERT INTO nt VALUES (2, NULL)");
+    CHECK(strstr(o, "삽입됨"), "INSERT에 NULL 값 허용");
+    free(o);
+    o = run(&db, "SELECT * FROM nt WHERE id = 2");
+    CHECK(strstr(o, "NULL") && strstr(o, "(1행"), "저장된 NULL이 SELECT에 NULL로 출력");
+    free(o);
+    o = run(&db, "SELECT * FROM nt WHERE name IS NULL");
+    CHECK(strstr(o, "(1행") && !strstr(o, "| a"), "WHERE name IS NULL -> NULL 행만");
+    free(o);
+    o = run(&db, "SELECT * FROM nt WHERE name IS NOT NULL");
+    CHECK(strstr(o, "| a") && strstr(o, "(1행"), "WHERE name IS NOT NULL -> 값 있는 행만");
+    free(o);
+    /* PK(첫 컬럼) NULL은 거부 */
+    o = run(&db, "INSERT INTO nt VALUES (NULL, 'x')");
+    CHECK(strstr(o, "ERROR") && strstr(o, "기본 키"), "PK 첫 컬럼 NULL 거부");
+    free(o);
+    o = run(&db, "SELECT * FROM nt");
+    CHECK(strstr(o, "(2행"), "PK NULL 거부 후 행 수 그대로(2)");
+    free(o);
+    /* NULL 정렬: NULL이 가장 크게(ASC면 끝, NULLS LAST) */
+    o = run(&db, "SELECT * FROM nt ORDER BY name");
+    {
+        char *a = strstr(o, "| a"), *nul = strstr(o, "NULL");
+        CHECK(a && nul && a < nul, "ORDER BY name ASC -> 값 먼저, NULL이 마지막");
+    }
+    free(o);
+
     db_close(&db);
     unlink(path);
     unlink(idx);

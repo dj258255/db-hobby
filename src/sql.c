@@ -251,8 +251,11 @@ static void parse_value(Parser *p, Value *v) {
         v->type = VAL_TEXT;
         snprintf(v->text_val, SQL_TEXT_LEN, "%s", p->cur.text);
         p_advance(p);
+    } else if (p->cur.type == TOK_NULL) {
+        v->type = VAL_NULL;
+        p_advance(p);
     } else {
-        p_fail(p, "값(정수 또는 '문자열')이 필요합니다");
+        p_fail(p, "값(정수, '문자열', 또는 NULL)이 필요합니다");
     }
 }
 

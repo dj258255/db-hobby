@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (235 checks across 15 suites).
+covered by tests (243 checks across 15 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -115,9 +115,10 @@ an aggregate). `JOIN` is a recursive N-way join that picks a
 method per level like an optimizer: index nested-loop (`btree_search`) when the
 inner's primary key is the `ON` key, hash join (build a hash on the inner's join
 column, then O(1) probe) for any other equi-join, else a plain nested-loop scan.
-`LEFT JOIN` preserves unmatched left rows by filling the right side with `NULL` --
-the one place `NULL` appears (it never lives in stored rows), so `COUNT(*)` counts
-those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
+`LEFT JOIN` preserves unmatched left rows by filling the right side with `NULL`.
+`NULL` can also be stored: `INSERT ... VALUES (1, NULL)` keeps it via a null bitmap
+at the front of each row (the first/PK column stays `NOT NULL`). Either way `COUNT(*)`
+counts those rows but `COUNT(col)`/`SUM`/`AVG` skip the `NULL`s, and `IS [NOT] NULL` tests
 for them (`LEFT JOIN ... WHERE right.col IS NULL` is the anti-join). `SELECT
 DISTINCT` dedupes output rows. `IN (1, 2, 3)` tests membership against a literal
 value set; `IN (SELECT ...)` runs an uncorrelated subquery once into a value set,
@@ -140,10 +141,10 @@ integer primary key; `WHERE` is in disjunctive normal form (AND-groups joined by
 OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
 to 4 tables (`INNER` and `LEFT`, aliases supported, so self-joins work);
 projection, aggregation, `GROUP BY`, and `HAVING` work over a single table or a
-join result; `NULL` only arises from `LEFT JOIN` (no nullable stored columns); subqueries are
+join result; `NULL` can be stored (nullable columns) or arise from `LEFT JOIN`, except the PK column; subqueries are
 uncorrelated and single-table/single-column; there is no isolation/concurrency
-(one transaction at a time); the WAL protects the data files but not the index
-(`.idx`) yet, and a transaction's dirty pages must fit in the buffer pool. B+Tree
+(one transaction at a time); the WAL protects both the data (`.tbl`) and index
+(`.idx`) files, and a transaction's dirty pages must fit in the buffer pool. B+Tree
 deletion isn't implemented (deleted rows are tombstoned in the heap, so a stale
 index entry is harmless). These are noted in the code where they matter.
 

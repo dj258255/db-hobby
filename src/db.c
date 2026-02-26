@@ -15,9 +15,16 @@ static int encode_row(const CreateStmt *schema, const Value *vals, int nvals,
     if (nvals != schema->num_columns) {
         return -1;
     }
-    uint16_t off = 0;
+    /* 행 맨 앞에 null 비트맵: 컬럼당 1비트(1이면 NULL). 실제 DB 행 포맷의 방식. */
+    int nbits = (schema->num_columns + 7) / 8;
+    memset(buf, 0, (size_t)nbits);
+    uint16_t off = (uint16_t)nbits;
     for (int i = 0; i < schema->num_columns; i++) {
         const Value *v = &vals[i];
+        if (v->type == VAL_NULL) {
+            buf[i / 8] |= (uint8_t)(1 << (i % 8)); /* NULL 표시, 값 바이트는 안 쓴다 */
+            continue;
+        }
         if (schema->columns[i].type == COL_INT) {
             if (v->type != VAL_INT) {
                 return -1;
@@ -41,8 +48,13 @@ static int encode_row(const CreateStmt *schema, const Value *vals, int nvals,
 }
 
 static void decode_row(const CreateStmt *schema, const uint8_t *rec, Value *out) {
-    uint16_t off = 0;
+    int nbits = (schema->num_columns + 7) / 8;
+    uint16_t off = (uint16_t)nbits;
     for (int i = 0; i < schema->num_columns; i++) {
+        if (rec[i / 8] & (uint8_t)(1 << (i % 8))) { /* null 비트 -> VAL_NULL, 값 바이트 없음 */
+            out[i].type = VAL_NULL;
+            continue;
+        }
         if (schema->columns[i].type == COL_INT) {
             int32_t x;
             memcpy(&x, rec + off, 4);
@@ -410,6 +422,11 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", in->table);
         return -1;
     }
+    /* 첫 컬럼은 유일 PK(인덱스 키)라 NULL일 수 없다. 진짜 DB의 PK NOT NULL과 같다. */
+    if (t->has_index && in->num_values >= 1 && in->values[0].type == VAL_NULL) {
+        fprintf(out, "ERROR: 기본 키(첫 컬럼)는 NULL일 수 없습니다\n");
+        return -1;
+    }
     uint8_t buf[PAGE_SIZE];
     uint16_t len;
     if (encode_row(&t->schema, in->values, in->num_values, buf, &len) != 0) {
@@ -516,7 +533,7 @@ static int g_sort_keys[SQL_MAX_ORDER]; /* 행 안의 컬럼 위치들 */
 static int g_sort_desc[SQL_MAX_ORDER];
 static int g_sort_n;
 
-/* 두 값을 비교해 sign(-1/0/1). NULL은 가장 작게. */
+/* 두 값을 비교해 sign(-1/0/1). NULL은 가장 크게 친다(ASC 정렬 시 끝 = PostgreSQL의 NULLS LAST). */
 static int value_cmp(const Value *x, const Value *y) {
     if (x->type == VAL_NULL || y->type == VAL_NULL) {
         return (x->type == VAL_NULL) - (y->type == VAL_NULL);
