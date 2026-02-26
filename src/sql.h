@@ -143,6 +143,7 @@ typedef struct {
 } OrderKey;
 
 struct SelectStmt {
+    int explain;              /* EXPLAIN SELECT — 실행 대신 쿼리 플랜을 출력 */
     char table[SQL_NAME_LEN]; /* FROM 테이블 */
     char alias[SQL_NAME_LEN]; /* FROM 테이블 별칭 ("" 이면 테이블명을 그대로 씀) */
     int num_joins;            /* 0이면 단일 테이블 */

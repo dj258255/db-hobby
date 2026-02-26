@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (225 checks across 14 suites).
+covered by tests (235 checks across 15 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -91,6 +91,7 @@ SELECT [DISTINCT] <* | item, ...>
 UPDATE <t> SET <col> = <value> [WHERE ...]
 DELETE FROM <t> [WHERE ...]
 BEGIN | COMMIT | ROLLBACK
+EXPLAIN <select>          -- print the query plan instead of running it
 
 <item>   is  <col> | COUNT(*) | COUNT|SUM|MIN|MAX|AVG(<col>)
 <cond>   is  <colref> <op> <value>  |  <colref> <op> (SELECT <col> FROM <t> [WHERE ...])

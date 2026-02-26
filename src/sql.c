@@ -19,6 +19,7 @@ typedef enum {
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
     TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN, TOK_OFFSET, TOK_BETWEEN, TOK_LIKE,
+    TOK_EXPLAIN,
     TOK_ERROR
 } TokType;
 
@@ -71,6 +72,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "OFFSET")) return TOK_OFFSET;
     if (!strcasecmp(s, "BETWEEN")) return TOK_BETWEEN;
     if (!strcasecmp(s, "LIKE")) return TOK_LIKE;
+    if (!strcasecmp(s, "EXPLAIN")) return TOK_EXPLAIN;
     return TOK_IDENT;
 }
 
@@ -681,6 +683,12 @@ int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
         case TOK_CREATE: p_advance(&p); parse_create(&p, out); break;
         case TOK_INSERT: p_advance(&p); parse_insert(&p, out); break;
         case TOK_SELECT: p_advance(&p); parse_select(&p, out); break;
+        case TOK_EXPLAIN: /* EXPLAIN <select> — 플랜만 출력 */
+            p_advance(&p);
+            p_expect(&p, TOK_SELECT, "EXPLAIN 다음에 SELECT가 필요합니다");
+            parse_select(&p, out);
+            out->select.explain = 1;
+            break;
         case TOK_DELETE: p_advance(&p); parse_delete(&p, out); break;
         case TOK_UPDATE: p_advance(&p); parse_update(&p, out); break;
         case TOK_BEGIN: out->type = STMT_BEGIN; p_advance(&p); break;

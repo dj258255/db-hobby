@@ -1184,6 +1184,227 @@ typedef struct {
     int count;
 } MJoinCtx;
 
+/* ------------- EXPLAIN: 실행기와 같은 결정 로직으로 쿼리 플랜을 출력 ------------- */
+
+static const char *xop_str(CmpOp op) {
+    switch (op) {
+        case CMP_EQ: return "=";
+        case CMP_NE: return "!=";
+        case CMP_LT: return "<";
+        case CMP_GT: return ">";
+        case CMP_LE: return "<=";
+        case CMP_GE: return ">=";
+        case CMP_IS_NULL: return "IS NULL";
+        case CMP_IS_NOT_NULL: return "IS NOT NULL";
+        case CMP_LIKE: return "LIKE";
+        case CMP_NOT_LIKE: return "NOT LIKE";
+    }
+    return "?";
+}
+
+static void xfmt_val(char *buf, size_t n, const Value *v) {
+    if (v->type == VAL_TEXT) {
+        snprintf(buf, n, "'%s'", v->text_val);
+    } else if (v->type == VAL_NULL) {
+        snprintf(buf, n, "NULL");
+    } else {
+        snprintf(buf, n, "%ld", v->int_val);
+    }
+}
+
+static void xfmt_cond(char *buf, size_t n, const Condition *c) {
+    char col[160];
+    if (c->tbl[0]) {
+        snprintf(col, sizeof col, "%s.%s", c->tbl, c->col);
+    } else {
+        snprintf(col, sizeof col, "%s", c->col);
+    }
+    if (c->op == CMP_IS_NULL || c->op == CMP_IS_NOT_NULL) {
+        snprintf(buf, n, "%s %s", col, xop_str(c->op));
+    } else if (c->in_sub) {
+        if (c->sub && c->scalar_sub) {
+            snprintf(buf, n, "%s %s (subquery)", col, xop_str(c->op));
+        } else if (c->sub) {
+            snprintf(buf, n, "%s %sIN (subquery)", col, c->in_negate ? "NOT " : "");
+        } else {
+            snprintf(buf, n, "%s %sIN (%d values)", col, c->in_negate ? "NOT " : "", c->in_set_n);
+        }
+    } else {
+        char v[300];
+        xfmt_val(v, sizeof v, &c->val);
+        snprintf(buf, n, "%s %s %s", col, xop_str(c->op), v);
+    }
+}
+
+static void xrender_where(char *buf, size_t n, const Where *w) {
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int gi = 0; gi < w->count; gi++) {
+        if (gi && len < n) {
+            len += snprintf(buf + len, n - len, " OR ");
+        }
+        const AndGroup *g = &w->groups[gi];
+        for (int i = 0; i < g->count && len < n; i++) {
+            char c[400];
+            xfmt_cond(c, sizeof c, &g->conds[i]);
+            len += snprintf(buf + len, n - len, "%s%s", i ? " AND " : "", c);
+        }
+    }
+}
+
+static void xindent(FILE *out, int ind) {
+    for (int i = 0; i < ind; i++) {
+        fputc(' ', out);
+    }
+}
+
+/* 후처리 노드(Limit/Unique/Sort/HAVING/Aggregate)를 바깥->안 순서로 찍고,
+ * 접근 노드를 찍을 들여쓰기 깊이를 반환한다. */
+static int xexplain_post(FILE *out, const SelectStmt *sel) {
+    int ind = 0;
+    if (sel->limit >= 0 || sel->offset > 0) {
+        xindent(out, ind);
+        if (sel->limit >= 0 && sel->offset > 0) {
+            fprintf(out, "Limit  (limit=%ld, offset=%ld)\n", sel->limit, sel->offset);
+        } else if (sel->limit >= 0) {
+            fprintf(out, "Limit  (limit=%ld)\n", sel->limit);
+        } else {
+            fprintf(out, "Offset  (offset=%ld)\n", sel->offset);
+        }
+        ind += 2;
+    }
+    if (sel->distinct) {
+        xindent(out, ind);
+        fprintf(out, "Unique  (DISTINCT)\n");
+        ind += 2;
+    }
+    if (sel->num_order > 0) {
+        char keys[400];
+        size_t len = 0;
+        keys[0] = '\0';
+        for (int k = 0; k < sel->num_order; k++) {
+            const OrderKey *ok = &sel->order_keys[k];
+            char key[160];
+            if (ok->pos > 0) {
+                snprintf(key, sizeof key, "col%d", ok->pos);
+            } else if (ok->tbl[0]) {
+                snprintf(key, sizeof key, "%s.%s", ok->tbl, ok->col);
+            } else {
+                snprintf(key, sizeof key, "%s", ok->col);
+            }
+            if (len < sizeof keys) {
+                len += snprintf(keys + len, sizeof keys - len, "%s%s %s", k ? ", " : "", key,
+                                ok->desc ? "DESC" : "ASC");
+            }
+        }
+        xindent(out, ind);
+        fprintf(out, "Sort  (keys: %s)\n", keys);
+        ind += 2;
+    }
+    if (sel->has_having) {
+        const SelectItem *h = &sel->having_agg;
+        char fn[160], v[200];
+        if (h->star) {
+            snprintf(fn, sizeof fn, "%s(*)", agg_name(h->agg));
+        } else {
+            snprintf(fn, sizeof fn, "%s(%s)", agg_name(h->agg), h->col);
+        }
+        xfmt_val(v, sizeof v, &sel->having_val);
+        xindent(out, ind);
+        fprintf(out, "Filter  (HAVING: %s %s %s)\n", fn, xop_str(sel->having_op), v);
+        ind += 2;
+    }
+    if (sel->has_aggregate || sel->group_col[0]) {
+        char ag[400];
+        size_t len = 0;
+        ag[0] = '\0';
+        for (int i = 0; i < sel->num_items; i++) {
+            const SelectItem *it = &sel->items[i];
+            if (it->agg == AGG_NONE) {
+                continue;
+            }
+            char a[160];
+            if (it->star) {
+                snprintf(a, sizeof a, "%s(*)", agg_name(it->agg));
+            } else {
+                snprintf(a, sizeof a, "%s(%s)", agg_name(it->agg), it->col);
+            }
+            if (len < sizeof ag) {
+                len += snprintf(ag + len, sizeof ag - len, "%s%s", len ? ", " : "", a);
+            }
+        }
+        xindent(out, ind);
+        if (sel->group_col[0]) {
+            fprintf(out, "GroupAggregate  (group: %s; aggs: %s)\n", sel->group_col, ag);
+        } else {
+            fprintf(out, "Aggregate  (aggs: %s)\n", ag);
+        }
+        ind += 2;
+    }
+    return ind;
+}
+
+/* 단일 테이블 플랜. exec_select의 인덱스 선택 로직과 동일한 조건으로 접근 방법을 정한다. */
+static void explain_single(FILE *out, Table *t, const char *tname, const SelectStmt *sel) {
+    fprintf(out, "EXPLAIN\n");
+    int ind = xexplain_post(out, sel);
+
+    /* 인덱스는 SELECT * + ORDER BY/LIMIT/OFFSET 없음 경로에서만 쓰인다(exec_select와 동일). */
+    int can_index = sel->select_star && sel->num_order == 0 && sel->limit < 0 && sel->offset <= 0;
+    const char *pkcol = t->schema.columns[0].name;
+    const Condition *c0 = (sel->where.count == 1 && sel->where.groups[0].count == 1)
+                              ? &sel->where.groups[0].conds[0]
+                              : NULL;
+    int pk_cond = c0 && !c0->in_sub && t->has_index &&
+                  (c0->tbl[0] == '\0' || strcmp(c0->tbl, tname) == 0) &&
+                  strcmp(c0->col, pkcol) == 0 && c0->val.type == VAL_INT;
+
+    xindent(out, ind);
+    if (can_index && pk_cond && c0->op == CMP_EQ) {
+        fprintf(out, "Index Point Lookup on %s using %s  (%s = %ld)\n", tname, pkcol, pkcol,
+                c0->val.int_val);
+    } else if (can_index && pk_cond &&
+               (c0->op == CMP_LT || c0->op == CMP_GT || c0->op == CMP_LE || c0->op == CMP_GE)) {
+        fprintf(out, "Index Range Scan on %s using %s  (%s %s %ld)\n", tname, pkcol, pkcol,
+                xop_str(c0->op), c0->val.int_val);
+    } else if (sel->where.count > 0) {
+        char w[800];
+        xrender_where(w, sizeof w, &sel->where);
+        fprintf(out, "Seq Scan on %s  (filter: %s)\n", tname, w);
+    } else {
+        fprintf(out, "Seq Scan on %s\n", tname);
+    }
+}
+
+/* 조인 플랜. 레벨별 method[](실행기가 고른 값)를 그대로 출력한다. */
+static void explain_join(FILE *out, const SelectStmt *sel, const MJoinCtx *m) {
+    fprintf(out, "EXPLAIN\n");
+    int ind = xexplain_post(out, sel);
+    if (sel->where.count > 0) {
+        char w[800];
+        xrender_where(w, sizeof w, &sel->where);
+        xindent(out, ind);
+        fprintf(out, "Filter  (%s)\n", w);
+        ind += 2;
+    }
+    xindent(out, ind);
+    fprintf(out, "Nested-Loop Join  (%d tables)\n", m->ntabs);
+    ind += 2;
+    xindent(out, ind);
+    fprintf(out, "Seq Scan on %s  (outer)\n", m->tname[0]);
+    for (int k = 1; k < m->ntabs; k++) {
+        xindent(out, ind);
+        const char *lft = m->is_left[k] ? "Left " : "";
+        if (m->method[k] == JM_INDEX) {
+            fprintf(out, "%sIndex Nested Loop -> %s  (inner PK = join key)\n", lft, m->tname[k]);
+        } else if (m->method[k] == JM_HASH) {
+            fprintf(out, "%sHash Join -> %s  (build hash on join col)\n", lft, m->tname[k]);
+        } else {
+            fprintf(out, "%sNested Loop -> %s  (seq scan)\n", lft, m->tname[k]);
+        }
+    }
+}
+
 /* [qtbl.]col 을 체인의 (테이블 idx, 컬럼 idx)로 해소한다. qtbl 없으면 체인 순서로
  * 첫 매치. 0 성공, -1 실패. */
 static int resolve_chain_ref(Table **tabs, const char **tname, int ntabs, const char *qtbl,
@@ -1393,6 +1614,12 @@ static int exec_select_join(Database *db, const SelectStmt *sel, FILE *out) {
         comb += m.tabs[t]->schema.num_columns;
     }
     m.comb_ncols = comb;
+
+    /* EXPLAIN이면 여기까지의 결정(레벨별 method)만 출력하고 끝낸다(해시 빌드 전). */
+    if (sel->explain) {
+        explain_join(out, sel, &m);
+        return 0;
+    }
 
     /* 해시 조인 레벨은 Tk를 조인 컬럼으로 미리 해시 빌드한다(한 번). 양 경로 공통. */
     int used_hash = 0;
@@ -1614,6 +1841,11 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         return -1;
     }
     const char *tname = sel->alias[0] ? sel->alias : t->schema.table; /* 실효 이름 */
+
+    if (sel->explain) {
+        explain_single(out, t, tname, sel);
+        return 0;
+    }
 
     if (!sel->select_star) {
         db->used_index = 0;
