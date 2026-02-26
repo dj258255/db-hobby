@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (246 checks across 15 suites).
+covered by tests (251 checks across 15 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 

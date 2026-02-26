@@ -34,6 +34,19 @@ static int scan_visit(bkey_t k, bval_t v, void *ctx_) {
     return 0;
 }
 
+typedef struct {
+    int count;
+    long sum;
+} CollectCtx;
+
+static int collect_visit(bkey_t k, bval_t v, void *ctx_) {
+    (void)k;
+    CollectCtx *c = ctx_;
+    c->count++;
+    c->sum += (long)v;
+    return 0;
+}
+
 int main(void) {
     const char *path = "build/test_btree.idx";
     unlink(path);
@@ -79,6 +92,59 @@ int main(void) {
     btree_scan(&bt2, scan_visit, &sc2);
     CHECK(sc2.count == N, "재오픈 후 스캔 1000개");
     btree_close(&bt2);
+
+    /* ---- 중복 키(비유니크): btree_insert_dup + btree_find_all ---- */
+    const char *dpath = "build/test_btree_dup.idx";
+    char dwal[64];
+    snprintf(dwal, sizeof dwal, "%s.wal", dpath);
+    unlink(dpath);
+    unlink(dwal);
+    BTree dbt;
+    btree_open(&dbt, dpath);
+    btree_insert_dup(&dbt, 5, 100);
+    btree_insert_dup(&dbt, 5, 101);
+    btree_insert_dup(&dbt, 5, 102);
+    btree_insert_dup(&dbt, 3, 30);
+    btree_insert_dup(&dbt, 7, 70);
+    btree_insert_dup(&dbt, 7, 71);
+    {
+        CollectCtx c = {0, 0};
+        btree_find_all(&dbt, 5, collect_visit, &c);
+        CHECK(c.count == 3 && c.sum == 303, "find_all(5) -> 값 3개(100+101+102)");
+    }
+    {
+        CollectCtx c = {0, 0};
+        btree_find_all(&dbt, 7, collect_visit, &c);
+        CHECK(c.count == 2 && c.sum == 141, "find_all(7) -> 값 2개");
+    }
+    {
+        CollectCtx c = {0, 0};
+        btree_find_all(&dbt, 3, collect_visit, &c);
+        CHECK(c.count == 1, "find_all(3) -> 값 1개");
+    }
+    {
+        CollectCtx c = {0, 0};
+        btree_find_all(&dbt, 9, collect_visit, &c);
+        CHECK(c.count == 0, "find_all(없는 키) -> 0개");
+    }
+    /* 분할을 가로지르는 중복: 같은 키 50개 + 주변 키. 노드당 8키라 42가 여러 리프로 쪼개진다. */
+    for (int i = 0; i < 20; i++) {
+        btree_insert_dup(&dbt, 40, i);
+    }
+    for (int i = 0; i < 50; i++) {
+        btree_insert_dup(&dbt, 42, 1000 + i);
+    }
+    for (int i = 0; i < 20; i++) {
+        btree_insert_dup(&dbt, 44, i);
+    }
+    {
+        CollectCtx c = {0, 0};
+        btree_find_all(&dbt, 42, collect_visit, &c);
+        CHECK(c.count == 50, "find_all: 분할 가로지르는 중복 50개 다 찾음(하한 탐색)");
+    }
+    btree_close(&dbt);
+    unlink(dpath);
+    unlink(dwal);
 
     unlink(path);
 

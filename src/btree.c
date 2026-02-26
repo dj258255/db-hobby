@@ -74,7 +74,7 @@ void btree_close(BTree *bt) {
 
 /* pid 서브트리에 (key,val)을 넣는다. 노드가 분할되면 1을 반환하고 올라갈 분리키
  * (*sep_out)와 새 오른쪽 페이지(*right_out)를 채운다. 분할 없으면 0, 오류 -1. */
-static int node_insert(BTree *bt, page_id_t pid, bkey_t key, bval_t val,
+static int node_insert(BTree *bt, page_id_t pid, bkey_t key, bval_t val, int allow_dup,
                        bkey_t *sep_out, page_id_t *right_out) {
     BTNode *n = fetch(bt, pid);
     if (!n) {
@@ -86,8 +86,8 @@ static int node_insert(BTree *bt, page_id_t pid, bkey_t key, bval_t val,
         while (i < n->num_keys && n->keys[i] < key) {
             i++;
         }
-        if (i < n->num_keys && n->keys[i] == key) {
-            n->u.values[i] = val; /* 갱신 */
+        if (!allow_dup && i < n->num_keys && n->keys[i] == key) {
+            n->u.values[i] = val; /* 유니크: 갱신. (비유니크면 아래로 떨어져 새 항목으로 삽입) */
             bufpool_unpin(bt->bp, pid, 1);
             return 0;
         }
@@ -133,7 +133,7 @@ static int node_insert(BTree *bt, page_id_t pid, bkey_t key, bval_t val,
     page_id_t child = n->u.children[i];
     bkey_t sep;
     page_id_t cr;
-    int sp = node_insert(bt, child, key, val, &sep, &cr);
+    int sp = node_insert(bt, child, key, val, allow_dup, &sep, &cr);
     if (sp < 0) {
         bufpool_unpin(bt->bp, pid, 0);
         return -1;
@@ -180,10 +180,10 @@ static int node_insert(BTree *bt, page_id_t pid, bkey_t key, bval_t val,
     return 1;
 }
 
-int btree_insert(BTree *bt, bkey_t key, bval_t val) {
+static int insert_root(BTree *bt, bkey_t key, bval_t val, int allow_dup) {
     bkey_t sep;
     page_id_t right;
-    int sp = node_insert(bt, bt->root, key, val, &sep, &right);
+    int sp = node_insert(bt, bt->root, key, val, allow_dup, &sep, &right);
     if (sp < 0) {
         return -1;
     }
@@ -201,6 +201,14 @@ int btree_insert(BTree *bt, bkey_t key, bval_t val) {
         write_root(bt, nr);
     }
     return 0;
+}
+
+int btree_insert(BTree *bt, bkey_t key, bval_t val) {
+    return insert_root(bt, key, val, 0); /* 유니크: 같은 키는 갱신 */
+}
+
+int btree_insert_dup(BTree *bt, bkey_t key, bval_t val) {
+    return insert_root(bt, key, val, 1); /* 비유니크: 같은 키도 새 항목으로 */
 }
 
 void btree_reload_root(BTree *bt) {
@@ -293,6 +301,48 @@ int btree_seek_scan(BTree *bt, bkey_t start, btree_visit_fn visit, void *ctx) {
         for (int i = 0; i < n->num_keys; i++) {
             if (n->keys[i] < start) {
                 continue;
+            }
+            int r = visit(n->keys[i], n->u.values[i], ctx);
+            if (r != 0) {
+                bufpool_unpin(bt->bp, pid, 0);
+                return r;
+            }
+        }
+        page_id_t nxt = n->next_leaf;
+        bufpool_unpin(bt->bp, pid, 0);
+        pid = nxt;
+    }
+    return 0;
+}
+
+int btree_find_all(BTree *bt, bkey_t key, btree_visit_fn visit, void *ctx) {
+    /* 하한 탐색: 같은 키가 여러 리프에 흩어질 수 있으니, 분리키와 같으면 오른쪽으로 넘어가지
+     * 않고(>, >= 아님) 왼쪽 자식으로 내려가 가장 왼쪽 후보 리프에 닿는다. */
+    page_id_t pid = bt->root;
+    for (;;) {
+        BTNode *n = fetch(bt, pid);
+        if (n->is_leaf) {
+            bufpool_unpin(bt->bp, pid, 0);
+            break;
+        }
+        int i = 0;
+        while (i < n->num_keys && key > n->keys[i]) {
+            i++;
+        }
+        page_id_t c = n->u.children[i];
+        bufpool_unpin(bt->bp, pid, 0);
+        pid = c;
+    }
+    /* 리프 체인을 오른쪽으로 훑으며 key와 같은 값만 모은다. key보다 커지면 끝. */
+    while (pid != 0) {
+        BTNode *n = fetch(bt, pid);
+        for (int i = 0; i < n->num_keys; i++) {
+            if (n->keys[i] < key) {
+                continue;
+            }
+            if (n->keys[i] > key) { /* 정렬돼 있으니 더 볼 것 없음 */
+                bufpool_unpin(bt->bp, pid, 0);
+                return 0;
             }
             int r = visit(n->keys[i], n->u.values[i], ctx);
             if (r != 0) {
