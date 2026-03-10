@@ -94,6 +94,27 @@ int main(void) {
     o = run(&db, "ROLLBACK"); free(o);
     CHECK(find_count(&t->sec[0].tree, 20) == 4, "ROLLBACK -> 인덱스 4행으로 복원");
 
+    /* 4단계: 플래너가 보조 인덱스로 쿼리 (find_all + heap_get + WHERE 재검사) */
+    o = run(&db, "SELECT * FROM t WHERE age = 20");
+    CHECK(db.used_index == 1 && strstr(o, "(4행"), "WHERE age=20 -> 보조 인덱스, 4행");
+    free(o);
+    o = run(&db, "SELECT * FROM t WHERE age = 30");
+    CHECK(strstr(o, "(2행"), "WHERE age=30 -> 2행");
+    free(o);
+    o = run(&db, "EXPLAIN SELECT * FROM t WHERE age = 20");
+    CHECK(strstr(o, "Index Scan using age_idx"), "EXPLAIN -> Index Scan using age_idx");
+    free(o);
+    /* 비인덱스 컬럼은 풀 스캔 */
+    o = run(&db, "SELECT * FROM t WHERE name = 'a'");
+    CHECK(db.used_index == 0, "비인덱스 컬럼(name) -> 풀 스캔");
+    free(o);
+    /* DELETE 후 보조 인덱스 조회: 삭제된 행은 재검사/tombstone으로 걸러진다 */
+    o = run(&db, "DELETE FROM t WHERE id = 1"); free(o); /* id=1, age=20, name 'a' */
+    o = run(&db, "SELECT * FROM t WHERE age = 20");
+    CHECK(strstr(o, "(3행") && !strstr(o, "1 | 20"),
+          "DELETE 후 age=20 -> 3행(삭제 행 제외, stale 인덱스 항목 무시)");
+    free(o);
+
     /* 영속성: 닫고 다시 열어도 보조 인덱스가 살아 있다 (id=6 커밋분 포함, id=7 롤백분 제외) */
     db_close(&db);
     Database db2;

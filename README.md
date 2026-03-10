@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (266 checks across 16 suites).
+covered by tests (271 checks across 16 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -107,9 +107,12 @@ EXPLAIN <select>          -- print the query plan instead of running it
 
 An `=`, `<`, `>`, `<=`, or `>=` on the first column (an `INT` primary key) uses
 the B+Tree index -- `=` is an O(log n) point lookup, the others walk the linked
-leaf chain as a range scan. `!=`, conditions on other columns, and compound
-`AND` conditions fall back to a full scan -- the kind of choice a query planner
-makes. `ORDER BY`/`LIMIT` and `GROUP BY`/aggregates take a materialize path
+leaf chain as a range scan. A `CREATE INDEX` on a non-PK `INT` column adds a
+secondary (non-unique) B+Tree; an `=` filter on that column does an index scan
+(`btree_find_all` collects candidate RIDs, then each is heap-fetched and the
+`WHERE` is rechecked to drop deleted/stale rows), and `EXPLAIN` shows `Index Scan
+using <name>`. `!=`, other conditions, and compound `AND` conditions fall back to
+a full scan -- the kind of choice a query planner makes. `ORDER BY`/`LIMIT` and `GROUP BY`/aggregates take a materialize path
 (collect, then sort / sort-group); grouped results can be filtered with `HAVING`
 and ordered by an output column or position (so `ORDER BY 2 DESC` gives top-N by
 an aggregate). `JOIN` is a recursive N-way join that picks a

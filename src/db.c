@@ -1476,6 +1476,23 @@ static int xexplain_post(FILE *out, const SelectStmt *sel) {
 }
 
 /* 단일 테이블 플랜. exec_select의 인덱스 선택 로직과 동일한 조건으로 접근 방법을 정한다. */
+/* 단일 "= 정수" 조건이 어떤 보조 인덱스의 컬럼이면 그 인덱스 번호를, 아니면 -1.
+ * pk_cond(PK 경로)면 -1(PK가 우선). exec_select와 explain_single이 공유한다. */
+static int sec_index_for(const Table *t, const char *tname, const Condition *c0, int pk_cond) {
+    if (!c0 || c0->in_sub || pk_cond || c0->op != CMP_EQ || c0->val.type != VAL_INT) {
+        return -1;
+    }
+    if (c0->tbl[0] && strcmp(c0->tbl, tname) != 0) {
+        return -1;
+    }
+    for (int k = 0; k < t->num_sec; k++) {
+        if (strcmp(t->schema.columns[t->sec[k].col].name, c0->col) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
+
 static void explain_single(FILE *out, Table *t, const char *tname, const SelectStmt *sel) {
     fprintf(out, "EXPLAIN\n");
     int ind = xexplain_post(out, sel);
@@ -1498,6 +1515,10 @@ static void explain_single(FILE *out, Table *t, const char *tname, const SelectS
                (c0->op == CMP_LT || c0->op == CMP_GT || c0->op == CMP_LE || c0->op == CMP_GE)) {
         fprintf(out, "Index Range Scan on %s using %s  (%s %s %ld)\n", tname, pkcol, pkcol,
                 xop_str(c0->op), c0->val.int_val);
+    } else if (can_index && sec_index_for(t, tname, c0, pk_cond) >= 0) {
+        int sk = sec_index_for(t, tname, c0, pk_cond);
+        fprintf(out, "Index Scan using %s on %s  (%s = %ld, recheck)\n", t->sec[sk].name, tname,
+                c0->col, c0->val.int_val);
     } else if (sel->where.count > 0) {
         char w[800];
         xrender_where(w, sizeof w, &sel->where);
@@ -1960,6 +1981,34 @@ static int prepare_where(Database *db, Where *w) {
     return 0;
 }
 
+/* 보조 인덱스 스캔: find_all로 받은 후보 RID를 heap_get으로 읽고 WHERE를 재검사한다.
+ * 재검사가 필요한 이유 — 삭제된 행(tombstone)은 heap_get이 거르고, UPDATE로 값이 바뀌어
+ * 남은 stale 인덱스 항목이나 슬롯 재사용은 cond 재평가로 거른다. */
+typedef struct {
+    Table *t;
+    const char *tname;
+    const Where *where;
+    FILE *out;
+    int count;
+} SecScanCtx;
+
+static int sec_scan_visit(bkey_t key, bval_t val, void *ctx_) {
+    (void)key;
+    SecScanCtx *s = ctx_;
+    uint8_t recbuf[PAGE_SIZE];
+    uint16_t len;
+    if (heap_get(&s->t->heap, rid_decode(val), recbuf, &len) != 0) {
+        return 0; /* 삭제된(tombstone) 행 */
+    }
+    Value row[SQL_MAX_COLS];
+    decode_row(&s->t->schema, recbuf, row);
+    if (where_matches(&s->t->schema, s->tname, s->where, row)) { /* 재검사 */
+        print_row(s->out, &s->t->schema, row);
+        s->count++;
+    }
+    return 0;
+}
+
 static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
     if (sel->num_joins > 0) {
         /* 조인: SELECT * 는 스트리밍, 투영/집계는 결합 행을 모아 처리 (둘 다 안에서 분기) */
@@ -2034,6 +2083,13 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
             btree_scan(&t->index, range_visit, &rc);
         }
         count = rc.count;
+    } else if (sec_index_for(t, tname, c0, pk_cond) >= 0) {
+        /* 비PK 컬럼 = 값 -> 보조 인덱스 find_all + heap_get + WHERE 재검사 */
+        db->used_index = 1;
+        int sk = sec_index_for(t, tname, c0, pk_cond);
+        SecScanCtx sc = {t, tname, &sel->where, out, 0};
+        btree_find_all(&t->sec[sk].tree, c0->val.int_val, sec_scan_visit, &sc);
+        count = sc.count;
     } else {
         /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> 풀 스캔 */
         SelectCtx ctx = {&t->schema, tname, &sel->where, out, 0};
