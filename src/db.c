@@ -511,6 +511,7 @@ static int exec_create_index(Database *db, const CreateIndexStmt *ci, FILE *out)
     SecBuildCtx bc = {si, col, &t->schema, 0};
     heap_scan(&t->heap, secidx_build_visit, &bc);
     bufpool_flush_all(si->tree.bp); /* WAL 없이 직접 영속화(한 번 만드는 DDL) */
+    si->txn_pages = si->tree.wal.data.num_pages; /* 혹시 트랜잭션 중이면 롤백이 이 크기로(=no-op) */
     t->num_sec++;
     catalog_write(db);
     fprintf(out, "인덱스 '%s' 생성됨 (%s.%s, 행 %d개 색인)\n", ci->name, ci->table, ci->column,
@@ -547,6 +548,12 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
     }
     if (t->has_index && in->values[0].type == VAL_INT) {
         btree_insert(&t->index, in->values[0].int_val, rid_encode(rid));
+    }
+    for (int k = 0; k < t->num_sec; k++) { /* 보조 인덱스도 (컬럼값 -> RID) 등록 */
+        int col = t->sec[k].col;
+        if (in->values[col].type == VAL_INT) { /* NULL은 색인 안 함 */
+            btree_insert_dup(&t->sec[k].tree, in->values[col].int_val, rid_encode(rid));
+        }
     }
     fprintf(out, "1개 행 삽입됨\n");
     return 0;
@@ -2126,9 +2133,16 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         if (heap_insert(&t->heap, newbuf, newlen, &newrid) != 0) {
             continue;
         }
-        /* 새 RID로 인덱스 갱신 — 안 하면 인덱스가 삭제된 옛 위치를 가리켜 행이 사라진다 */
+        /* 새 RID로 인덱스 갱신 — 안 하면 인덱스가 삭제된 옛 위치를 가리켜 행이 사라진다.
+         * RID가 통째로 바뀌므로 바뀐 컬럼과 무관하게 모든 인덱스에 새 RID를 다시 넣는다. */
         if (t->has_index && row[0].type == VAL_INT) {
             btree_insert(&t->index, row[0].int_val, rid_encode(newrid));
+        }
+        for (int k = 0; k < t->num_sec; k++) {
+            int col = t->sec[k].col;
+            if (row[col].type == VAL_INT) {
+                btree_insert_dup(&t->sec[k].tree, row[col].int_val, rid_encode(newrid));
+            }
         }
         n++;
     }
@@ -2178,6 +2192,11 @@ static int exec_begin(Database *db, FILE *out) {
             wal_begin(&t->index.wal);
             t->txn_index_pages = t->index.wal.data.num_pages;
         }
+        for (int k = 0; k < t->num_sec; k++) {
+            bufpool_set_no_steal(t->sec[k].tree.bp, 1);
+            wal_begin(&t->sec[k].tree.wal);
+            t->sec[k].txn_pages = t->sec[k].tree.wal.data.num_pages;
+        }
     }
     fprintf(out, "트랜잭션 시작\n");
     return 0;
@@ -2195,6 +2214,10 @@ static int exec_commit(Database *db, FILE *out) {
         if (t->has_index) {
             wal_flush_commit(t->index.bp, &t->index.wal); /* 인덱스: 인덱스 WAL로 */
             bufpool_set_no_steal(t->index.bp, 0);
+        }
+        for (int k = 0; k < t->num_sec; k++) {
+            wal_flush_commit(t->sec[k].tree.bp, &t->sec[k].tree.wal);
+            bufpool_set_no_steal(t->sec[k].tree.bp, 0);
         }
     }
     db->in_txn = 0;
@@ -2219,6 +2242,13 @@ static int exec_rollback(Database *db, FILE *out) {
             wal_begin(&t->index.wal);
             btree_reload_root(&t->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
             bufpool_set_no_steal(t->index.bp, 0);
+        }
+        for (int k = 0; k < t->num_sec; k++) {
+            bufpool_discard_dirty(t->sec[k].tree.bp);
+            pager_truncate(&t->sec[k].tree.wal.data, t->sec[k].txn_pages);
+            wal_begin(&t->sec[k].tree.wal);
+            btree_reload_root(&t->sec[k].tree);
+            bufpool_set_no_steal(t->sec[k].tree.bp, 0);
         }
     }
     db->in_txn = 0;
@@ -2306,6 +2336,9 @@ int db_exec(Database *db, const char *sql, FILE *out) {
             if (db->tables[i].has_index) {
                 bufpool_set_no_steal(db->tables[i].index.bp, 1);
             }
+            for (int k = 0; k < db->tables[i].num_sec; k++) {
+                bufpool_set_no_steal(db->tables[i].sec[k].tree.bp, 1);
+            }
         }
     }
     int rc;
@@ -2329,6 +2362,9 @@ int db_exec(Database *db, const char *sql, FILE *out) {
                 if (t->has_index) {
                     wal_flush_commit(t->index.bp, &t->index.wal); /* 인덱스: 인덱스 WAL로 */
                 }
+                for (int k = 0; k < t->num_sec; k++) {
+                    wal_flush_commit(t->sec[k].tree.bp, &t->sec[k].tree.wal);
+                }
             } else {
                 bufpool_discard_dirty(t->bp); /* 실패한 문장의 변경은 버린다 */
                 wal_begin(&t->wal);
@@ -2336,10 +2372,17 @@ int db_exec(Database *db, const char *sql, FILE *out) {
                     bufpool_discard_dirty(t->index.bp);
                     wal_begin(&t->index.wal);
                 }
+                for (int k = 0; k < t->num_sec; k++) {
+                    bufpool_discard_dirty(t->sec[k].tree.bp);
+                    wal_begin(&t->sec[k].tree.wal);
+                }
             }
             bufpool_set_no_steal(t->bp, 0);
             if (t->has_index) {
                 bufpool_set_no_steal(t->index.bp, 0);
+            }
+            for (int k = 0; k < t->num_sec; k++) {
+                bufpool_set_no_steal(t->sec[k].tree.bp, 0);
             }
         }
     }

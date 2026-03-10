@@ -83,14 +83,25 @@ int main(void) {
     CHECK(strstr(o, "ERROR") && strstr(o, "이미"), "이름 중복 -> 거부");
     free(o);
 
-    /* 영속성: 닫고 다시 열어도 보조 인덱스가 살아 있다 */
+    /* DML 유지보수: INSERT가 보조 인덱스도 갱신한다 */
+    o = run(&db, "INSERT INTO t VALUES (6, 20, 'f')"); free(o);
+    CHECK(find_count(&t->sec[0].tree, 20) == 4, "INSERT 후 find_all(age=20) -> 4행");
+
+    /* 인덱스도 WAL로 묶이므로 롤백 시 함께 되돌아간다 */
+    o = run(&db, "BEGIN"); free(o);
+    o = run(&db, "INSERT INTO t VALUES (7, 20, 'g')"); free(o);
+    CHECK(find_count(&t->sec[0].tree, 20) == 5, "트랜잭션 중 INSERT -> 인덱스 5행");
+    o = run(&db, "ROLLBACK"); free(o);
+    CHECK(find_count(&t->sec[0].tree, 20) == 4, "ROLLBACK -> 인덱스 4행으로 복원");
+
+    /* 영속성: 닫고 다시 열어도 보조 인덱스가 살아 있다 (id=6 커밋분 포함, id=7 롤백분 제외) */
     db_close(&db);
     Database db2;
     db_open(&db2, path);
     Table *t2 = &db2.tables[0];
     CHECK(t2->num_sec == 1 && strcmp(t2->sec[0].name, "age_idx") == 0 && t2->sec[0].col == 1,
           "재오픈 후 보조 인덱스 메타 복원");
-    CHECK(find_count(&t2->sec[0].tree, 20) == 3, "재오픈 후 find_all(age=20) -> 3행");
+    CHECK(find_count(&t2->sec[0].tree, 20) == 4, "재오픈 후 find_all(age=20) -> 4행(커밋분 영속)");
     db_close(&db2);
 
     /* 정리 */

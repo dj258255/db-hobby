@@ -38,6 +38,7 @@ typedef struct {
     char name[SQL_NAME_LEN]; /* 인덱스 이름 */
     int col;                 /* 인덱싱하는 컬럼 위치 */
     BTree tree;
+    uint64_t txn_pages;      /* BEGIN 시점 인덱스 파일 페이지 수(롤백 복원용) */
 } SecIndex;
 
 typedef struct {
