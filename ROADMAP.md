@@ -1,9 +1,9 @@
 # minidb 로드맵 (Done / Next)
 
-진행 상황 한눈에. 블로그 시리즈(1~9편)와 그 뒤 추가분을 추적한다.
+진행 상황 한눈에. 블로그 시리즈(1~10편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope" 섹션, 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 271개 / 16스위트 통과.**
+현재: **테스트 292개 / 17스위트 통과.**
 
 ## Done
 
@@ -30,8 +30,12 @@ PK 외 임의 컬럼에 인덱스. 4단계로 쪼갠다.
   - [x] DELETE/UPDATE의 stale 인덱스 항목은 4단계의 heap_get + WHERE 재검사로 걸러짐
 - [x] **4. 플래너가 보조 인덱스 선택 + EXPLAIN 표시** — WHERE 비PK컬럼=값이면 find_all로 후보 RID -> heap_get + WHERE 재검사(tombstone/stale 거름). EXPLAIN에 `Index Scan using <name>`.
 
-### 격리 / 동시성 (ACID의 I) — 가장 큼
-- [ ] 동시 트랜잭션(스레드), MVCC(스냅샷) 또는 2PL 락, 격리 수준
+### 격리 / 동시성 (ACID의 I) — 진행 중
+단일 스레드라 OS 동시성은 없다. 대신 인터리브된 in-process 트랜잭션 + 2PL 락으로
+격리의 핵심(충돌 직렬화, lost update/dirty read 방지)을 보인다. 단계로 쪼갠다.
+- [x] **1. 락 매니저** — (테이블,키) 단위 S/X 락, 충돌 행렬, acquire(충돌이면 -1)/release, S->X 업그레이드
+- [ ] 2. 다중 트랜잭션 핸들 + DML에 락 통합(읽기 S, 쓰기 X), 인터리브 데모로 lost update/dirty read 방지 증명
+- [ ] 3. 교착 탐지(wait-for 그래프) 또는 타임아웃/abort
 
 ### 그 밖에 (작은~중간)
 - [ ] B+Tree 삭제 (현재 삭제 행은 힙에서 tombstone, 인덱스 항목은 방치)

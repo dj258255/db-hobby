@@ -3,10 +3,10 @@ CFLAGS ?= -std=gnu11 -Wall -Wextra -g
 BUILD := build
 
 # 핵심 소스 (계층이 늘면 여기에 추가)
-SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/btree.c src/wal.c
+SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/btree.c src/wal.c src/lock.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock
 
 .PHONY: test repl clean bench
 
