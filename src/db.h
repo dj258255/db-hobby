@@ -8,6 +8,7 @@
 #include "btree.h"
 #include "wal.h"
 #include "sql.h"
+#include "lock.h"
 
 /*
  * Database — 모든 계층을 하나로 묶어 SQL을 실행한다.
@@ -63,6 +64,10 @@ typedef struct {
 
     int used_index; /* 직전 SELECT가 인덱스를 썼나 (시연·테스트용) */
     int in_txn;     /* 명시적 트랜잭션(BEGIN) 중인가 */
+
+    LockManager lm; /* 2PL 테이블 락 — 인터리브된 트랜잭션 충돌 탐지(격리) */
+    int cur_txn;    /* 현재 트랜잭션 id (락 소유자). 0이면 없음 */
+    int next_txn;   /* 다음 트랜잭션 id 발급기 */
 } Database;
 
 /* 파일을 열어 DB를 준비한다. 0 성공, -1 실패. */

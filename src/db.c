@@ -2238,6 +2238,7 @@ static int exec_begin(Database *db, FILE *out) {
         return -1;
     }
     db->in_txn = 1;
+    db->cur_txn = db->next_txn++; /* 이 트랜잭션의 락 소유자 id */
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
         bufpool_set_no_steal(t->bp, 1);
@@ -2276,6 +2277,8 @@ static int exec_commit(Database *db, FILE *out) {
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
         }
     }
+    lock_release_all(&db->lm, db->cur_txn); /* 2PL: 끝에서 한꺼번에 푼다 */
+    db->cur_txn = 0;
     db->in_txn = 0;
     fprintf(out, "커밋됨\n");
     return 0;
@@ -2307,6 +2310,8 @@ static int exec_rollback(Database *db, FILE *out) {
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
         }
     }
+    lock_release_all(&db->lm, db->cur_txn); /* 2PL: 끝에서 한꺼번에 푼다 */
+    db->cur_txn = 0;
     db->in_txn = 0;
     fprintf(out, "롤백됨\n");
     return 0;
@@ -2319,6 +2324,9 @@ int db_open(Database *db, const char *path) {
     db->num_tables = 0;
     db->used_index = 0;
     db->in_txn = 0;
+    lock_init(&db->lm);
+    db->cur_txn = 0;
+    db->next_txn = 1;
 
     /* 카탈로그가 있으면 테이블 목록을 복원하고 각 테이블 파일을 연다. */
     FILE *f = fopen(path, "rb");
@@ -2363,6 +2371,43 @@ void db_close(Database *db) {
     db->num_tables = 0;
 }
 
+/* 테이블 하나에 락을 건다(키 0 = 테이블 전체). 충돌이면 에러를 찍고 -1. */
+static int lock_one(Database *db, const char *table, LockMode mode, int txn, FILE *out) {
+    if (lock_acquire(&db->lm, txn, table, 0, mode) != 0) {
+        fprintf(out, "ERROR: 테이블 '%s'가 다른 트랜잭션에 잠겨 있습니다 (%s 충돌)\n", table,
+                mode == LOCK_X ? "쓰기" : "읽기");
+        return -1;
+    }
+    return 0;
+}
+
+/* 문장이 건드리는 테이블에 락(쓰기 X / 읽기 S). 충돌이면 -1. CREATE/INDEX/트랜잭션 제어는 안 검. */
+static int acquire_stmt_locks(Database *db, const Statement *st, int txn, FILE *out) {
+    switch (st->type) {
+        case STMT_INSERT:
+            return lock_one(db, st->insert.table, LOCK_X, txn, out);
+        case STMT_DELETE:
+            return lock_one(db, st->del.table, LOCK_X, txn, out);
+        case STMT_UPDATE:
+            return lock_one(db, st->upd.table, LOCK_X, txn, out);
+        case STMT_SELECT:
+            if (st->select.explain) {
+                return 0; /* EXPLAIN은 실행을 안 하니 락 불필요 */
+            }
+            if (lock_one(db, st->select.table, LOCK_S, txn, out) != 0) {
+                return -1;
+            }
+            for (int k = 0; k < st->select.num_joins; k++) {
+                if (lock_one(db, st->select.joins[k].table, LOCK_S, txn, out) != 0) {
+                    return -1;
+                }
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
 int db_exec(Database *db, const char *sql, FILE *out) {
     Statement st;
     char err[128];
@@ -2380,6 +2425,22 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         fprintf(out, "ERROR: 서브쿼리를 실행할 수 없습니다 (지원 형태: SELECT <컬럼> FROM <테이블> [WHERE ...])\n");
         statement_free(&st);
         return -1;
+    }
+    /* 격리(2PL): 이 문장이 건드리는 테이블에 락을 건다. 명시적 트랜잭션이면 그 txn id로
+     * 잡아 COMMIT/ROLLBACK까지 쥐고, autocommit이면 임시 id로 잡았다가 문장 끝에 푼다.
+     * 다른 트랜잭션이 이미 충돌 락을 쥐고 있으면(단일 스레드라 "블록" 대신) 문장을 거부한다. */
+    int lock_txn = 0, lock_autorelease = 0;
+    if (st.type == STMT_INSERT || st.type == STMT_DELETE || st.type == STMT_UPDATE ||
+        (st.type == STMT_SELECT && !st.select.explain)) {
+        lock_txn = db->in_txn ? db->cur_txn : db->next_txn++;
+        lock_autorelease = !db->in_txn;
+        if (acquire_stmt_locks(db, &st, lock_txn, out) != 0) {
+            if (lock_autorelease) {
+                lock_release_all(&db->lm, lock_txn);
+            }
+            statement_free(&st);
+            return -1;
+        }
     }
     /* autocommit: 트랜잭션 밖 DML은 이 문장 하나가 곧 한 트랜잭션이다. WAL로 커밋될
      * 때까지 dirty 페이지(데이터·인덱스 둘 다)가 디스크로 새지 않게 no-steal을 켠다. */
@@ -2441,6 +2502,9 @@ int db_exec(Database *db, const char *sql, FILE *out) {
                 bufpool_set_no_steal(t->sec[k].tree.bp, 0);
             }
         }
+    }
+    if (lock_autorelease) {
+        lock_release_all(&db->lm, lock_txn); /* autocommit 문장: 잡았던 락을 푼다 */
     }
     statement_free(&st); /* 서브쿼리·IN 집합 해제 */
     return rc;

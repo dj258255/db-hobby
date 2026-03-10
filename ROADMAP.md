@@ -3,7 +3,7 @@
 진행 상황 한눈에. 블로그 시리즈(1~10편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope" 섹션, 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 292개 / 17스위트 통과.**
+현재: **테스트 302개 / 18스위트 통과.**
 
 ## Done
 
@@ -34,7 +34,7 @@ PK 외 임의 컬럼에 인덱스. 4단계로 쪼갠다.
 단일 스레드라 OS 동시성은 없다. 대신 인터리브된 in-process 트랜잭션 + 2PL 락으로
 격리의 핵심(충돌 직렬화, lost update/dirty read 방지)을 보인다. 단계로 쪼갠다.
 - [x] **1. 락 매니저** — (테이블,키) 단위 S/X 락, 충돌 행렬, acquire(충돌이면 -1)/release, S->X 업그레이드
-- [ ] 2. 다중 트랜잭션 핸들 + DML에 락 통합(읽기 S, 쓰기 X), 인터리브 데모로 lost update/dirty read 방지 증명
+- [x] **2. DML에 락 통합 + 인터리브 데모** — INSERT/UPDATE/DELETE는 테이블 X, SELECT는 S 락을 cur_txn으로 잡아 2PL(COMMIT/ROLLBACK까지 유지). 충돌은 단일 스레드라 거부(ERROR). test_isolation이 다른 txn 락을 주입해 dirty read/lost update 방지·reader 호환을 진짜 엔진에서 시연.
 - [ ] 3. 교착 탐지(wait-for 그래프) 또는 타임아웃/abort
 
 ### 그 밖에 (작은~중간)

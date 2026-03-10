@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (292 checks across 17 suites).
+covered by tests (302 checks across 18 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -146,8 +146,11 @@ OR, no parentheses); joins are INNER only, each `ON` is a single `=`, chained up
 to 4 tables (`INNER` and `LEFT`, aliases supported, so self-joins work);
 projection, aggregation, `GROUP BY`, and `HAVING` work over a single table or a
 join result; `NULL` can be stored (nullable columns) or arise from `LEFT JOIN`, except the PK column; subqueries are
-uncorrelated and single-table/single-column; there is no isolation/concurrency
-(one transaction at a time); the WAL protects both the data (`.tbl`) and index
+uncorrelated and single-table/single-column; execution is single-threaded, but
+interleaved transactions are isolated by 2PL **table-level** locks (writes take an
+`X` lock, reads an `S` lock, held until commit/rollback), and a conflict is
+rejected rather than blocked on since there are no threads to wait; the WAL
+protects both the data (`.tbl`) and index
 (`.idx`) files, and a transaction's dirty pages must fit in the buffer pool. B+Tree
 deletion isn't implemented (deleted rows are tombstoned in the heap, so a stale
 index entry is harmless). These are noted in the code where they matter.
