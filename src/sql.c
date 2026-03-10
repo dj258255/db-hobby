@@ -19,7 +19,7 @@ typedef enum {
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
     TOK_IS, TOK_NOT, TOK_NULL, TOK_DISTINCT, TOK_IN, TOK_OFFSET, TOK_BETWEEN, TOK_LIKE,
-    TOK_EXPLAIN,
+    TOK_EXPLAIN, TOK_INDEX,
     TOK_ERROR
 } TokType;
 
@@ -73,6 +73,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "BETWEEN")) return TOK_BETWEEN;
     if (!strcasecmp(s, "LIKE")) return TOK_LIKE;
     if (!strcasecmp(s, "EXPLAIN")) return TOK_EXPLAIN;
+    if (!strcasecmp(s, "INDEX")) return TOK_INDEX;
     return TOK_IDENT;
 }
 
@@ -437,6 +438,19 @@ static void parse_create(Parser *p, Statement *st) {
     p_expect(p, TOK_RPAREN, ") 가 필요합니다");
 }
 
+/* CREATE INDEX <name> ON <table>(<col>) */
+static void parse_create_index(Parser *p, Statement *st) {
+    st->type = STMT_CREATE_INDEX;
+    CreateIndexStmt *ci = &st->cidx;
+    p_expect(p, TOK_INDEX, "CREATE 다음에 TABLE 또는 INDEX가 필요합니다");
+    parse_name(p, ci->name);
+    p_expect(p, TOK_ON, "INDEX <이름> 다음에 ON이 필요합니다");
+    parse_name(p, ci->table);
+    p_expect(p, TOK_LPAREN, "테이블명 다음에 ( 가 필요합니다");
+    parse_name(p, ci->column);
+    p_expect(p, TOK_RPAREN, ") 가 필요합니다");
+}
+
 static void parse_insert(Parser *p, Statement *st) {
     st->type = STMT_INSERT;
     InsertStmt *in = &st->insert;
@@ -688,7 +702,14 @@ int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
 
     memset(out, 0, sizeof(*out));
     switch (p.cur.type) {
-        case TOK_CREATE: p_advance(&p); parse_create(&p, out); break;
+        case TOK_CREATE:
+            p_advance(&p);
+            if (p.cur.type == TOK_INDEX) { /* CREATE INDEX ... */
+                parse_create_index(&p, out);
+            } else { /* CREATE TABLE ... */
+                parse_create(&p, out);
+            }
+            break;
         case TOK_INSERT: p_advance(&p); parse_insert(&p, out); break;
         case TOK_SELECT: p_advance(&p); parse_select(&p, out); break;
         case TOK_EXPLAIN: /* EXPLAIN <select> — 플랜만 출력 */

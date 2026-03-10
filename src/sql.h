@@ -14,6 +14,7 @@
  *
  * 지원 문법(학습용 최소 부분집합):
  *   CREATE TABLE <name> (<col> INT|TEXT [NOT NULL], ...)
+ *   CREATE INDEX <name> ON <table> (<col>)        (INT 컬럼 보조 인덱스)
  *   INSERT INTO <name> VALUES (<int|'text'>, ...)
  *   SELECT <* | item, ...> FROM <name> [JOIN <name> ON <colref> = <colref>]...
  *                        [WHERE <cond> [AND <cond>] [OR ...]]
@@ -98,6 +99,7 @@ typedef enum {
     STMT_BEGIN,    /* BEGIN — 트랜잭션 시작 */
     STMT_COMMIT,   /* COMMIT — 확정 */
     STMT_ROLLBACK, /* ROLLBACK — 되돌리기 */
+    STMT_CREATE_INDEX, /* CREATE INDEX <name> ON <table>(<col>) */
 } StmtType;
 
 typedef struct {
@@ -182,6 +184,12 @@ typedef struct {
 } UpdateStmt;
 
 typedef struct {
+    char name[SQL_NAME_LEN];   /* 인덱스 이름 */
+    char table[SQL_NAME_LEN];  /* 대상 테이블 */
+    char column[SQL_NAME_LEN]; /* 인덱싱할 컬럼 */
+} CreateIndexStmt;
+
+typedef struct {
     StmtType type;
     union {
         CreateStmt create;
@@ -189,6 +197,7 @@ typedef struct {
         SelectStmt select;
         DeleteStmt del;
         UpdateStmt upd;
+        CreateIndexStmt cidx;
     };
 } Statement;
 

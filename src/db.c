@@ -118,6 +118,14 @@ static void catalog_write(Database *db) {
     fwrite(&n, sizeof(n), 1, f);
     for (int i = 0; i < db->num_tables; i++) {
         fwrite(&db->tables[i].schema, sizeof(CreateStmt), 1, f);
+        /* 보조 인덱스 정의(개수 + 각 {이름, 컬럼 위치})도 같이 직렬화 */
+        int32_t ns = db->tables[i].num_sec;
+        fwrite(&ns, sizeof(ns), 1, f);
+        for (int k = 0; k < db->tables[i].num_sec; k++) {
+            fwrite(db->tables[i].sec[k].name, SQL_NAME_LEN, 1, f);
+            int32_t col = db->tables[i].sec[k].col;
+            fwrite(&col, sizeof(col), 1, f);
+        }
     }
     fclose(f);
 }
@@ -147,10 +155,22 @@ static int table_open_files(Table *t, const char *dbpath) {
             t->has_index = 1;
         }
     }
+    /* 보조 인덱스들(재오픈 시 카탈로그가 채운 num_sec/sec[]대로). 새 테이블은 num_sec=0. */
+    for (int k = 0; k < t->num_sec; k++) {
+        char sp[780];
+        snprintf(sp, sizeof(sp), "%s.%s.%s.idx", dbpath, t->schema.table, t->sec[k].name);
+        if (btree_open(&t->sec[k].tree, sp) != 0) {
+            return -1;
+        }
+    }
     return 0;
 }
 
 static void table_close_files(Table *t) {
+    for (int k = 0; k < t->num_sec; k++) {
+        btree_close(&t->sec[k].tree);
+    }
+    t->num_sec = 0;
     if (t->has_index) {
         btree_close(&t->index);
         t->has_index = 0;
@@ -402,6 +422,7 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
 
     Table *t = &db->tables[db->num_tables];
     t->schema = *c;
+    t->num_sec = 0; /* 새 테이블은 보조 인덱스 없음 */
     if (table_open_files(t, db->path) != 0) {
         fprintf(out, "ERROR: 테이블 파일을 열 수 없습니다\n");
         return -1;
@@ -413,6 +434,87 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
     if (t->has_index) {
         fprintf(out, "  (인덱스: %s 컬럼)\n", t->schema.columns[0].name);
     }
+    return 0;
+}
+
+/* CREATE INDEX: 기존 행을 훑어 보조 인덱스를 채우는 콜백 */
+typedef struct {
+    SecIndex *si;
+    int col;
+    const CreateStmt *schema;
+    int count;
+} SecBuildCtx;
+
+static int secidx_build_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)len;
+    SecBuildCtx *c = ctx_;
+    Value row[SQL_MAX_COLS];
+    decode_row(c->schema, (const uint8_t *)rec, row);
+    if (row[c->col].type == VAL_INT) { /* NULL/비INT는 색인 안 함 */
+        btree_insert_dup(&c->si->tree, row[c->col].int_val, rid_encode(rid));
+        c->count++;
+    }
+    return 0;
+}
+
+/* CREATE INDEX <name> ON <table>(<col>) — INT 컬럼에 비유니크 보조 인덱스를 만든다.
+ * 새 파일을 열어 기존 행으로 채우고, 직접 flush한 뒤 카탈로그에 영속화한다(DDL이라 즉시 반영). */
+static int exec_create_index(Database *db, const CreateIndexStmt *ci, FILE *out) {
+    Table *t = find_table(db, ci->table);
+    if (!t) {
+        fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", ci->table);
+        return -1;
+    }
+    int col = -1;
+    for (int i = 0; i < t->schema.num_columns; i++) {
+        if (strcmp(t->schema.columns[i].name, ci->column) == 0) {
+            col = i;
+            break;
+        }
+    }
+    if (col < 0) {
+        fprintf(out, "ERROR: '%s' 컬럼이 없습니다\n", ci->column);
+        return -1;
+    }
+    if (t->schema.columns[col].type != COL_INT) {
+        fprintf(out, "ERROR: 보조 인덱스는 INT 컬럼에만 걸 수 있습니다 (%s)\n", ci->column);
+        return -1;
+    }
+    if (col == 0 && t->has_index) {
+        fprintf(out, "ERROR: 첫 컬럼은 이미 PK 인덱스가 있습니다\n");
+        return -1;
+    }
+    if (t->num_sec >= DB_MAX_SEC_IDX) {
+        fprintf(out, "ERROR: 보조 인덱스가 너무 많습니다 (최대 %d개)\n", DB_MAX_SEC_IDX);
+        return -1;
+    }
+    for (int k = 0; k < t->num_sec; k++) {
+        if (strcmp(t->sec[k].name, ci->name) == 0) {
+            fprintf(out, "ERROR: 이미 인덱스 '%s' 가 있습니다\n", ci->name);
+            return -1;
+        }
+    }
+
+    SecIndex *si = &t->sec[t->num_sec];
+    snprintf(si->name, SQL_NAME_LEN, "%s", ci->name);
+    si->col = col;
+    char sp[780], swp[800];
+    snprintf(sp, sizeof(sp), "%s.%s.%s.idx", db->path, t->schema.table, ci->name);
+    snprintf(swp, sizeof(swp), "%s.wal", sp);
+    unlink(sp); /* 옛 파일 정리 */
+    unlink(swp);
+    if (btree_open(&si->tree, sp) != 0) {
+        fprintf(out, "ERROR: 인덱스 파일을 열 수 없습니다\n");
+        return -1;
+    }
+    /* 기존 행을 훑어 (컬럼값 -> RID) 등록 */
+    SecBuildCtx bc = {si, col, &t->schema, 0};
+    heap_scan(&t->heap, secidx_build_visit, &bc);
+    bufpool_flush_all(si->tree.bp); /* WAL 없이 직접 영속화(한 번 만드는 DDL) */
+    t->num_sec++;
+    catalog_write(db);
+    fprintf(out, "인덱스 '%s' 생성됨 (%s.%s, 행 %d개 색인)\n", ci->name, ci->table, ci->column,
+            bc.count);
     return 0;
 }
 
@@ -2144,6 +2246,20 @@ int db_open(Database *db, const char *path) {
                 }
                 Table *t = &db->tables[db->num_tables];
                 t->schema = s;
+                /* 보조 인덱스 정의 복원(없거나 옛 포맷이면 0개로) */
+                t->num_sec = 0;
+                int32_t ns = 0;
+                if (fread(&ns, sizeof(ns), 1, f) == 1 && ns >= 0 && ns <= DB_MAX_SEC_IDX) {
+                    for (int k = 0; k < ns; k++) {
+                        int32_t col = 0;
+                        if (fread(t->sec[k].name, SQL_NAME_LEN, 1, f) != 1 ||
+                            fread(&col, sizeof(col), 1, f) != 1) {
+                            break;
+                        }
+                        t->sec[k].col = col;
+                        t->num_sec++;
+                    }
+                }
                 if (table_open_files(t, db->path) == 0) {
                     db->num_tables++;
                 }
@@ -2195,6 +2311,7 @@ int db_exec(Database *db, const char *sql, FILE *out) {
     int rc;
     switch (st.type) {
         case STMT_CREATE: rc = exec_create(db, &st.create, out); break;
+        case STMT_CREATE_INDEX: rc = exec_create_index(db, &st.cidx, out); break;
         case STMT_INSERT: rc = exec_insert(db, &st.insert, out); break;
         case STMT_SELECT: rc = exec_select(db, &st.select, out); break;
         case STMT_DELETE: rc = exec_delete(db, &st.del, out); break;

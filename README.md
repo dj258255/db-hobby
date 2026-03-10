@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (251 checks across 15 suites).
+covered by tests (263 checks across 16 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -82,6 +82,7 @@ mydb.orders.idx.wal
 
 ```
 CREATE TABLE <t> (<col> INT|TEXT [NOT NULL], ...)
+CREATE INDEX <name> ON <t> (<col>)   -- secondary index on an INT column
 INSERT INTO <t> VALUES (<int|'text'>, ...)
 SELECT [DISTINCT] <* | item, ...>
        FROM <t> [<alias>] [[LEFT] JOIN <t2> [<alias>] ON <colref> = <colref>]...

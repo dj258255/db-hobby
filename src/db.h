@@ -30,6 +30,15 @@
  */
 
 #define DB_MAX_TABLES 16
+#define DB_MAX_SEC_IDX 4 /* 테이블당 보조 인덱스 최대 개수 */
+
+/* 보조 인덱스(CREATE INDEX) — PK가 아닌 INT 컬럼에 거는 비유니크 B+Tree.
+ * 자기 파일 <db>.<tbl>.<name>.idx(+.wal)를 쓰고, 키=컬럼값, 값=RID. */
+typedef struct {
+    char name[SQL_NAME_LEN]; /* 인덱스 이름 */
+    int col;                 /* 인덱싱하는 컬럼 위치 */
+    BTree tree;
+} SecIndex;
 
 typedef struct {
     CreateStmt schema;
@@ -38,6 +47,9 @@ typedef struct {
     Heap heap;
     BTree index; /* 첫 컬럼(INT PK) 인덱스 */
     int has_index;
+
+    SecIndex sec[DB_MAX_SEC_IDX]; /* 보조 인덱스들 */
+    int num_sec;
 
     uint64_t txn_data_pages;  /* BEGIN 시점 데이터 파일 페이지 수(롤백 복원용) */
     uint64_t txn_index_pages; /* BEGIN 시점 인덱스 파일 페이지 수 */
