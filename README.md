@@ -150,7 +150,10 @@ join result; `NULL` can be stored (nullable columns) or arise from `LEFT JOIN`, 
 uncorrelated and single-table/single-column; execution is single-threaded, but
 interleaved transactions are isolated by 2PL **table-level** locks (writes take an
 `X` lock, reads an `S` lock, held until commit/rollback), and a conflict is
-rejected rather than blocked on since there are no threads to wait; the WAL
+rejected rather than blocked on since there are no threads to wait. This is
+lock-based (2PL), **not** MVCC/snapshot isolation, and the executor keeps one
+transaction open at a time (a conflict is demonstrated by injecting a competing
+lock). The WAL
 protects both the data (`.tbl`) and index
 (`.idx`) files, and a transaction's dirty pages must fit in the buffer pool. B+Tree
 deletion isn't implemented (deleted rows are tombstoned in the heap, so a stale

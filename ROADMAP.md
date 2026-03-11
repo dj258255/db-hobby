@@ -37,6 +37,15 @@ PK 외 임의 컬럼에 인덱스. 4단계로 쪼갠다.
 - [x] **2. DML에 락 통합 + 인터리브 데모** — INSERT/UPDATE/DELETE는 테이블 X, SELECT는 S 락을 cur_txn으로 잡아 2PL(COMMIT/ROLLBACK까지 유지). 충돌은 단일 스레드라 거부(ERROR). test_isolation이 다른 txn 락을 주입해 dirty read/lost update 방지·reader 호환을 진짜 엔진에서 시연.
 - [x] **3. 교착 탐지** — wait-for 그래프(누가 누구를 기다리나) + DFS 순환 탐지. 거부 모델이라 실제 교착은 안 생기지만, "대기한다면" 생길 순환을 lock_deadlock_victim이 찾아 victim 반환(2중/3중 순환 데모).
 
+### MVCC (스냅샷 격리) — 진짜 PostgreSQL식 격리 (다음 큰 주제)
+현재 격리는 테이블 단위 2PL(잠금)이라 거칠고, 충돌을 거부하며, 실행기가 트랜잭션을 하나씩만 연다.
+PostgreSQL식은 MVCC(다중 버전): **읽기가 쓰기를 막지 않고**, 각 트랜잭션이 자기 스냅샷을 본다.
+minidb 저장 구조는 이미 MVCC에 맞다 — 힙, dead tuple, UPDATE=새 버전(=PG). 빠진 조각만 채운다.
+- [ ] 1. 트랜잭션 id + 상태 로그(커밋/아보트) + 행에 `xmin`/`xmax` (지금의 tombstone 비트를 xmax로 승격)
+- [ ] 2. 스냅샷 + 가시성 판정 (SELECT가 "내 스냅샷에서 보이는 버전"만 — xmin 커밋·보임 + xmax 안 보임)
+- [ ] 3. 다중 트랜잭션 핸들 + 인터리브 데모 (reader가 writer를 안 막는 걸 진짜로 시연)
+- [ ] 4. 쓰기-쓰기 충돌(first-updater-wins) + VACUUM(죽은 버전·인덱스 항목 회수)
+
 ### 그 밖에 (작은~중간)
 - [ ] B+Tree 삭제 (현재 삭제 행은 힙에서 tombstone, 인덱스 항목은 방치)
 - [ ] 버퍼 풀을 넘는 큰 트랜잭션 (no-steal + WAL_MAX_STAGED 한계)
