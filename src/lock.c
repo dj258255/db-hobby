@@ -6,6 +6,8 @@
 void lock_init(LockManager *lm) {
     lm->n = 0;
     memset(lm->entries, 0, sizeof(lm->entries));
+    lm->nwaits = 0;
+    memset(lm->waits, 0, sizeof(lm->waits));
 }
 
 static int same_obj(const LockEntry *e, const char *table, long key) {
@@ -85,6 +87,104 @@ int lock_held(const LockManager *lm, int txn, const char *table, long key) {
         const LockEntry *e = &lm->entries[i];
         if (e->txn == txn && e->key == key && strcmp(e->table, table) == 0) {
             return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 교착 탐지 ---- */
+
+void lock_wait_add(LockManager *lm, int txn, const char *table, long key, LockMode mode) {
+    for (int i = 0; i < lm->nwaits; i++) { /* 같은 txn의 옛 대기는 교체(한 번에 하나만 기다린다) */
+        if (lm->waits[i].txn == txn) {
+            snprintf(lm->waits[i].table, LOCK_NAME_LEN, "%s", table);
+            lm->waits[i].key = key;
+            lm->waits[i].mode = mode;
+            return;
+        }
+    }
+    if (lm->nwaits >= LOCK_MAX_WAITS) {
+        return;
+    }
+    LockWait *w = &lm->waits[lm->nwaits++];
+    w->txn = txn;
+    snprintf(w->table, LOCK_NAME_LEN, "%s", table);
+    w->key = key;
+    w->mode = mode;
+}
+
+void lock_wait_clear(LockManager *lm, int txn) {
+    for (int i = 0; i < lm->nwaits; i++) {
+        if (lm->waits[i].txn == txn) {
+            lm->waits[i] = lm->waits[--lm->nwaits]; /* 끝 칸을 당겨와 빈틈 메움 */
+            return;
+        }
+    }
+}
+
+/* txn이 기다리는 락의 충돌 보유자들(= txn이 기다리는 트랜잭션들)을 out에 모은다. */
+static int wait_targets(const LockManager *lm, int txn, int *out, int max) {
+    int n = 0;
+    const LockWait *w = NULL;
+    for (int i = 0; i < lm->nwaits; i++) {
+        if (lm->waits[i].txn == txn) {
+            w = &lm->waits[i];
+            break;
+        }
+    }
+    if (!w) {
+        return 0;
+    }
+    for (int i = 0; i < lm->n; i++) {
+        const LockEntry *e = &lm->entries[i];
+        if (e->txn == 0 || e->txn == txn || e->key != w->key || strcmp(e->table, w->table) != 0) {
+            continue;
+        }
+        int conflict = (w->mode == LOCK_X) || (e->mode == LOCK_X); /* 호환 행렬 */
+        if (!conflict) {
+            continue;
+        }
+        int dup = 0;
+        for (int j = 0; j < n; j++) {
+            if (out[j] == e->txn) {
+                dup = 1;
+            }
+        }
+        if (!dup && n < max) {
+            out[n++] = e->txn;
+        }
+    }
+    return n;
+}
+
+/* path를 따라 wait-for 그래프를 DFS. txn이 path에 다시 나오면 순환 -> 그 txn 반환. */
+static int dfs_cycle(const LockManager *lm, int txn, int *path, int depth) {
+    for (int i = 0; i < depth; i++) {
+        if (path[i] == txn) {
+            return txn; /* 이미 경로에 있음 = 순환 */
+        }
+    }
+    if (depth >= LOCK_MAX_WAITS) {
+        return 0;
+    }
+    path[depth] = txn;
+    int targets[LOCK_MAX];
+    int nt = wait_targets(lm, txn, targets, LOCK_MAX);
+    for (int i = 0; i < nt; i++) {
+        int v = dfs_cycle(lm, targets[i], path, depth + 1);
+        if (v) {
+            return v;
+        }
+    }
+    return 0;
+}
+
+int lock_deadlock_victim(LockManager *lm) {
+    int path[LOCK_MAX_WAITS];
+    for (int i = 0; i < lm->nwaits; i++) {
+        int v = dfs_cycle(lm, lm->waits[i].txn, path, 0);
+        if (v) {
+            return v;
         }
     }
     return 0;

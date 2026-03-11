@@ -62,6 +62,36 @@ int main(void) {
     CHECK(lock_acquire(&lm, 2, "acct", 100, LOCK_X) == -1,
           "T2: 같은 잔액 행 X 충돌 -> lost update 방지");
 
+    /* ---- 교착 탐지: wait-for 그래프 순환 ---- */
+
+    /* 고전 교착: T1이 A 쥐고 B 기다림, T2가 B 쥐고 A 기다림 (T1<->T2) */
+    lock_init(&lm);
+    lock_acquire(&lm, 1, "A", 0, LOCK_X);
+    lock_acquire(&lm, 2, "B", 0, LOCK_X);
+    lock_wait_add(&lm, 1, "B", 0, LOCK_X); /* T1 -> T2 */
+    lock_wait_add(&lm, 2, "A", 0, LOCK_X); /* T2 -> T1 */
+    CHECK(lock_deadlock_victim(&lm) != 0, "교착 탐지(T1<->T2 순환) -> victim 반환");
+
+    /* 단방향 대기는 교착 아님: T2가 T1을 기다리지만 T1은 안 기다림 */
+    lock_init(&lm);
+    lock_acquire(&lm, 1, "A", 0, LOCK_X);
+    lock_wait_add(&lm, 2, "A", 0, LOCK_X); /* T2 -> T1, T1은 대기 없음 */
+    CHECK(lock_deadlock_victim(&lm) == 0, "단방향 대기(T2->T1)는 교착 아님");
+
+    /* 3중 순환: T1->T2->T3->T1 */
+    lock_init(&lm);
+    lock_acquire(&lm, 1, "A", 0, LOCK_X);
+    lock_acquire(&lm, 2, "B", 0, LOCK_X);
+    lock_acquire(&lm, 3, "C", 0, LOCK_X);
+    lock_wait_add(&lm, 1, "B", 0, LOCK_X); /* T1 -> T2 */
+    lock_wait_add(&lm, 2, "C", 0, LOCK_X); /* T2 -> T3 */
+    lock_wait_add(&lm, 3, "A", 0, LOCK_X); /* T3 -> T1 */
+    CHECK(lock_deadlock_victim(&lm) != 0, "3중 순환(T1->T2->T3->T1) 교착 탐지");
+
+    /* 한 대기를 해소하면(victim abort) 순환이 끊겨 교착이 사라진다 */
+    lock_wait_clear(&lm, 3);
+    CHECK(lock_deadlock_victim(&lm) == 0, "한 대기 해소되면 교착 사라짐");
+
     if (failures == 0) {
         printf("\n전체 통과\n");
         return 0;

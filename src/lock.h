@@ -17,6 +17,7 @@
  */
 
 #define LOCK_MAX 256
+#define LOCK_MAX_WAITS 64
 #define LOCK_NAME_LEN 64
 
 typedef enum { LOCK_S, LOCK_X } LockMode; /* 공유(읽기) / 배타(쓰기) */
@@ -28,9 +29,19 @@ typedef struct {
     LockMode mode;
 } LockEntry;
 
+/* "이 트랜잭션이 (table,key,mode) 락을 기다리는 중"이라는 대기 기록(wait-for 그래프의 원천). */
+typedef struct {
+    int txn;
+    char table[LOCK_NAME_LEN];
+    long key;
+    LockMode mode;
+} LockWait;
+
 typedef struct {
     LockEntry entries[LOCK_MAX];
     int n;
+    LockWait waits[LOCK_MAX_WAITS];
+    int nwaits;
 } LockManager;
 
 void lock_init(LockManager *lm);
@@ -43,5 +54,19 @@ void lock_release_all(LockManager *lm, int txn);
 
 /* txn이 (table,key)에 락을 쥐고 있나(테스트/디버그용). 1/0. */
 int lock_held(const LockManager *lm, int txn, const char *table, long key);
+
+/* ---- 교착(deadlock) 탐지: wait-for 그래프 + 순환 찾기 ----
+ * minidb는 충돌을 즉시 거부해 실제 대기가 없지만, "거부 대신 대기한다면" 생길 교착을
+ * wait-for 그래프로 보인다. 대기(누가 무엇을 기다리는지)를 lock_wait_add로 기록한 뒤
+ * lock_deadlock_victim이 순환을 찾으면 그 안의 한 트랜잭션(victim)을 돌려준다. */
+
+/* txn이 (table,key,mode) 락을 기다린다고 기록한다(같은 txn의 옛 대기는 교체). */
+void lock_wait_add(LockManager *lm, int txn, const char *table, long key, LockMode mode);
+
+/* txn의 대기 기록을 지운다(락을 얻었거나 abort됐을 때). */
+void lock_wait_clear(LockManager *lm, int txn);
+
+/* wait-for 그래프에 순환(교착)이 있으면 그 순환 안의 트랜잭션 id를, 없으면 0을 돌려준다. */
+int lock_deadlock_victim(LockManager *lm);
 
 #endif /* MINIDB_LOCK_H */

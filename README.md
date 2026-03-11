@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (302 checks across 18 suites).
+covered by tests (306 checks across 18 suites).
 
 ![minidb REPL demo](docs/demo.svg)
 
@@ -60,6 +60,7 @@ Built bottom-up; each layer sits on the one below it.
 | `db.c` | executor: tuple codec, multi-table catalog, joins (NLJ/index/hash), aggregates | pg_catalog, executor |
 | `btree.c` | on-disk B+Tree index for O(log n) lookups, with node splits | InnoDB clustered index |
 | `wal.c` | write-ahead log on each table's data file: atomic commit + crash recovery | PG WAL / redo log |
+| `lock.c` | 2PL table locks (S/X) + deadlock detection (wait-for graph) for isolation | PG/InnoDB lock manager |
 
 ### Storage layout
 
