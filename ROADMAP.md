@@ -3,7 +3,7 @@
 진행 상황 한눈에. 블로그 시리즈(1~12편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope", 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 316개 / 19스위트 통과.**
+현재: **테스트 321개 / 20스위트 통과.**
 
 > 저장 철학에 따라 갈리는 일을 두 트랙으로 나눈다 — **A: PostgreSQL식**(minidb의 현재 정체성),
 > **B: MySQL/InnoDB 대조**. 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
@@ -34,7 +34,8 @@ minidb는 이미 PG식이다 — 힙 + 별도 인덱스(RID), relfilenode, dead 
 
 ### A1. MVCC (스냅샷 격리) — 진행 중
 - [x] **1. 트랜잭션 상태 로그 + 가시성 규칙** (mvcc.c, standalone) — "xmin 커밋 AND xmax 미커밋이면 보임". abort된 INSERT/DELETE/UPDATE가 상태만으로 롤백되는 것까지 test_mvcc로 검증
-- [ ] 2. 행에 `xmin`/`xmax` 저장(codec 헤더, tombstone을 xmax로 승격) + 읽기 경로가 가시성으로 dead row 판정 + 트랜잭션 시작 스냅샷
+- [x] **2a. 행 codec에 xmin/xmax 헤더 + INSERT/UPDATE가 xmin 기록 + TxnLog를 트랜잭션 생명주기(BEGIN/COMMIT/ROLLBACK·autocommit)에 연결.** 실제 힙 행 가시성을 test_mvcc_store로 증명(txn 아보트하면 그 행이 안 보임). 헤더는 SELECT 출력에 투명(무회귀)
+- [ ] 2b. production 읽기 경로를 tombstone -> 가시성으로 전환 + DELETE를 xmax로 승격 + 트랜잭션 id/상태 영속화(재오픈 시 옛 행=커밋으로)
 - [ ] 3. 다중 트랜잭션 핸들 + 인터리브 데모 (reader가 writer를 안 막는 걸 진짜로 시연)
 - [ ] 4. 쓰기-쓰기 충돌(first-updater-wins)
 

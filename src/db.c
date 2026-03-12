@@ -10,19 +10,36 @@
  *   TEXT : 2바이트 길이 + 바이트열
  */
 
-static int encode_row(const CreateStmt *schema, const Value *vals, int nvals,
-                      uint8_t *buf, uint16_t *out_len) {
+/* 행 맨 앞 MVCC 헤더: int32 xmin(만든 트랜잭션) + int32 xmax(지운 트랜잭션, 0=안 지움).
+ * 그 뒤에 null 비트맵, 그 뒤에 값들. PostgreSQL 튜플 헤더의 xmin/xmax와 같은 발상. */
+#define MVCC_HDR 8
+
+int32_t db_rec_xmin(const void *rec) {
+    int32_t x;
+    memcpy(&x, rec, 4);
+    return x;
+}
+int32_t db_rec_xmax(const void *rec) {
+    int32_t x;
+    memcpy(&x, (const char *)rec + 4, 4);
+    return x;
+}
+
+static int encode_row(const CreateStmt *schema, const Value *vals, int nvals, int32_t xmin,
+                      int32_t xmax, uint8_t *buf, uint16_t *out_len) {
     if (nvals != schema->num_columns) {
         return -1;
     }
-    /* 행 맨 앞에 null 비트맵: 컬럼당 1비트(1이면 NULL). 실제 DB 행 포맷의 방식. */
+    memcpy(buf, &xmin, 4); /* MVCC 헤더 */
+    memcpy(buf + 4, &xmax, 4);
+    /* null 비트맵: 컬럼당 1비트(1이면 NULL). 헤더 뒤에 둔다. */
     int nbits = (schema->num_columns + 7) / 8;
-    memset(buf, 0, (size_t)nbits);
-    uint16_t off = (uint16_t)nbits;
+    memset(buf + MVCC_HDR, 0, (size_t)nbits);
+    uint16_t off = (uint16_t)(MVCC_HDR + nbits);
     for (int i = 0; i < schema->num_columns; i++) {
         const Value *v = &vals[i];
         if (v->type == VAL_NULL) {
-            buf[i / 8] |= (uint8_t)(1 << (i % 8)); /* NULL 표시, 값 바이트는 안 쓴다 */
+            buf[MVCC_HDR + i / 8] |= (uint8_t)(1 << (i % 8)); /* NULL 표시 */
             continue;
         }
         if (schema->columns[i].type == COL_INT) {
@@ -49,9 +66,9 @@ static int encode_row(const CreateStmt *schema, const Value *vals, int nvals,
 
 static void decode_row(const CreateStmt *schema, const uint8_t *rec, Value *out) {
     int nbits = (schema->num_columns + 7) / 8;
-    uint16_t off = (uint16_t)nbits;
+    uint16_t off = (uint16_t)(MVCC_HDR + nbits); /* MVCC 헤더 + null 비트맵 건너뜀 */
     for (int i = 0; i < schema->num_columns; i++) {
-        if (rec[i / 8] & (uint8_t)(1 << (i % 8))) { /* null 비트 -> VAL_NULL, 값 바이트 없음 */
+        if (rec[MVCC_HDR + i / 8] & (uint8_t)(1 << (i % 8))) { /* null 비트 */
             out[i].type = VAL_NULL;
             continue;
         }
@@ -537,7 +554,7 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
     }
     uint8_t buf[PAGE_SIZE];
     uint16_t len;
-    if (encode_row(&t->schema, in->values, in->num_values, buf, &len) != 0) {
+    if (encode_row(&t->schema, in->values, in->num_values, db->cur_txn, 0, buf, &len) != 0) {
         fprintf(out, "ERROR: 값의 개수나 타입이 스키마와 맞지 않습니다\n");
         return -1;
     }
@@ -2181,7 +2198,8 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         /* 가변 길이라 제자리 수정이 안 된다 -> 옛 행 삭제 + 새 행 삽입 */
         uint8_t newbuf[PAGE_SIZE];
         uint16_t newlen;
-        if (encode_row(&t->schema, row, t->schema.num_columns, newbuf, &newlen) != 0) {
+        if (encode_row(&t->schema, row, t->schema.num_columns, db->cur_txn, 0, newbuf, &newlen) !=
+            0) {
             continue;
         }
         heap_delete(&t->heap, ctx.rids[i]);
@@ -2238,7 +2256,8 @@ static int exec_begin(Database *db, FILE *out) {
         return -1;
     }
     db->in_txn = 1;
-    db->cur_txn = db->next_txn++; /* 이 트랜잭션의 락 소유자 id */
+    db->cur_txn = db->next_txn++; /* 이 트랜잭션의 락 소유자 id · 행 xmin */
+    txnlog_begin(&db->txnlog, db->cur_txn);
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
         bufpool_set_no_steal(t->bp, 1);
@@ -2277,7 +2296,8 @@ static int exec_commit(Database *db, FILE *out) {
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
         }
     }
-    lock_release_all(&db->lm, db->cur_txn); /* 2PL: 끝에서 한꺼번에 푼다 */
+    txnlog_commit(&db->txnlog, db->cur_txn); /* MVCC: 이 트랜잭션을 커밋 표시 */
+    lock_release_all(&db->lm, db->cur_txn);  /* 2PL: 끝에서 한꺼번에 푼다 */
     db->cur_txn = 0;
     db->in_txn = 0;
     fprintf(out, "커밋됨\n");
@@ -2310,6 +2330,7 @@ static int exec_rollback(Database *db, FILE *out) {
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
         }
     }
+    txnlog_abort(&db->txnlog, db->cur_txn); /* MVCC: 이 트랜잭션을 아보트 표시 */
     lock_release_all(&db->lm, db->cur_txn); /* 2PL: 끝에서 한꺼번에 푼다 */
     db->cur_txn = 0;
     db->in_txn = 0;
@@ -2325,6 +2346,7 @@ int db_open(Database *db, const char *path) {
     db->used_index = 0;
     db->in_txn = 0;
     lock_init(&db->lm);
+    txnlog_init(&db->txnlog);
     db->cur_txn = 0;
     db->next_txn = 1;
 
@@ -2434,6 +2456,10 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         (st.type == STMT_SELECT && !st.select.explain)) {
         lock_txn = db->in_txn ? db->cur_txn : db->next_txn++;
         lock_autorelease = !db->in_txn;
+        if (lock_autorelease) {
+            db->cur_txn = lock_txn; /* autocommit: 이 문장이 곧 한 트랜잭션 (행 xmin에 쓰임) */
+            txnlog_begin(&db->txnlog, lock_txn);
+        }
         if (acquire_stmt_locks(db, &st, lock_txn, out) != 0) {
             if (lock_autorelease) {
                 lock_release_all(&db->lm, lock_txn);
@@ -2504,6 +2530,11 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         }
     }
     if (lock_autorelease) {
+        if (rc == 0) {
+            txnlog_commit(&db->txnlog, lock_txn); /* 문장 성공 -> 이 트랜잭션 커밋 */
+        } else {
+            txnlog_abort(&db->txnlog, lock_txn);
+        }
         lock_release_all(&db->lm, lock_txn); /* autocommit 문장: 잡았던 락을 푼다 */
     }
     statement_free(&st); /* 서브쿼리·IN 집합 해제 */

@@ -9,6 +9,7 @@
 #include "wal.h"
 #include "sql.h"
 #include "lock.h"
+#include "mvcc.h"
 
 /*
  * Database — 모든 계층을 하나로 묶어 SQL을 실행한다.
@@ -66,8 +67,9 @@ typedef struct {
     int in_txn;     /* 명시적 트랜잭션(BEGIN) 중인가 */
 
     LockManager lm; /* 2PL 테이블 락 — 인터리브된 트랜잭션 충돌 탐지(격리) */
-    int cur_txn;    /* 현재 트랜잭션 id (락 소유자). 0이면 없음 */
+    int cur_txn;    /* 현재 트랜잭션 id (락 소유자·행 xmin). 0이면 없음 */
     int next_txn;   /* 다음 트랜잭션 id 발급기 */
+    TxnLog txnlog;  /* MVCC: 트랜잭션 상태(진행/커밋/아보트) — 행 가시성 판정용 */
 } Database;
 
 /* 파일을 열어 DB를 준비한다. 0 성공, -1 실패. */
@@ -78,5 +80,9 @@ void db_close(Database *db);
 
 /* SQL 한 문장을 실행한다. 결과/메시지는 out으로. 0 성공, -1 오류. */
 int db_exec(Database *db, const char *sql, FILE *out);
+
+/* 힙 레코드의 MVCC 헤더(xmin/xmax) 접근. 가시성 판정·테스트용. */
+int32_t db_rec_xmin(const void *rec);
+int32_t db_rec_xmax(const void *rec);
 
 #endif /* MINIDB_DB_H */
