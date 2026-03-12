@@ -32,7 +32,10 @@ minidb는 이미 PG식이다 — 힙 + 별도 인덱스(RID), relfilenode, dead 
 남은 건 **격리를 잠금(2PL)에서 버전(MVCC)으로** 끌어올리고, 그 부산물인 죽은 공간을 **VACUUM**으로 청소하는 것.
 이 둘을 하면 "진짜 미니 PostgreSQL"이 완성된다. (자세한 2PL vs MVCC 대조는 12편.)
 
-### A1. MVCC (스냅샷 격리) — 진행 중
+### A1. MVCC (스냅샷 격리) — 마일스톤 도달 (2c~4는 코어 재작성 프론티어)
+> 1~2b까지 안전하게 심었다(버전·가시성 게이트·영속화, 무회귀). 그 너머(2c DELETE->xmax, 3 진짜 동시성,
+> 4 쓰기충돌)는 no-steal/WAL-truncate/tombstone/단일 트랜잭션 코어를 steal+abort롤백+다중 트랜잭션으로
+> 갈아엎어야 해서 안정된 엔진을 흔드는 큰 재작성이다. 여기까지를 13편으로 정리.
 - [x] **1. 트랜잭션 상태 로그 + 가시성 규칙** (mvcc.c, standalone) — "xmin 커밋 AND xmax 미커밋이면 보임". abort된 INSERT/DELETE/UPDATE가 상태만으로 롤백되는 것까지 test_mvcc로 검증
 - [x] **2a. 행 codec에 xmin/xmax 헤더 + INSERT/UPDATE가 xmin 기록 + TxnLog를 트랜잭션 생명주기(BEGIN/COMMIT/ROLLBACK·autocommit)에 연결.** 실제 힙 행 가시성을 test_mvcc_store로 증명(txn 아보트하면 그 행이 안 보임). 헤더는 SELECT 출력에 투명(무회귀)
 - [x] **2b. MVCC 가시성 게이트를 SELECT* 읽기 경로에 + next_txn 영속화(committed_below)** — select_visit이 row_visible(xmin/xmax, my_txn)로 거른다. db_close가 next_txn 저장 -> 재오픈 시 그 미만 txn=커밋으로 봐 옛 행이 보임(no-steal라 디스크엔 커밋분만). 닫고 다시 열어 SELECT가 옛 행을 보이는 것 test로 증명. 경합 없으면 무회귀
