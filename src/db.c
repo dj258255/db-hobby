@@ -133,6 +133,8 @@ static void catalog_write(Database *db) {
     }
     int32_t n = db->num_tables;
     fwrite(&n, sizeof(n), 1, f);
+    int32_t nt = db->next_txn; /* MVCC: 다음 세션이 옛 행을 커밋으로 보게 next_txn 영속화 */
+    fwrite(&nt, sizeof(nt), 1, f);
     for (int i = 0; i < db->num_tables; i++) {
         fwrite(&db->tables[i].schema, sizeof(CreateStmt), 1, f);
         /* 보조 인덱스 정의(개수 + 각 {이름, 컬럼 위치})도 같이 직렬화 */
@@ -207,6 +209,31 @@ static Table *find_table(Database *db, const char *name) {
         }
     }
     return NULL;
+}
+
+/* ------------- MVCC 가시성 ------------- */
+
+/* txn이 "커밋된 것으로 보이나" — 이전 세션 id(committed_below 미만)는 전부 커밋,
+ * 이번 세션 id는 TxnLog가 COMMITTED일 때만. (no-steal+WAL이라 디스크엔 커밋분만 있음.) */
+static int txn_committed_view(Database *db, int txn) {
+    if (txn <= 0) {
+        return 0;
+    }
+    if (txn < db->committed_below) {
+        return 1;
+    }
+    return txnlog_status(&db->txnlog, txn) == TXN_COMMITTED;
+}
+
+/* 행 버전(xmin,xmax)이 my_txn 입장에서 보이나? 자기 트랜잭션의 미커밋 쓰기도 본다. */
+static int row_visible(Database *db, int32_t xmin, int32_t xmax, int my_txn) {
+    if (!(xmin == my_txn || txn_committed_view(db, xmin))) {
+        return 0; /* 생성자가 내 것도 아니고 커밋도 아님 -> 없는 행 */
+    }
+    if (xmax != 0 && (xmax == my_txn || txn_committed_view(db, xmax))) {
+        return 0; /* 내가/커밋된 누가 지움 -> 안 보임 */
+    }
+    return 1;
 }
 
 /* ------------- WHERE 평가 -------------
@@ -584,12 +611,17 @@ typedef struct {
     const Where *where;
     FILE *out;
     int count;
+    Database *db; /* MVCC 가시성 판정용 */
+    int my_txn;
 } SelectCtx;
 
 static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)rid;
     (void)len;
     SelectCtx *ctx = ctx_;
+    if (!row_visible(ctx->db, db_rec_xmin(rec), db_rec_xmax(rec), ctx->my_txn)) {
+        return 0; /* 내 스냅샷에 안 보이는 버전(미커밋/아보트 생성, 커밋된 삭제)은 건너뜀 */
+    }
     Value row[SQL_MAX_COLS];
     decode_row(ctx->schema, rec, row);
     if (!where_matches(ctx->schema, ctx->tname, ctx->where, row)) {
@@ -2109,7 +2141,7 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         count = sc.count;
     } else {
         /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> 풀 스캔 */
-        SelectCtx ctx = {&t->schema, tname, &sel->where, out, 0};
+        SelectCtx ctx = {&t->schema, tname, &sel->where, out, 0, db, db->cur_txn};
         heap_scan(&t->heap, select_visit, &ctx);
         count = ctx.count;
     }
@@ -2349,12 +2381,18 @@ int db_open(Database *db, const char *path) {
     txnlog_init(&db->txnlog);
     db->cur_txn = 0;
     db->next_txn = 1;
+    db->committed_below = 1; /* 새 DB: 이전 트랜잭션 없음 */
 
     /* 카탈로그가 있으면 테이블 목록을 복원하고 각 테이블 파일을 연다. */
     FILE *f = fopen(path, "rb");
     if (f) {
         int32_t n = 0;
         if (fread(&n, sizeof(n), 1, f) == 1 && n >= 0 && n <= DB_MAX_TABLES) {
+            int32_t nt = 1; /* MVCC: 저장된 next_txn -> 그 미만 id는 전부 커밋된 것으로 본다 */
+            if (fread(&nt, sizeof(nt), 1, f) == 1 && nt > db->next_txn) {
+                db->next_txn = nt;
+            }
+            db->committed_below = db->next_txn;
             for (int i = 0; i < n; i++) {
                 CreateStmt s;
                 if (fread(&s, sizeof(s), 1, f) != 1) {
@@ -2387,6 +2425,7 @@ int db_open(Database *db, const char *path) {
 }
 
 void db_close(Database *db) {
+    catalog_write(db); /* MVCC: 이번 세션의 최종 next_txn을 영속화(재오픈 시 옛 행 가시성) */
     for (int i = 0; i < db->num_tables; i++) {
         table_close_files(&db->tables[i]);
     }

@@ -69,6 +69,8 @@ typedef struct {
     LockManager lm; /* 2PL 테이블 락 — 인터리브된 트랜잭션 충돌 탐지(격리) */
     int cur_txn;    /* 현재 트랜잭션 id (락 소유자·행 xmin). 0이면 없음 */
     int next_txn;   /* 다음 트랜잭션 id 발급기 */
+    int committed_below; /* 이 세션 시작 시점의 txn 번호 — 그 미만 id는 전부 커밋된 것으로 본다
+                          * (no-steal+WAL이라 디스크엔 커밋분만 있음). 재오픈 시 옛 행 가시성. */
     TxnLog txnlog;  /* MVCC: 트랜잭션 상태(진행/커밋/아보트) — 행 가시성 판정용 */
 } Database;
 

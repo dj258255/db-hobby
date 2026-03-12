@@ -84,7 +84,20 @@ int main(void) {
     CHECK(c2.total == 3, "힙엔 여전히 3행이 물리적으로 있음(MVCC는 안 지움)");
     CHECK(c2.visible == 2, "txn2 아보트 -> 그 행만 안 보임(가시 2행)");
 
+    /* SQL 레벨: 닫고 다시 열어도 옛 행이 보인다.
+     * (db_close가 next_txn을 영속화 -> 재오픈 시 committed_below로 옛 txn=커밋. 게이트는 select_visit.) */
     db_close(&db);
+    Database db2;
+    db_open(&db2, path);
+    o = run(&db2, "SELECT * FROM t");
+    CHECK(strstr(o, "(3행"),
+          "재오픈 후 SELECT * -> 3행 (MVCC 게이트 + next_txn 영속화로 옛 행 가시)");
+    free(o);
+    o = run(&db2, "SELECT * FROM t WHERE id = 2");
+    CHECK(strstr(o, "(1행"), "재오픈 후 WHERE도 정상(가시성 게이트 통과)");
+    free(o);
+    db_close(&db2);
+
     unlink(path);
     {
         const char *suf[] = {".t.tbl", ".t.idx", ".t.wal", ".t.idx.wal"};
