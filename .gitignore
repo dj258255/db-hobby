@@ -1,6 +1,18 @@
-build/
+# build outputs (build/, build 2/ 등 sync 변형 포함)
+build*/
 *.o
 *.db
 a.out
+
+# minidb는 순수 C — branchdb(Rust) 잔재가 흘러들어오면 무시
+*.rs
+Cargo.toml
+Cargo.lock
+examples/
+
+# iCloud/클라우드 동기화가 만드는 중복본 ("db 2.rs", "test_join 2.c" 등)
+* [2-9].*
+
+# OS / 도구
 .DS_Store
 .claude/
