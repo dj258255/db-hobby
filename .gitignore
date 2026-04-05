@@ -16,3 +16,9 @@ examples/
 # OS / 도구
 .DS_Store
 .claude/
+
+# DB 생성 산출물 (heap/index/wal)
+*.tbl
+*.idx
+*.wal
+*.db.*
