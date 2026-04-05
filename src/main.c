@@ -3,11 +3,11 @@
 #include <stdio.h>
 #include <string.h>
 
-/* minidb REPL — SQL을 한 줄씩 받아 실행한다.
- *   빌드/실행:  make repl && ./build/minidb mydata.db
+/* db-hobby REPL — SQL을 한 줄씩 받아 실행한다.
+ *   빌드/실행:  make repl && ./build/db-hobby mydata.db
  */
 int main(int argc, char **argv) {
-    const char *path = (argc > 1) ? argv[1] : "minidb.db";
+    const char *path = (argc > 1) ? argv[1] : "db-hobby.db";
 
     Database db;
     if (db_open(&db, path) != 0) {
@@ -15,10 +15,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("minidb — SQL을 입력하세요. (Ctrl-D로 종료)\n");
+    printf("db-hobby — SQL을 입력하세요. (Ctrl-D로 종료)\n");
     char line[2048];
     while (1) {
-        printf("minidb> ");
+        printf("db-hobby> ");
         fflush(stdout);
         if (!fgets(line, sizeof(line), stdin)) {
             break;

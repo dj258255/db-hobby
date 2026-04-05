@@ -258,7 +258,7 @@ static int cmp_apply(CmpOp op, long sign) {
 }
 
 /* SQL LIKE 패턴 매칭. '%' = 임의 길이(0+) 문자열, '_' = 정확히 한 글자.
- * 그 외 문자는 그대로 일치해야 한다(대소문자 구분 — minidb TEXT 비교가 strcmp라 일관).
+ * 그 외 문자는 그대로 일치해야 한다(대소문자 구분 — db-hobby TEXT 비교가 strcmp라 일관).
  *
  * 백트래킹 two-pointer 방식: '%'를 만나면 그 위치(star)와 그때의 입력 위치(ss)를
  * 기억해 두고 일단 '%'가 0글자를 먹었다고 보고 전진한다. 뒤에서 막히면 star로

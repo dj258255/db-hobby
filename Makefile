@@ -20,8 +20,8 @@ $(BUILD)/bench: tests/bench.c $(SRCS) | $(BUILD)
 	$(CC) $(CFLAGS) -O2 -Isrc $< $(SRCS) -o $@
 
 # 대화형 REPL 바이너리
-repl: $(BUILD)/minidb
-$(BUILD)/minidb: src/main.c $(SRCS) | $(BUILD)
+repl: $(BUILD)/db-hobby
+$(BUILD)/db-hobby: src/main.c $(SRCS) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $< $(SRCS) -o $@
 
 # 각 테스트 = 그 테스트 소스 + 모든 핵심 소스

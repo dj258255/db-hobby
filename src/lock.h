@@ -4,7 +4,7 @@
 /*
  * 2PL 락 매니저 — (테이블, 키) 단위의 공유/배타 락.
  *
- * minidb는 단일 스레드라 OS 동시성은 없지만, 인터리브된 in-process 트랜잭션 사이의
+ * db-hobby는 단일 스레드라 OS 동시성은 없지만, 인터리브된 in-process 트랜잭션 사이의
  * 충돌을 탐지해 격리(직렬화)를 보인다. 충돌이면 acquire가 -1을 돌려준다("블록될 상황").
  *
  * 호환 행렬(같은 객체에 대해):
@@ -56,7 +56,7 @@ void lock_release_all(LockManager *lm, int txn);
 int lock_held(const LockManager *lm, int txn, const char *table, long key);
 
 /* ---- 교착(deadlock) 탐지: wait-for 그래프 + 순환 찾기 ----
- * minidb는 충돌을 즉시 거부해 실제 대기가 없지만, "거부 대신 대기한다면" 생길 교착을
+ * db-hobby는 충돌을 즉시 거부해 실제 대기가 없지만, "거부 대신 대기한다면" 생길 교착을
  * wait-for 그래프로 보인다. 대기(누가 무엇을 기다리는지)를 lock_wait_add로 기록한 뒤
  * lock_deadlock_victim이 순환을 찾으면 그 안의 한 트랜잭션(victim)을 돌려준다. */
 

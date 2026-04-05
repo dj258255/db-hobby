@@ -18,7 +18,7 @@
  * WAL(.idx.wal)로 감싼다 — 인덱스 페이저는 wal.data 안에 있다.
  * page 0 = 메타(루트 페이지 id 저장), page 1+ = 노드들.
  *
- * 학습용으로 키·값은 int64다. minidb에서는 키=INT 컬럼 값, 값=RID를 int64로 인코딩.
+ * 학습용으로 키·값은 int64다. db-hobby에서는 키=INT 컬럼 값, 값=RID를 int64로 인코딩.
  */
 
 typedef int64_t bkey_t;

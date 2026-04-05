@@ -1,4 +1,4 @@
-# minidb
+# db-hobby
 
 A small relational database written from scratch in C, built to dissect how
 PostgreSQL and MySQL actually work inside. It goes from raw fixed-size pages all
@@ -9,7 +9,7 @@ This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
 covered by tests (323 checks across 20 suites).
 
-![minidb REPL demo](docs/demo.svg)
+![db-hobby REPL demo](docs/demo.svg)
 
 ## Quick start
 
@@ -17,25 +17,25 @@ covered by tests (323 checks across 20 suites).
 make test            # build and run the test suite
 make bench           # build (-O2) and run the benchmark (index vs scan, fsync cost)
 make repl            # build the REPL
-./build/minidb my.db # open (or create) a database and type SQL
+./build/db-hobby my.db # open (or create) a database and type SQL
 ```
 
 A session:
 
 ```
-minidb> CREATE TABLE users (id INT, name TEXT);
+db-hobby> CREATE TABLE users (id INT, name TEXT);
 테이블 'users' 생성됨 (컬럼 2개)
   (인덱스: id 컬럼)
-minidb> INSERT INTO users VALUES (1, 'kim');
-minidb> INSERT INTO users VALUES (2, 'lee');
-minidb> SELECT * FROM users WHERE id = 2;
+db-hobby> INSERT INTO users VALUES (1, 'kim');
+db-hobby> INSERT INTO users VALUES (2, 'lee');
+db-hobby> SELECT * FROM users WHERE id = 2;
 id | name
 2 | lee
 (1행, 인덱스 사용)
-minidb> BEGIN;
-minidb> DELETE FROM users WHERE id = 1;
-minidb> ROLLBACK;
-minidb> SELECT * FROM users;
+db-hobby> BEGIN;
+db-hobby> DELETE FROM users WHERE id = 1;
+db-hobby> ROLLBACK;
+db-hobby> SELECT * FROM users;
 id | name
 1 | kim
 2 | lee

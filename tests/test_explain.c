@@ -64,7 +64,7 @@ int main(void) {
           "조건 없음 -> Seq Scan (filter 없음)");
     free(o);
 
-    /* ORDER BY / LIMIT가 인덱스를 끄는 것 (minidb의 정직한 한계) */
+    /* ORDER BY / LIMIT가 인덱스를 끄는 것 (db-hobby의 정직한 한계) */
     o = run(&db, "EXPLAIN SELECT * FROM users ORDER BY name");
     CHECK(strstr(o, "Sort") && strstr(o, "Seq Scan on users"),
           "ORDER BY -> Sort 노드 + Seq Scan(인덱스 못 씀)");

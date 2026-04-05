@@ -1,5 +1,5 @@
 /*
- * bench.c — minidb 실측 벤치마크.
+ * bench.c — db-hobby 실측 벤치마크.
  *
  * 두 가지를 잰다:
  *   ① 같은 한 행을 찾을 때 인덱스 점 조회(O(log n)) vs 풀 스캔(O(n)) 지연.
@@ -154,7 +154,7 @@ int main(void) {
         return 1;
     }
 
-    printf("=== minidb 벤치마크 ===\n\n");
+    printf("=== db-hobby 벤치마크 ===\n\n");
 
     printf("[1] 한 행 찾기: 인덱스 점 조회(O(log n)) vs 풀 스캔(O(n))\n");
     measure_lookup(1000, 5000, 3000, 1);

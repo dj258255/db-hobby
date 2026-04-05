@@ -1,11 +1,11 @@
-# minidb 로드맵 (트랙별)
+# db-hobby 로드맵 (트랙별)
 
 진행 상황 한눈에. 블로그 시리즈(1~12편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope", 구조는 `DESIGN.md` 참고.
 
 현재: **테스트 323개 / 20스위트 통과.**
 
-> 저장 철학에 따라 갈리는 일을 두 트랙으로 나눈다 — **A: PostgreSQL식**(minidb의 현재 정체성),
+> 저장 철학에 따라 갈리는 일을 두 트랙으로 나눈다 — **A: PostgreSQL식**(db-hobby의 현재 정체성),
 > **B: MySQL/InnoDB 대조**. 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
 
 ## Done — 공통 핵심 (PG·MySQL이 똑같이 쓰는 것)
@@ -28,7 +28,7 @@
 
 ## 트랙 A — PostgreSQL식 (현재 정체성, 한 줄기로 완성)
 
-minidb는 이미 PG식이다 — 힙 + 별도 인덱스(RID), relfilenode, dead tuple, UPDATE=새 버전, EXPLAIN 용어.
+db-hobby는 이미 PG식이다 — 힙 + 별도 인덱스(RID), relfilenode, dead tuple, UPDATE=새 버전, EXPLAIN 용어.
 남은 건 **격리를 잠금(2PL)에서 버전(MVCC)으로** 끌어올리고, 그 부산물인 죽은 공간을 **VACUUM**으로 청소하는 것.
 이 둘을 하면 "진짜 미니 PostgreSQL"이 완성된다. (자세한 2PL vs MVCC 대조는 12편.)
 
@@ -53,7 +53,7 @@ MVCC는 일부러 옛 버전(dead tuple)을 쌓으니, 안 치우면 테이블·
 
 ## 트랙 B — MySQL/InnoDB 대조 (트랙 A 완성 뒤 별도 챕터)
 
-별도 프로젝트를 또 만들지 않는다. minidb 안에 InnoDB식 선택지를 **다른 모드**로 더해,
+별도 프로젝트를 또 만들지 않는다. db-hobby 안에 InnoDB식 선택지를 **다른 모드**로 더해,
 한 코드에서 PG식 vs MySQL식을 나란히 비교한다(블로그 1편 힙 vs 클러스터드, 4편 append-only vs undo의 코드판).
 - [ ] **B1. 클러스터드 테이블 모드** (index-organized) — 데이터를 PK B+Tree에 PK 순서로 저장, 보조 인덱스는 RID가 아니라 PK 값을 듦("보조 -> PK -> 데이터" 2단 조회). 힙(PG) vs 클러스터드(InnoDB)를 `make bench`로 비교(PK 조회·보조 조회·INSERT 비용)
 - [ ] **B2. undo 기반 MVCC** — in-place 수정 + undo log (PG의 append-only 새 버전과 대조). dead tuple 대신 undo·purge
