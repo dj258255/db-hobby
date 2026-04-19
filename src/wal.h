@@ -41,6 +41,14 @@ typedef struct {
     uint64_t *spilled;   /* 이미 undo 로그를 남긴 page_id들 (first-write-wins) */
     int num_spilled;
     int cap_spilled;
+
+    /* --- LSN (트랙 E: no-force로 가는 인프라) ---
+     * 모든 로그 레코드는 단조 증가 LSN을 단다. flushed_lsn은 fsync로 내구화된
+     * 마지막 LSN — "페이지를 디스크에 쓰기 전에 그 pageLSN까지 로그를 먼저"라는
+     * WAL 규칙을 LSN 비교로 판정하기 위한 기반이다. (지금 로그는 커밋 시
+     * truncate되는 임시 파일이라 LSN은 로그 수명 안에서만 유효.) */
+    uint64_t next_lsn;
+    uint64_t flushed_lsn;
 } Wal;
 
 /* 데이터/로그 파일을 연다. 열 때 크래시 복구를 수행한다. 0 성공, -1 실패. */

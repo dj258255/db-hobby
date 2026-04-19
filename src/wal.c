@@ -13,6 +13,7 @@ typedef struct {
     uint8_t data[PAGE_SIZE];
 } StagedPage;
 
+/* 레코드 공통 머리: type(1B) + lsn(8B). 그 뒤에 타입별 payload. */
 #define REC_PAGE 'P'   /* pid + after-image (redo) */
 #define REC_COMMIT 'C' /* 커밋 마커 */
 #define REC_BEGIN 'B'  /* base_pages (steal이 처음 일어날 때 한 번) */
@@ -46,6 +47,16 @@ static int read_exact(int fd, void *buf, size_t n) {
         n -= (size_t)r;
     }
     return 0;
+}
+
+/* 레코드 머리(type + lsn)를 쓴다. 부여한 lsn을 반환, 실패 시 0. */
+static uint64_t write_hdr(Wal *w, uint8_t type) {
+    uint64_t lsn = w->next_lsn++;
+    if (write_all(w->log_fd, &type, 1) != 0 ||
+        write_all(w->log_fd, &lsn, sizeof(lsn)) != 0) {
+        return 0;
+    }
+    return lsn;
 }
 
 /* -- steal한 페이지 추적 (페이지당 undo는 최초 1회 = first-write-wins) -- */
@@ -104,6 +115,9 @@ static int wal_recover(Wal *w) {
         if (read_exact(w->log_fd, &type, 1) != 0) {
             break; /* EOF 또는 오류 */
         }
+        if (skip_bytes(w->log_fd, sizeof(uint64_t)) != 0) {
+            break; /* lsn */
+        }
         if (type == REC_BEGIN) {
             if (skip_bytes(w->log_fd, sizeof(uint64_t)) != 0) {
                 break;
@@ -150,6 +164,9 @@ static int wal_recover(Wal *w) {
             uint8_t type;
             if (read_exact(w->log_fd, &type, 1) != 0) {
                 break;
+            }
+            if (skip_bytes(w->log_fd, sizeof(uint64_t)) != 0) {
+                break; /* lsn */
             }
             if (type == REC_BEGIN) {
                 uint64_t b;
@@ -213,6 +230,8 @@ int wal_open(Wal *w, const char *data_path, const char *log_path) {
     w->spilled = NULL;
     w->num_spilled = 0;
     w->cap_spilled = 0;
+    w->next_lsn = 1;
+    w->flushed_lsn = 0;
     wal_recover(w); /* 열면서 복구 */
     return 0;
 }
@@ -267,9 +286,8 @@ int wal_steal(Wal *w, page_id_t page_id, const void *buf) {
 
     if (!w->stole) {
         /* 최초 steal: 트랜잭션 시작 페이지 수를 로그에 남긴다(undo 시 truncate 기준). */
-        uint8_t type = REC_BEGIN;
         uint64_t base = w->base_pages;
-        if (write_all(w->log_fd, &type, 1) != 0 ||
+        if (write_hdr(w, REC_BEGIN) == 0 ||
             write_all(w->log_fd, &base, sizeof(base)) != 0) {
             return -1;
         }
@@ -285,9 +303,8 @@ int wal_steal(Wal *w, page_id_t page_id, const void *buf) {
             if (pager_read(&w->data, page_id, before) != 0) {
                 return -1;
             }
-            uint8_t type = REC_UNDO;
             uint64_t pid = page_id;
-            if (write_all(w->log_fd, &type, 1) != 0 ||
+            if (write_hdr(w, REC_UNDO) == 0 ||
                 write_all(w->log_fd, &pid, sizeof(pid)) != 0 ||
                 write_all(w->log_fd, before, PAGE_SIZE) != 0) {
                 return -1;
@@ -299,6 +316,7 @@ int wal_steal(Wal *w, page_id_t page_id, const void *buf) {
     }
 
     fsync(w->log_fd); /* WAL 규칙: undo가 디스크에 내구된 뒤에야 데이터를 바꾼다 */
+    w->flushed_lsn = w->next_lsn - 1;
     if (pager_write(&w->data, page_id, buf) != 0) {
         return -1;
     }
@@ -320,6 +338,9 @@ int wal_undo(Wal *w) {
         uint8_t type;
         if (read_exact(w->log_fd, &type, 1) != 0) {
             break;
+        }
+        if (skip_bytes(w->log_fd, sizeof(uint64_t)) != 0) {
+            break; /* lsn */
         }
         if (type == REC_BEGIN) {
             uint64_t b;
@@ -361,9 +382,8 @@ int wal_commit(Wal *w) {
 
     /* 1) 바뀐 페이지들(after-image)을 로그에 쓴다 (write-ahead) */
     for (int i = 0; i < w->num_staged; i++) {
-        uint8_t type = REC_PAGE;
         uint64_t pid = s[i].page_id;
-        if (write_all(w->log_fd, &type, 1) != 0 ||
+        if (write_hdr(w, REC_PAGE) == 0 ||
             write_all(w->log_fd, &pid, sizeof(pid)) != 0 ||
             write_all(w->log_fd, s[i].data, PAGE_SIZE) != 0) {
             return -1;
@@ -371,15 +391,16 @@ int wal_commit(Wal *w) {
     }
     if (wal_test_crash_before_commit) {
         fsync(w->log_fd);
+        w->flushed_lsn = w->next_lsn - 1;
         return 0; /* 크래시: 커밋 마커 없음 -> 복구 시 undo로 버려짐 */
     }
 
     /* 2) 커밋 마커 + fsync — 이 줄을 지나면 "내구"하다 */
-    uint8_t c = REC_COMMIT;
-    if (write_all(w->log_fd, &c, 1) != 0) {
+    if (write_hdr(w, REC_COMMIT) == 0) {
         return -1;
     }
     fsync(w->log_fd);
+    w->flushed_lsn = w->next_lsn - 1;
     if (wal_test_crash_after_log) {
         return 0; /* 크래시: 데이터 적용 전 -> 복구가 redo */
     }
