@@ -2269,6 +2269,12 @@ static int wal_stage_sink(page_id_t pid, const void *data, void *ctx) {
     return wal_stage((Wal *)ctx, pid, data);
 }
 
+/* STEAL 핸들러: 버퍼 풀이 커밋 전 dirty 페이지를 축출할 때 부른다.
+ * wal_steal이 undo(before-image) 로깅 + 디스크 쓰기까지 원자적으로 처리한다. */
+static int wal_steal_cb(page_id_t pid, const void *data, void *ctx) {
+    return wal_steal((Wal *)ctx, pid, data);
+}
+
 /* 버퍼 풀의 dirty 페이지를 WAL로 보내 원자적으로 커밋한다(데이터·인덱스 공통). */
 static int wal_flush_commit(BufferPool *bp, Wal *wal) {
     wal_begin(wal);
@@ -2293,15 +2299,18 @@ static int exec_begin(Database *db, FILE *out) {
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
         bufpool_set_no_steal(t->bp, 1);
+        bufpool_set_steal_handler(t->bp, wal_steal_cb, &t->wal);
         wal_begin(&t->wal);
         t->txn_data_pages = t->wal.data.num_pages;
         if (t->has_index) {
             bufpool_set_no_steal(t->index.bp, 1);
+            bufpool_set_steal_handler(t->index.bp, wal_steal_cb, &t->index.wal);
             wal_begin(&t->index.wal);
             t->txn_index_pages = t->index.wal.data.num_pages;
         }
         for (int k = 0; k < t->num_sec; k++) {
             bufpool_set_no_steal(t->sec[k].tree.bp, 1);
+            bufpool_set_steal_handler(t->sec[k].tree.bp, wal_steal_cb, &t->sec[k].tree.wal);
             wal_begin(&t->sec[k].tree.wal);
             t->sec[k].txn_pages = t->sec[k].tree.wal.data.num_pages;
         }
@@ -2319,13 +2328,16 @@ static int exec_commit(Database *db, FILE *out) {
         Table *t = &db->tables[i];
         wal_flush_commit(t->bp, &t->wal); /* 데이터: WAL로 원자 커밋 */
         bufpool_set_no_steal(t->bp, 0);
+        bufpool_set_steal_handler(t->bp, NULL, NULL);
         if (t->has_index) {
             wal_flush_commit(t->index.bp, &t->index.wal); /* 인덱스: 인덱스 WAL로 */
             bufpool_set_no_steal(t->index.bp, 0);
+            bufpool_set_steal_handler(t->index.bp, NULL, NULL);
         }
         for (int k = 0; k < t->num_sec; k++) {
             wal_flush_commit(t->sec[k].tree.bp, &t->sec[k].tree.wal);
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
+            bufpool_set_steal_handler(t->sec[k].tree.bp, NULL, NULL);
         }
     }
     txnlog_commit(&db->txnlog, db->cur_txn); /* MVCC: 이 트랜잭션을 커밋 표시 */
@@ -2343,23 +2355,31 @@ static int exec_rollback(Database *db, FILE *out) {
     }
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
-        bufpool_discard_dirty(t->bp);
-        pager_truncate(&t->wal.data, t->txn_data_pages);
-        wal_begin(&t->wal); /* 혹시 stage된 것도 버린다(로그엔 아직 안 씀) */
+        /* steal이 있었으면 로그의 before-image로 디스크를 먼저 원복(+새 페이지 truncate).
+         * 그다음 풀 전체를 무효화해 steal로 clean 처리된 미커밋 프레임까지 버린다. */
+        wal_undo(&t->wal);
+        bufpool_invalidate_all(t->bp);
+        pager_truncate(&t->wal.data, t->txn_data_pages); /* non-steal 경로의 새 페이지 제거 */
+        wal_begin(&t->wal);
         bufpool_set_no_steal(t->bp, 0);
+        bufpool_set_steal_handler(t->bp, NULL, NULL);
         if (t->has_index) {
-            bufpool_discard_dirty(t->index.bp);
+            wal_undo(&t->index.wal);
+            bufpool_invalidate_all(t->index.bp);
             pager_truncate(&t->index.wal.data, t->txn_index_pages);
             wal_begin(&t->index.wal);
             btree_reload_root(&t->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
             bufpool_set_no_steal(t->index.bp, 0);
+            bufpool_set_steal_handler(t->index.bp, NULL, NULL);
         }
         for (int k = 0; k < t->num_sec; k++) {
-            bufpool_discard_dirty(t->sec[k].tree.bp);
+            wal_undo(&t->sec[k].tree.wal);
+            bufpool_invalidate_all(t->sec[k].tree.bp);
             pager_truncate(&t->sec[k].tree.wal.data, t->sec[k].txn_pages);
             wal_begin(&t->sec[k].tree.wal);
             btree_reload_root(&t->sec[k].tree);
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
+            bufpool_set_steal_handler(t->sec[k].tree.bp, NULL, NULL);
         }
     }
     txnlog_abort(&db->txnlog, db->cur_txn); /* MVCC: 이 트랜잭션을 아보트 표시 */
@@ -2514,12 +2534,19 @@ int db_exec(Database *db, const char *sql, FILE *out) {
                       st.type == STMT_DELETE || st.type == STMT_UPDATE);
     if (autocommit) {
         for (int i = 0; i < db->num_tables; i++) {
-            bufpool_set_no_steal(db->tables[i].bp, 1);
-            if (db->tables[i].has_index) {
-                bufpool_set_no_steal(db->tables[i].index.bp, 1);
+            Table *t = &db->tables[i];
+            bufpool_set_no_steal(t->bp, 1);
+            bufpool_set_steal_handler(t->bp, wal_steal_cb, &t->wal);
+            wal_begin(&t->wal); /* base_pages 포착 — steal 시 undo truncate 기준 */
+            if (t->has_index) {
+                bufpool_set_no_steal(t->index.bp, 1);
+                bufpool_set_steal_handler(t->index.bp, wal_steal_cb, &t->index.wal);
+                wal_begin(&t->index.wal);
             }
-            for (int k = 0; k < db->tables[i].num_sec; k++) {
-                bufpool_set_no_steal(db->tables[i].sec[k].tree.bp, 1);
+            for (int k = 0; k < t->num_sec; k++) {
+                bufpool_set_no_steal(t->sec[k].tree.bp, 1);
+                bufpool_set_steal_handler(t->sec[k].tree.bp, wal_steal_cb, &t->sec[k].tree.wal);
+                wal_begin(&t->sec[k].tree.wal);
             }
         }
     }
@@ -2548,23 +2575,39 @@ int db_exec(Database *db, const char *sql, FILE *out) {
                     wal_flush_commit(t->sec[k].tree.bp, &t->sec[k].tree.wal);
                 }
             } else {
-                bufpool_discard_dirty(t->bp); /* 실패한 문장의 변경은 버린다 */
+                /* 실패한 문장의 변경은 버린다. steal이 있었으면 before-image로 원복하고
+                 * 새로 할당한 페이지를 잘라낸다. */
+                uint64_t base = t->wal.base_pages;
+                wal_undo(&t->wal);
+                bufpool_invalidate_all(t->bp);
+                pager_truncate(&t->wal.data, base);
                 wal_begin(&t->wal);
                 if (t->has_index) {
-                    bufpool_discard_dirty(t->index.bp);
+                    uint64_t ibase = t->index.wal.base_pages;
+                    wal_undo(&t->index.wal);
+                    bufpool_invalidate_all(t->index.bp);
+                    pager_truncate(&t->index.wal.data, ibase);
                     wal_begin(&t->index.wal);
+                    btree_reload_root(&t->index);
                 }
                 for (int k = 0; k < t->num_sec; k++) {
-                    bufpool_discard_dirty(t->sec[k].tree.bp);
+                    uint64_t sbase = t->sec[k].tree.wal.base_pages;
+                    wal_undo(&t->sec[k].tree.wal);
+                    bufpool_invalidate_all(t->sec[k].tree.bp);
+                    pager_truncate(&t->sec[k].tree.wal.data, sbase);
                     wal_begin(&t->sec[k].tree.wal);
+                    btree_reload_root(&t->sec[k].tree);
                 }
             }
             bufpool_set_no_steal(t->bp, 0);
+            bufpool_set_steal_handler(t->bp, NULL, NULL);
             if (t->has_index) {
                 bufpool_set_no_steal(t->index.bp, 0);
+                bufpool_set_steal_handler(t->index.bp, NULL, NULL);
             }
             for (int k = 0; k < t->num_sec; k++) {
                 bufpool_set_no_steal(t->sec[k].tree.bp, 0);
+                bufpool_set_steal_handler(t->sec[k].tree.bp, NULL, NULL);
             }
         }
     }

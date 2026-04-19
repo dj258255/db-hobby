@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (323 checks across 20 suites).
+covered by tests (331 checks across 21 suites).
 
 ![db-hobby REPL demo](docs/demo.svg)
 
@@ -133,9 +133,12 @@ and `_` (one char) with a backtracking matcher -- both run as a full scan, not v
 the index. Writes go through a **write-ahead
 log**: a commit (explicit or per-statement autocommit) stages the transaction's
 dirty pages -- for both the heap and the B+Tree index -- logs them with a commit
-marker + `fsync`, and only then applies them to the file, so a crash mid-commit is
-recovered on reopen (redo if the marker is present, discard if not). Rollback
-discards dirty pages and truncates the files.
+marker + `fsync`, and only then applies them to the file. If a transaction's dirty
+pages outgrow the buffer pool, they are **stolen** (evicted to disk before commit)
+only after their *before-image* is logged first, so the change stays undoable. A
+crash mid-commit is recovered on reopen: **redo** the committed after-images if the
+marker is present, else **undo** the before-images and truncate any pages the
+transaction allocated. Rollback undoes the same way.
 
 See `DESIGN.md` for the full layer map and build order.
 
@@ -155,7 +158,10 @@ lock-based (2PL), **not** MVCC/snapshot isolation, and the executor keeps one
 transaction open at a time (a conflict is demonstrated by injecting a competing
 lock). The WAL
 protects both the data (`.tbl`) and index
-(`.idx`) files, and a transaction's dirty pages must fit in the buffer pool. B+Tree
+(`.idx`) files; a transaction larger than the buffer pool is handled by stealing
+dirty pages to disk with undo (before-image) logging, so transaction size is no
+longer bounded by the pool -- but commit still **forces** every page to disk and
+truncates the log (no fuzzy checkpoint / no-force / multi-pass ARIES yet). B+Tree
 deletion isn't implemented (deleted rows are tombstoned in the heap, so a stale
 index entry is harmless). These are noted in the code where they matter.
 

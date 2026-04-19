@@ -20,6 +20,8 @@ struct BufferPool {
     size_t hits;
     size_t misses;
     int no_steal;          /* 트랜잭션 중: dirty 페이지를 교체 대상에서 제외 */
+    bufpool_sink_fn steal_fn; /* no-steal 중 dirty 축출 시 부를 핸들러(WAL undo). NULL이면 옛 동작 */
+    void *steal_ctx;
 };
 
 BufferPool *bufpool_create(Pager *pager, size_t num_frames) {
@@ -60,25 +62,33 @@ static Frame *pick_frame(BufferPool *bp) {
             return &bp->frames[i];
         }
     }
-    /* 2) LRU victim: pin 안 된 것 중 last_used가 가장 작은 것 */
+    /* 2) LRU victim: pin 안 된 것 중 last_used가 가장 작은 것.
+     * no-steal이고 steal 핸들러가 없으면 dirty는 제외(옛 동작). 핸들러가 있으면
+     * dirty도 후보 — 축출할 때 핸들러가 undo 로깅 후 디스크로 내보낸다(steal). */
+    int can_steal_dirty = !bp->no_steal || bp->steal_fn != NULL;
     Frame *victim = NULL;
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
         if (f->pin_count != 0) {
             continue;
         }
-        if (bp->no_steal && f->dirty) {
-            continue; /* 트랜잭션 중엔 커밋 안 된 페이지를 쫓아내지 않는다 */
+        if (f->dirty && !can_steal_dirty) {
+            continue; /* 옛 no-steal: 커밋 안 된 페이지를 쫓아내지 않는다 */
         }
         if (!victim || f->last_used < victim->last_used) {
             victim = f;
         }
     }
     if (!victim) {
-        return NULL; /* 전부 pin됨 — 자리 없음 */
+        return NULL; /* 전부 pin됨(또는 no-steal+핸들러없음+전부 dirty) — 자리 없음 */
     }
     if (victim->dirty) {
-        if (pager_write(bp->pager, victim->page_id, victim->data) != 0) {
+        if (bp->no_steal && bp->steal_fn) {
+            /* STEAL: 핸들러가 WAL undo 로깅 + 디스크 쓰기까지 책임진다. */
+            if (bp->steal_fn(victim->page_id, victim->data, bp->steal_ctx) != 0) {
+                return NULL;
+            }
+        } else if (pager_write(bp->pager, victim->page_id, victim->data) != 0) {
             return NULL;
         }
         victim->dirty = 0;
@@ -173,6 +183,11 @@ void bufpool_set_no_steal(BufferPool *bp, int on) {
     bp->no_steal = on;
 }
 
+void bufpool_set_steal_handler(BufferPool *bp, bufpool_sink_fn fn, void *ctx) {
+    bp->steal_fn = fn;
+    bp->steal_ctx = ctx;
+}
+
 void bufpool_discard_dirty(BufferPool *bp) {
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
@@ -180,6 +195,14 @@ void bufpool_discard_dirty(BufferPool *bp) {
             f->valid = 0; /* 디스크에 안 쓰고 무효화 -> 다음 fetch가 원본을 읽는다 */
             f->dirty = 0;
         }
+    }
+}
+
+void bufpool_invalidate_all(BufferPool *bp) {
+    for (size_t i = 0; i < bp->num_frames; i++) {
+        bp->frames[i].valid = 0;
+        bp->frames[i].dirty = 0;
+        bp->frames[i].pin_count = 0;
     }
 }
 

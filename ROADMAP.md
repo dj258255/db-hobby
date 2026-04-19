@@ -3,10 +3,13 @@
 진행 상황 한눈에. 블로그 시리즈(1~12편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope", 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 323개 / 20스위트 통과.**
+현재: **테스트 331개 / 21스위트 통과.**
 
-> 저장 철학에 따라 갈리는 일을 두 트랙으로 나눈다 — **A: PostgreSQL식**(db-hobby의 현재 정체성),
-> **B: MySQL/InnoDB 대조**. 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
+> 저장 철학에 따라 갈리는 일을 나눈다 — **A: PostgreSQL식**(현재 정체성), **B: MySQL/InnoDB 대조**,
+> 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
+> 그 위로 "새로 공부되는 축"을 더 얹었다 — **D: 진짜 멀티스레드 동시성**, **E: ARIES 복구**,
+> **F: 비용 기반 옵티마이저**, **G: 클라이언트/서버(psql 접속)**, **H: 분산(복제·Raft·샤딩)**, **I: LSM 엔진**.
+> A~C가 "지금 걸 완성", D~I가 "단일 노드 DB 마스터 이후의 새 지평". 상세 순서는 맨 아래 **추천 순서** 참고.
 
 ## Done — 공통 핵심 (PG·MySQL이 똑같이 쓰는 것)
 
@@ -72,8 +75,87 @@ MVCC는 일부러 옛 버전(dead tuple)을 쌓으니, 안 치우면 테이블·
 
 ---
 
+## 트랙 D — 동시성을 진짜로 (단일 스레드 -> 멀티 스레드)
+
+지금 엔진은 단일 스레드다 — 락은 "경쟁 락 주입"으로 시연할 뿐 진짜 스레드 경쟁은 없다(README Scope).
+여기서 진짜 스레드를 켠다. CMU 15-445 Project 1/2/4가 적대적 멀티스레드로 채점하는 바로 그 깊이 —
+**단일 노드 DB 내부에서 db-hobby에 없는 가장 큰 조각.**
+- [ ] **D1. 버퍼 풀 스레드 안전** — 프레임 latch(페이지별) + pin count 원자화 + 교체(LRU) 임계구역. 여러 스레드가 같은 페이지를 동시에 잡아도 안 깨지게
+- [ ] **D2. B+Tree latch crabbing(lock coupling)** — 루트->리프로 내려가며 자식 latch를 잡고 안전하면 부모 latch를 놓기, 분할이 조상까지 안 번지면 조상 latch 조기 해제. 읽기/쓰기 latch 구분
+- [ ] **D3. 진짜 블로킹 락 매니저** — 지금은 충돌을 즉시 거부. 이걸 대기 큐 + 조건변수로 바꿔 conflict면 block, 락 해제 때 깨움. wait-for 그래프 교착 탐지는 **이미 있음** -> 진짜 대기 상황에 연결
+- [ ] **D4. 다중 커넥션 동시 트랜잭션** — 스레드별 트랜잭션 핸들(트랙 A3와 만남), 인터리브를 주입이 아니라 진짜 스레드로 시연
+
+---
+
+## 트랙 E — 복구를 제대로 (redo-only no-steal -> ARIES)
+
+**steal + undo 도달(14편).** 커밋 전 dirty page를 before-image 로깅 후 디스크로 방출(steal)하고,
+복구/롤백이 redo(커밋분 after-image) + undo(미완 loser의 before-image + 새 페이지 truncate)로 나뉜다.
+그래서 트랜잭션이 버퍼 풀보다 커도 돈다(위 "버퍼 풀 초과 트랜잭션" 한계 해소). 남은 건 no-force·체크포인트·3-패스(15편).
+- [x] **E1(부분). WAL rule + steal** — 최초 steal 시 REC_BEGIN(base 페이지 수) + REC_UNDO(before-image)를 로그에 먼저 fsync한 뒤 페이지를 디스크로. pageLSN·no-force는 아직 (커밋 시 force 유지)
+- [x] **E2(부분). UNDO 로깅** — steal한 미커밋 변경을 before-image로 되돌림(롤백·크래시 복구 공통). first-write-wins로 페이지당 undo 1회(최초 steal 때만). CLR·no-force는 15편
+- [ ] E1/E2 마무리 — pageLSN, no-force(커밋 시 로그만 force), CLR(보상 로그)
+- [ ] **E3. 퍼지 체크포인트** — dirty page table + active txn table 스냅샷을 로그에 찍어 복구 시작점을 앞당김
+- [ ] **E4. 3-패스 복구(Analysis -> Redo -> Undo)** — 크래시 후 정확히 ARIES로 복원. 지금의 redo/discard보다 훨씬 현실적
+  - ※ 이걸 하면 트랙 A1의 MVCC 재작성(steal + abort 롤백)이 자연히 풀린다 — E와 A는 한 몸.
+
+---
+
+## 트랙 F — 옵티마이저 (규칙 기반 -> 비용 기반)
+
+지금 플래너는 규칙 기반(첫 컬럼 PK면 인덱스, 아니면 풀스캔; 조인 방법도 규칙 선택). 진짜 옵티마이저는 통계로 비용을 매겨 고른다.
+- [ ] **F1. 통계 수집(ANALYZE)** — 테이블 행 수, 컬럼별 히스토그램/distinct 추정을 카탈로그에 영속화
+- [ ] **F2. 카디널리티 추정** — WHERE 선택도(selectivity)로 결과 행 수 예측, 히스토그램 기반 range 추정
+- [ ] **F3. 비용 기반 조인 순서** — System R식 DP로 N-way 조인의 순서 + 방법 조합 비용을 최소화. 지금 "선언 순서대로 왼쪽부터"를 진짜 탐색으로
+- [ ] **F4. EXPLAIN에 추정 비용/행 수** — 진짜 PG처럼 `cost=.. rows=..` 표시
+
+---
+
+## 트랙 G — 클라이언트/서버 (REPL -> 네트워크 DB)
+
+지금은 로컬 REPL 하나. 진짜 DB는 TCP로 여러 클라이언트를 받는다. **여기서 트랙 D(멀티스레드)가 진짜로 필요해진다** — 커넥션마다 세션.
+- [ ] **G1. TCP 서버 + 커넥션당 세션** — accept 루프, 커넥션별 트랜잭션/락 컨텍스트
+- [ ] **G2. PostgreSQL wire protocol(v3)** — startup, 쿼리(Q), RowDescription/DataRow, ReadyForQuery. **목표: 진짜 `psql`로 접속**. (프로토콜 스펙 정독 = CodeCrafters Redis의 RESP 정독과 같은 결)
+- [ ] **G3. (선택) prepared statement / extended query** — Parse/Bind/Execute 흐름
+  - ※ 포트폴리오 관점: "내가 C로 짠 DB에 `psql`이 그대로 붙는다"는 데모 하나가 면접에서 세다.
+
+---
+
+## 트랙 H — 분산 (단일 노드 -> 다중 노드)
+
+db-hobby는 전부 단일 노드다. 여기서 축이 완전히 바뀐다(MIT 6.824의 영역).
+**이미 WAL이 있으니 복제의 출발점이 자연스럽다 — 로그를 다른 노드로 보내면 그게 복제다.**
+- [ ] **H1. Primary-Replica 복제(log shipping)** — primary의 WAL을 replica로 스트리밍, replica가 redo로 따라감. 동기/비동기 커밋 대조
+- [ ] **H2. 합의(Raft)** — 리더 선출 + 로그 복제 + 안전성. 노드 장애/네트워크 분단에도 일관. (6.824 Raft를 네 엔진 위에서)
+- [ ] **H3. 샤딩** — 키 범위/해시로 파티션 + 라우팅. (6.824 Sharded KV의 결)
+  - ※ H는 사실상 별개 프로젝트 규모. 트랙 G(네트워크) 이후에나 현실적.
+
+---
+
+## 트랙 I — 대체 스토리지 엔진 (B-Tree <-> LSM)
+
+트랙 B가 "PG 힙 vs InnoDB 클러스터드"를 한 코드에서 대조하듯, 여기선 "B-Tree vs LSM-Tree"를 대조한다. RocksDB/LevelDB 내부.
+- [ ] **I1. LSM 스토리지 모드** — memtable(인메모리 정렬) + WAL + flush로 SSTable 생성
+- [ ] **I2. Compaction** — leveled/tiered로 SSTable 병합, tombstone 청소
+- [ ] **I3. Bloom filter** — SSTable별 존재 필터로 읽기 증폭 감소
+- [ ] **I4. `make bench`로 B-Tree vs LSM** — 쓰기 많은/읽기 많은 워크로드에서 write/read amplification 비교
+
+---
+
 ## 추천 순서
 
-1. **트랙 A 한 줄기**: A1(MVCC) -> A2(VACUUM). "진짜 미니 PostgreSQL" 완성.
-2. 그다음 **트랙 B**(클러스터드 모드)로 MySQL 대조 — 힙 vs 클러스터드를 직접 벤치.
-3. **트랙 C**는 사이사이 하나씩.
+**(1) 지금 정체성 완성 — 최우선**
+1. **트랙 A**: A1(MVCC) -> A2(VACUUM). "진짜 미니 PostgreSQL" 완성.
+2. **트랙 B**(클러스터드 모드)로 MySQL 대조 — 힙 vs 클러스터드를 직접 벤치.
+
+**(2) 깊이 — DB 코어를 교과서 수준으로**
+3. **트랙 E**(ARIES) — 트랙 C의 "버퍼 풀 넘는 트랜잭션" 한계 + A1의 재작성 프론티어를 한 방에 푼다.
+4. **트랙 D**(진짜 멀티스레드) — 단일 노드 DB 내부의 마지막 큰 조각. 15-445 P1/P4 깊이.
+5. **트랙 F**(비용 기반 옵티마이저).
+
+**(3) 새 축 — 이력서가 세지는 구간**
+6. **트랙 G**(psql 붙는 서버) — 네트워크 축. 데모 임팩트 큼.
+7. **트랙 H**(복제 -> Raft -> 샤딩) — 분산 축. 6.824를 네 엔진 위에서.
+
+**(4) 대조 연구 — 사이사이**
+8. **트랙 I**(LSM 엔진) — B-Tree vs LSM. · **트랙 C**(SQL 완성도)는 머리 식힐 때 하나씩.
