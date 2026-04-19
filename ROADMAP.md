@@ -3,7 +3,7 @@
 진행 상황 한눈에. 블로그 시리즈(1~12편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope", 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 331개 / 21스위트 통과.**
+현재: **테스트 338개 / 21스위트 통과.**
 
 > 저장 철학에 따라 갈리는 일을 나눈다 — **A: PostgreSQL식**(현재 정체성), **B: MySQL/InnoDB 대조**,
 > 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
@@ -89,12 +89,14 @@ MVCC는 일부러 옛 버전(dead tuple)을 쌓으니, 안 치우면 테이블·
 
 ## 트랙 E — 복구를 제대로 (redo-only no-steal -> ARIES)
 
-**steal + undo 도달(14편).** 커밋 전 dirty page를 before-image 로깅 후 디스크로 방출(steal)하고,
-복구/롤백이 redo(커밋분 after-image) + undo(미완 loser의 before-image + 새 페이지 truncate)로 나뉜다.
-그래서 트랜잭션이 버퍼 풀보다 커도 돈다(위 "버퍼 풀 초과 트랜잭션" 한계 해소). 남은 건 no-force·체크포인트·3-패스(15편).
-- [x] **E1(부분). WAL rule + steal** — 최초 steal 시 REC_BEGIN(base 페이지 수) + REC_UNDO(before-image)를 로그에 먼저 fsync한 뒤 페이지를 디스크로. pageLSN·no-force는 아직 (커밋 시 force 유지)
-- [x] **E2(부분). UNDO 로깅** — steal한 미커밋 변경을 before-image로 되돌림(롤백·크래시 복구 공통). first-write-wins로 페이지당 undo 1회(최초 steal 때만). CLR·no-force는 15편
-- [ ] E1/E2 마무리 — pageLSN, no-force(커밋 시 로그만 force), CLR(보상 로그)
+**steal + undo(14편), no-force + 단순 체크포인트(15편) 도달.** 커밋 전 dirty page를 before-image
+로깅 후 방출(steal)하고, 커밋은 로그 fsync 하나가 유일한 내구성 지점(no-force) — 로그가 진실의
+원천이 됐다(커밋 시 truncate 안 함). 복구는 다중 트랜잭션 로그를 커밋 구간별 redo + 꼬리 loser
+undo로 처리. 남은 건 CLR·퍼지 체크포인트·3-패스 정식화(16편).
+- [x] **E1. WAL rule + steal(14편) + no-force(15편)** — 커밋 = after-image+마커 로그 fsync만. 페이지는 fsync 없이 write-back. LSN 인프라(next/flushed_lsn) 도입. ※ pageLSN은 도입 안 함 — 페이지 전체 물리 로깅이라 redo가 idempotent해 불필요(physiological 로깅으로 갈 때 필요해짐, 정직한 생략)
+- [x] **E2(부분). UNDO 로깅** — steal한 미커밋 변경을 before-image로 되돌림(롤백·크래시 복구 공통). first-write-wins로 페이지당 undo 1회. 롤백은 로그의 자기 트랜잭션 구간(txn_log_start~)만 undo. CLR은 남음
+- [x] **E3(부분). 단순 체크포인트** — 로그가 임계(4MB)를 넘으면 커밋 끝에 데이터 fsync 후 로그 truncate. 재오픈 복구의 끝도 체크포인트로 동작. 퍼지(dirty page table + active txn 스냅샷)는 아님
+- [ ] **E 마무리(16편)** — CLR(보상 로그, undo 중 재크래시 안전), 퍼지 체크포인트, 3-패스(Analysis -> Redo -> Undo) 정식화
 - [ ] **E3. 퍼지 체크포인트** — dirty page table + active txn table 스냅샷을 로그에 찍어 복구 시작점을 앞당김
 - [ ] **E4. 3-패스 복구(Analysis -> Redo -> Undo)** — 크래시 후 정확히 ARIES로 복원. 지금의 redo/discard보다 훨씬 현실적
   - ※ 이걸 하면 트랙 A1의 MVCC 재작성(steal + abort 롤백)이 자연히 풀린다 — E와 A는 한 몸.

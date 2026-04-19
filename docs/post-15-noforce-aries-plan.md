@@ -1,8 +1,27 @@
 # 15편 기획서 — FORCE를 버리고 WAL을 진실의 원천으로 (no-force + 체크포인트 + 3-패스 ARIES)
 
-> 상태: 기획(draft). 트랙 E의 마무리 — E1(no-force)·E3(체크포인트)·E4(3-패스 복구).
+> 상태: **15(a) 구현 완료.** 두 편 분할 확정 — 15편 = no-force + 상시 redo + 단순 체크포인트(코드 완료),
+> 16편 = CLR + 퍼지 체크포인트 + 3-패스 정식화.
 > 전제: 14편에서 steal + before-image undo + redo/undo 2-패스까지 완료(`docs/post-14-aries-plan.md`).
-> ⚠️ 14편과 달리 **온디스크 페이지 포맷을 바꾼다**(pageLSN). 가장 침습적인 편.
+
+## ✅ 구현 확정 사항 (계획 대비 변경)
+
+1. **pageLSN 생략 (페이지 포맷 변경 안 함).** 페이지 전체 물리 로깅에선 커밋 순서 redo가 idempotent라
+   pageLSN이 정확성에 불필요. 14편 7절("pageLSN 없음 — redo가 idempotent")의 논리와 일관.
+   pageLSN은 훗날 physiological 로깅 편에서 "진짜 필요해서" 등장시키는 게 정직한 서사.
+   → 이로써 이 편의 최대 리스크(온디스크 포맷 변경·파일 비호환)가 사라짐.
+2. **db-hobby식 no-force**: 커밋 = 로그 fsync 하나(유일한 내구성 지점). 페이지는 파일에 write-back하되
+   **fsync하지 않고**(OS 캐시), 로그는 truncate하지 않음. "디스크(캐시) = 최신 커밋" 불변식이 유지돼
+   steal의 capture-at-first-steal(디스크에서 before-image 읽기)이 그대로 정확. bufpool/트랜잭션
+   choreography 무변경 — 최소 침습.
+3. **롤백 스코프**: `txn_log_start`(wal_begin 시 로그 끝 오프셋) 이후만 undo하고 그 지점으로 로그
+   truncate — 앞선 커밋 이력 보존.
+4. **복구 = 다중 트랜잭션 2-패스**: pass1은 커밋 구간마다 after-image를 커밋 순서대로 redo(+마지막
+   커밋 오프셋 추적), pass2는 그 뒤 꼬리(loser)만 스트리밍 undo + base truncate. 복구 끝 = 로그
+   truncate = "여는 것 자체가 체크포인트".
+5. **단순 체크포인트**: 커밋 끝에 로그 크기 > 4MB(`WAL_CHECKPOINT_BYTES`)면 데이터 fsync 후 로그
+   truncate. 퍼지 아님(16편).
+6. 테스트: test_wal에 다중 커밋 redo·롤백 이력 보존 시나리오 추가. **338개 / 21스위트 green.**
 
 ---
 

@@ -4,26 +4,29 @@
 #include "pager.h"
 
 /*
- * WAL (Write-Ahead Log) — 내구성과 원자성을 주는 장치.
+ * WAL (Write-Ahead Log) — 내구성과 원자성을 주는 장치. 로그가 "진실의 원천"이다.
  *
  * 규칙: 데이터 파일을 고치기 전에 로그에 먼저 적고 fsync 한다(write-ahead).
- * 트랜잭션 동안 바뀐 페이지는 버퍼 풀에 모아두고, 커밋할 때:
- *   1) 모은 페이지들을 로그에 쓴다
- *   2) 커밋 마커를 쓰고 fsync  <- 여기를 지나면 "내구"하다
- *   3) 데이터 파일에 실제로 적용한다
- *   4) 로그를 비운다(체크포인트)
+ * 트랜잭션 동안 바뀐 페이지는 버퍼 풀에 모아두고, 커밋할 때(NO-FORCE):
+ *   1) 모은 페이지들(after-image)을 로그에 쓴다
+ *   2) 커밋 마커를 쓰고 fsync  <- 여기가 유일한 내구성 지점
+ *   3) 데이터 파일에 반영은 하되 fsync하지 않는다 — 내구성은 로그가 책임진다
+ *   4) 로그는 자르지 않는다. 커밋 이력이 쌓인다(진실의 원천).
+ *      너무 커지면 체크포인트(데이터 fsync 후 로그 truncate)로 자른다.
  *
- * 크래시 복구(wal_open 시): 로그를 읽어
- *   - 커밋 마커가 있으면  -> 커밋된 after-image를 데이터에 재적용(redo). 내구성.
- *   - 커밋 마커가 없으면  -> before-image로 되돌린다(undo) + 새로 할당한 페이지는 잘라낸다. 원자성.
+ * 크래시 복구(wal_open 시): 로그를 앞에서부터 읽어
+ *   - 커밋 마커가 붙은 구간들 -> after-image를 순서대로 재적용(redo). 내구성.
+ *   - 꼬리의 마커 없는 구간(loser) -> before-image로 되돌린다(undo) + 새 페이지는 잘라낸다. 원자성.
+ *   복구 끝 = 데이터 fsync + 로그 truncate (여는 것 자체가 체크포인트다).
  *
  * STEAL (트랙 E): 트랜잭션의 dirty 페이지가 버퍼 풀보다 많아지면, 커밋 전이라도
  * 디스크로 내보낸다(steal). 그러면 디스크에 미커밋 변경이 생기므로 되돌릴 수단이 필요하다 —
  * steal 직전에 그 페이지의 before-image(=아직 내가 안 건드린 디스크의 커밋본)를 로그에
  * 먼저 남긴다(REC_BEGIN으로 트랜잭션 시작 페이지 수도 함께). first-write-wins: 페이지당 undo는
- * 최초 steal 때 한 번만. 커밋 정책은 force-at-commit 유지(no-force·체크포인트·3-패스는 다음 단계).
+ * 최초 steal 때 한 번만.
  *
- * 학습용: 단일 트랜잭션, 페이지 전체 물리 로깅. 진짜 ARIES의 physiological 로깅·LSN·동시성은 없음.
+ * 학습용: 단일 트랜잭션, 페이지 전체 물리 로깅(그래서 redo가 idempotent — pageLSN 불필요).
+ * 진짜 ARIES의 physiological 로깅·CLR·동시성은 없음.
  */
 
 #define WAL_MAX_STAGED 64
@@ -49,6 +52,10 @@ typedef struct {
      * truncate되는 임시 파일이라 LSN은 로그 수명 안에서만 유효.) */
     uint64_t next_lsn;
     uint64_t flushed_lsn;
+
+    /* no-force: 로그에 여러 트랜잭션 이력이 쌓이므로, 롤백(undo)은 로그 처음이
+     * 아니라 "내 트랜잭션이 시작된 오프셋"부터 훑어야 한다. wal_begin이 기록. */
+    int64_t txn_log_start;
 } Wal;
 
 /* 데이터/로그 파일을 연다. 열 때 크래시 복구를 수행한다. 0 성공, -1 실패. */

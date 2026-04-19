@@ -19,6 +19,10 @@ typedef struct {
 #define REC_BEGIN 'B'  /* base_pages (steal이 처음 일어날 때 한 번) */
 #define REC_UNDO 'U'   /* pid + before-image (undo) */
 
+/* no-force라 로그가 커밋 이력으로 자란다. 이 크기를 넘으면 커밋 끝에 체크포인트
+ * (데이터 fsync -> 로그 truncate)로 자른다. 복구 시간과 로그 크기의 상한. */
+#define WAL_CHECKPOINT_BYTES (4 << 20)
+
 static int write_all(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     while (n) {
@@ -89,13 +93,15 @@ static int skip_bytes(int fd, off_t n) {
 }
 
 /*
- * 크래시 복구.
- *   - 로그에 REC_COMMIT가 있으면 = 커밋됨 -> REC_PAGE(after-image)를 재적용(redo). 내구성.
- *     (커밋 시 in-pool dirty만 stage하므로 REC_PAGE는 버퍼 풀 크기(<=64) 이하. stolen 페이지는
- *      이미 디스크에 fsync됨.)
- *   - REC_COMMIT가 없으면 = 미완(loser) -> REC_UNDO(before-image)로 원복하고 새로 할당한
- *     페이지(>= base)는 잘라낸다. 원자성. (REC_UNDO는 개수 제한이 없으므로 스트리밍으로 적용.)
- * 단일 트랜잭션 + 커밋 시 로그 truncate라 로그엔 마지막 한 트랜잭션분만 있다.
+ * 크래시 복구. no-force라 로그엔 여러 트랜잭션의 이력이 순서대로 쌓여 있다.
+ *   - Pass 1: 앞에서부터 훑으며, REC_COMMIT를 만날 때마다 그 구간의 REC_PAGE
+ *     (after-image)들을 데이터에 재적용(redo). 커밋 순서 그대로 반복하므로 마지막
+ *     상태가 정확히 복원된다(페이지 전체 물리 로깅 = idempotent, pageLSN 불필요).
+ *     (구간당 REC_PAGE는 커밋 시 in-pool dirty만 stage하므로 <= WAL_MAX_STAGED.)
+ *   - Pass 2: 마지막 커밋 마커 뒤에 남은 꼬리 = 미완(loser). REC_UNDO(before-image)로
+ *     원복하고 새로 할당한 페이지(>= base)는 잘라낸다. 원자성.
+ *     (loser의 REC_UNDO는 개수 제한이 없으므로 스트리밍으로 적용.)
+ * 복구 끝 = 데이터 fsync + 로그 truncate — 여는 것 자체가 체크포인트다.
  */
 static int wal_recover(Wal *w) {
     if (lseek(w->log_fd, 0, SEEK_SET) < 0) {
@@ -106,10 +112,10 @@ static int wal_recover(Wal *w) {
         return -1;
     }
     int nredo = 0;
-    int committed = 0;
     int rc = 0;
+    off_t loser_start = 0; /* 마지막 커밋 마커 직후 오프셋 = loser 구간의 시작 */
 
-    /* Pass 1 (redo 후보 수집 + 커밋 여부 판정) */
+    /* Pass 1: 커밋 구간마다 after-image를 커밋 순서대로 재적용(redo) */
     for (;;) {
         uint8_t type;
         if (read_exact(w->log_fd, &type, 1) != 0) {
@@ -124,7 +130,7 @@ static int wal_recover(Wal *w) {
             }
         } else if (type == REC_UNDO) {
             if (skip_bytes(w->log_fd, sizeof(uint64_t) + PAGE_SIZE) != 0) {
-                break; /* undo는 pass 2에서 처리 */
+                break; /* 커밋된 구간의 undo는 안 쓴다. loser 것은 pass 2에서 */
             }
         } else if (type == REC_PAGE) {
             uint64_t pid;
@@ -141,25 +147,24 @@ static int wal_recover(Wal *w) {
                 break;
             }
         } else if (type == REC_COMMIT) {
-            committed = 1;
-            break; /* 단일 트랜잭션: 커밋 마커가 마지막 */
+            /* 이 구간은 커밋됨 -> redo. 다음 구간을 이어서 훑는다. */
+            for (int i = 0; i < nredo; i++) {
+                if (pager_write(&w->data, redo[i].page_id, redo[i].data) != 0) {
+                    rc = -1;
+                }
+            }
+            nredo = 0;
+            loser_start = lseek(w->log_fd, 0, SEEK_CUR);
         } else {
             break;
         }
     }
 
-    if (committed) {
-        /* 커밋됨 -> after-image 재적용(redo). undo 레코드는 무시. */
-        for (int i = 0; i < nredo; i++) {
-            if (pager_write(&w->data, redo[i].page_id, redo[i].data) != 0) {
-                rc = -1;
-            }
-        }
-    } else {
-        /* 미완(loser) -> Pass 2: before-image로 원복(스트리밍) + 새 페이지 truncate. */
+    /* Pass 2: 마지막 커밋 뒤 꼬리(loser) -> before-image로 원복(스트리밍) + 새 페이지 truncate. */
+    {
         int have_base = 0;
         uint64_t base = 0;
-        lseek(w->log_fd, 0, SEEK_SET);
+        lseek(w->log_fd, loser_start, SEEK_SET);
         for (;;) {
             uint8_t type;
             if (read_exact(w->log_fd, &type, 1) != 0) {
@@ -232,7 +237,8 @@ int wal_open(Wal *w, const char *data_path, const char *log_path) {
     w->cap_spilled = 0;
     w->next_lsn = 1;
     w->flushed_lsn = 0;
-    wal_recover(w); /* 열면서 복구 */
+    w->txn_log_start = 0;
+    wal_recover(w); /* 열면서 복구 (끝에 로그를 비우므로 = 체크포인트) */
     return 0;
 }
 
@@ -262,6 +268,9 @@ void wal_begin(Wal *w) {
     w->stole = 0;
     w->base_pages = w->data.num_pages; /* undo 시 여기로 truncate */
     w->num_spilled = 0;                /* spilled 목록 리셋 (버퍼는 재사용) */
+    /* 로그엔 앞선 커밋들의 이력이 남아 있다(no-force). 내 트랜잭션의 기록은
+     * 여기부터 시작한다 — 롤백(undo)이 이 오프셋부터만 훑는다. */
+    w->txn_log_start = lseek(w->log_fd, 0, SEEK_END);
 }
 
 int wal_stage(Wal *w, page_id_t page_id, const void *buf) {
@@ -328,7 +337,8 @@ int wal_undo(Wal *w) {
     if (!w->stole) {
         return 0; /* steal이 없었으면 로그에 되돌릴 게 없다 */
     }
-    if (lseek(w->log_fd, 0, SEEK_SET) < 0) {
+    /* 로그 앞부분은 앞선 트랜잭션들의 커밋 이력(no-force) — 내 것만 훑는다. */
+    if (lseek(w->log_fd, w->txn_log_start, SEEK_SET) < 0) {
         return -1;
     }
     int rc = 0;
@@ -368,9 +378,9 @@ int wal_undo(Wal *w) {
         pager_truncate(&w->data, base); /* 새로 할당한 페이지 제거 */
     }
     fsync(w->data.fd);
-    /* 로그 비움 */
-    ftruncate(w->log_fd, 0);
-    lseek(w->log_fd, 0, SEEK_SET);
+    /* 아보트한 트랜잭션의 기록만 잘라낸다 — 앞선 커밋 이력은 보존(진실의 원천). */
+    ftruncate(w->log_fd, w->txn_log_start);
+    lseek(w->log_fd, 0, SEEK_END);
     w->stole = 0;
     w->num_spilled = 0;
     return rc;
@@ -405,17 +415,22 @@ int wal_commit(Wal *w) {
         return 0; /* 크래시: 데이터 적용 전 -> 복구가 redo */
     }
 
-    /* 3) 데이터 파일에 실제로 적용 (stolen 페이지는 이미 디스크에 있다) */
+    /* 3) 데이터 파일에 반영은 하되 fsync하지 않는다(NO-FORCE) — 내구성은 이미
+     *    2)의 로그 fsync가 책임진다. 크래시가 나도 복구의 redo가 로그에서 재적용.
+     *    (stolen 페이지는 steal 시점에 이미 디스크에 내구화돼 있다.) */
     for (int i = 0; i < w->num_staged; i++) {
         if (pager_write(&w->data, s[i].page_id, s[i].data) != 0) {
             return -1;
         }
     }
-    fsync(w->data.fd);
 
-    /* 4) 로그 비움(체크포인트) */
-    ftruncate(w->log_fd, 0);
-    lseek(w->log_fd, 0, SEEK_SET);
+    /* 4) 로그는 자르지 않는다 — 커밋 이력이 곧 진실의 원천. 대신 무한히 크지 않게,
+     *    임계를 넘으면 체크포인트: 데이터를 fsync해 로그를 따라잡게 한 뒤 로그를 비운다. */
+    if (lseek(w->log_fd, 0, SEEK_END) > (off_t)WAL_CHECKPOINT_BYTES) {
+        fsync(w->data.fd);
+        ftruncate(w->log_fd, 0);
+        lseek(w->log_fd, 0, SEEK_SET);
+    }
     w->num_staged = 0;
     w->stole = 0;
     w->num_spilled = 0;
