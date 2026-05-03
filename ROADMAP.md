@@ -111,13 +111,14 @@ undo로 처리. 남은 건 CLR·퍼지 체크포인트·3-패스 정식화(16편
 
 ---
 
-## 트랙 G — 클라이언트/서버 (REPL -> 네트워크 DB)
+## 트랙 G — 클라이언트/서버 (REPL -> 네트워크 DB) — **도달(19편)**
 
-지금은 로컬 REPL 하나. 진짜 DB는 TCP로 여러 클라이언트를 받는다. **여기서 트랙 D(멀티스레드)가 진짜로 필요해진다** — 커넥션마다 세션.
-- [ ] **G1. TCP 서버 + 커넥션당 세션** — accept 루프, 커넥션별 트랜잭션/락 컨텍스트
-- [ ] **G2. PostgreSQL wire protocol(v3)** — startup, 쿼리(Q), RowDescription/DataRow, ReadyForQuery. **목표: 진짜 `psql`로 접속**. (프로토콜 스펙 정독 = CodeCrafters Redis의 RESP 정독과 같은 결)
-- [ ] **G3. (선택) prepared statement / extended query** — Parse/Bind/Execute 흐름
-  - ※ 포트폴리오 관점: "내가 C로 짠 DB에 `psql`이 그대로 붙는다"는 데모 하나가 면접에서 세다.
+`./build/db-hobby db.db --serve 5433` -> **진짜 `psql`이 붙는다**(검증: psql 14.19). 단일 스레드 `poll()`
+이벤트 루프, 커넥션 = 18편의 세션(커넥션당 트랜잭션 핸들). psql 두 개로 "reader가 writer를 안 막는다"를
+네트워크 너머에서 시연. 그 한계(이벤트 루프 = 진짜 병렬 아님, 느린 클라가 서버를 막음)가 곧 트랙 D의 장애 서사다.
+- [x] **G1. TCP 서버 + 커넥션당 세션** — `poll()` 루프, 커넥션↔세션 매핑, 끊김 시 열린 트랜잭션 롤백
+- [x] **G2. PostgreSQL wire protocol(v3)** — startup·SSLRequest 거절·simple query(Q)·Terminate, RowDescription/DataRow(전 컬럼 text)·CommandComplete·ErrorResponse·ReadyForQuery(txn 상태 반영). EXPLAIN은 QUERY PLAN 컬럼으로
+- [ ] **G3. (선택) extended query(Parse/Bind/Execute)** — 미지원(psql 기본 대화는 simple query라 불필요). SELECT는 실행기 텍스트 출력 파싱이라 TEXT에 " | " 들어가면 컬럼 갈림(알려진 한계)
 
 ---
 

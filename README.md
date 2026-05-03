@@ -18,7 +18,18 @@ make test            # build and run the test suite
 make bench           # build (-O2) and run the benchmark (index vs scan, fsync cost)
 make repl            # build the REPL
 ./build/db-hobby my.db # open (or create) a database and type SQL
+
+# or speak the real PostgreSQL wire protocol and connect with psql:
+./build/db-hobby my.db --serve 5433
+psql "host=127.0.0.1 port=5433 dbname=db-hobby"
 ```
+
+The `--serve` mode is a single-threaded `poll()` server that speaks PostgreSQL's
+v3 wire protocol, so **an actual `psql` connects to it** (tested against psql
+14.19). Each connection gets one of the multi-transaction sessions, so two `psql`
+windows demonstrate "readers don't block writers" over the network. (Simple query
+only -- no extended/prepared protocol; SELECT rows are parsed from the executor's
+text output, so a `TEXT` value containing `" | "` splits columns.)
 
 A session:
 

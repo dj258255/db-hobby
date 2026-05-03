@@ -5,10 +5,13 @@ BUILD := build
 # 핵심 소스 (계층이 늘면 여기에 추가)
 SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/btree.c src/wal.c src/lock.c src/mvcc.c
 
+# REPL/서버 바이너리에만 링크되는 소스(테스트엔 불필요)
+BINSRCS := src/server.c
+
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
 TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn
 
-.PHONY: test repl clean bench
+.PHONY: test repl serve clean bench
 
 test: $(addprefix $(BUILD)/, $(TESTS))
 	@for t in $(TESTS); do echo "=== $$t ==="; ./$(BUILD)/$$t || exit 1; echo; done
@@ -19,10 +22,12 @@ bench: $(BUILD)/bench
 $(BUILD)/bench: tests/bench.c $(SRCS) | $(BUILD)
 	$(CC) $(CFLAGS) -O2 -Isrc $< $(SRCS) -o $@
 
-# 대화형 REPL 바이너리
+# 대화형 REPL / PostgreSQL wire 서버 바이너리 (한 바이너리, --serve로 서버)
 repl: $(BUILD)/db-hobby
-$(BUILD)/db-hobby: src/main.c $(SRCS) | $(BUILD)
-	$(CC) $(CFLAGS) -Isrc $< $(SRCS) -o $@
+serve: $(BUILD)/db-hobby
+	./$(BUILD)/db-hobby db-hobby.db --serve 5433
+$(BUILD)/db-hobby: src/main.c $(SRCS) $(BINSRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc $< $(SRCS) $(BINSRCS) -o $@
 
 # 각 테스트 = 그 테스트 소스 + 모든 핵심 소스
 $(BUILD)/test_%: tests/test_%.c $(SRCS) | $(BUILD)
