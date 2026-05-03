@@ -60,12 +60,13 @@ int main(void) {
 
     char *o;
     o = run(&db, "CREATE TABLE t (id INT)"); free(o);
+    /* autocommit 문장은 끝나며 cur_txn을 정리하므로, 방금 발급된 id = next_txn - 1 로 읽는다. */
     o = run(&db, "INSERT INTO t VALUES (1)"); free(o);
-    int t1 = db.cur_txn; /* 방금 INSERT의 트랜잭션 id */
+    int t1 = db.next_txn - 1; /* 방금 INSERT의 트랜잭션 id */
     o = run(&db, "INSERT INTO t VALUES (2)"); free(o);
-    int t2 = db.cur_txn;
+    int t2 = db.next_txn - 1;
     o = run(&db, "INSERT INTO t VALUES (3)"); free(o);
-    int t3 = db.cur_txn;
+    int t3 = db.next_txn - 1;
 
     /* 각 INSERT가 서로 다른 트랜잭션 id를 행 xmin에 박았다 */
     CHECK(t1 > 0 && t2 > 0 && t3 > 0 && t1 != t2 && t2 != t3,

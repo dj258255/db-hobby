@@ -214,8 +214,11 @@ static Table *find_table(Database *db, const char *name) {
 
 /* ------------- MVCC 가시성 ------------- */
 
-/* txn이 "커밋된 것으로 보이나" — 이전 세션 id(committed_below 미만)는 전부 커밋,
- * 이번 세션 id는 TxnLog가 COMMITTED일 때만. (no-steal+WAL이라 디스크엔 커밋분만 있음.) */
+/* txn이 "커밋된 것으로 보이나" — 이전 실행 id(committed_below 미만)는 전부 커밋,
+ * 이번 실행 id는 TxnLog가 COMMITTED일 때만. 그리고 명시적 트랜잭션 안에서는
+ * **시작 시점 스냅샷**으로 판정한다(스냅샷 격리): 내 시작 이후에 발급됐거나(>= snap_next)
+ * 시작 시점에 진행 중이던 트랜잭션은, 지금 커밋돼 있어도 나에겐 '아직 커밋 안 됨'이다.
+ * 트랜잭션 밖(autocommit 문장)은 지금 상태 그대로 본다(read committed). */
 static int txn_committed_view(Database *db, int txn) {
     if (txn <= 0) {
         return 0;
@@ -223,8 +226,25 @@ static int txn_committed_view(Database *db, int txn) {
     if (txn < db->committed_below) {
         return 1;
     }
-    return txnlog_status(&db->txnlog, txn) == TXN_COMMITTED;
+    if (txnlog_status(&db->txnlog, txn) != TXN_COMMITTED) {
+        return 0;
+    }
+    const DbSession *s = &db->sessions[db->cur_session];
+    if (s->in_txn) {
+        if (txn >= s->snap_next) {
+            return 0; /* 내 시작 이후에 태어난 트랜잭션 */
+        }
+        for (int i = 0; i < s->n_snap_inprog; i++) {
+            if (s->snap_inprog[i] == txn) {
+                return 0; /* 내 시작 시점에 진행 중이던 트랜잭션 */
+            }
+        }
+    }
+    return 1;
 }
+
+/* 트랜잭션 절(아래)에 정의 — 쓰기 실행기들이 첫 쓰기 전에 부른다. */
+static void table_begin_write(Database *db, Table *t, int txn);
 
 /* 행 버전(xmin,xmax)이 my_txn 입장에서 보이나? 자기 트랜잭션의 미커밋 쓰기도 본다. */
 static int row_visible(Database *db, int32_t xmin, int32_t xmax, int my_txn) {
@@ -488,11 +508,13 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
     t->schema = *c;
     t->num_sec = 0; /* 새 테이블은 보조 인덱스 없음 */
     t->owner = db;  /* 읽기 경로의 가시성 판정용 역참조 */
+    t->writer_txn = 0;
     if (table_open_files(t, db->path) != 0) {
         fprintf(out, "ERROR: 테이블 파일을 열 수 없습니다\n");
         return -1;
     }
     db->num_tables++;
+    table_begin_write(db, t, db->cur_txn); /* 초기 페이지(인덱스 메타 등)도 WAL로 커밋 */
     catalog_write(db);
 
     fprintf(out, "테이블 '%s' 생성됨 (컬럼 %d개)\n", c->table, c->num_columns);
@@ -530,6 +552,12 @@ static int secidx_build_visit(RID rid, const void *rec, uint16_t len, void *ctx_
  * 새 파일을 열어 기존 행으로 채우고, 직접 flush한 뒤 카탈로그에 영속화한다(DDL이라 즉시 반영). */
 static int exec_create_index(Database *db, const CreateIndexStmt *ci, FILE *out) {
     Table *t = find_table(db, ci->table);
+    if (t && t->writer_txn != 0) {
+        /* 미커밋 쓰기가 있는 테이블 위에 인덱스를 지으면 (가시성 게이트가 그 행들을
+         * 걸러) 커밋 후 인덱스에 구멍이 난다 — DDL이라 그냥 거부한다. */
+        fprintf(out, "ERROR: 다른 트랜잭션이 '%s' 테이블을 쓰는 중입니다\n", ci->table);
+        return -1;
+    }
     if (!t) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", ci->table);
         return -1;
@@ -604,6 +632,7 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
             return -1;
         }
     }
+    table_begin_write(db, t, db->cur_txn); /* 이 테이블의 WAL 트랜잭션을 (처음이면) 연다 */
     uint8_t buf[PAGE_SIZE];
     uint16_t len;
     if (encode_row(&t->schema, in->values, in->num_values, db->cur_txn, 0, buf, &len) != 0) {
@@ -616,7 +645,10 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
         return -1;
     }
     if (t->has_index && in->values[0].type == VAL_INT) {
-        btree_insert(&t->index, in->values[0].int_val, rid_encode(rid));
+        /* 버전마다 인덱스 항목을 단다(PostgreSQL식) — 다중 버전에선 같은 PK의 옛/새
+         * 버전이 공존하므로, 유니크 덮어쓰기 대신 (키,RID) 짝을 추가하고 조회가
+         * '보이는' 버전을 고른다. */
+        btree_insert_dup(&t->index, in->values[0].int_val, rid_encode(rid));
     }
     for (int k = 0; k < t->num_sec; k++) { /* 보조 인덱스도 (컬럼값 -> RID) 등록 */
         int col = t->sec[k].col;
@@ -666,6 +698,29 @@ typedef struct {
     FILE *out;
     int count;
 } RangeCtx;
+
+/* PK 점 조회: 다중 버전 인덱스라 같은 키에 항목이 여러 개일 수 있다 — 후보마다
+ * 힙에서 읽어 '보이는' 버전만 출력한다(인덱스는 MVCC를 모른다, 판정은 게이트가). */
+typedef struct {
+    Table *t;
+    FILE *out;
+    int count;
+} PointCtx;
+
+static int point_visit(bkey_t key, bval_t val, void *ctx_) {
+    (void)key;
+    PointCtx *p = ctx_;
+    uint8_t recbuf[PAGE_SIZE];
+    uint16_t len;
+    if (heap_get(&p->t->heap, rid_decode(val), recbuf, &len) == 0 &&
+        rec_visible(p->t->owner, recbuf)) {
+        Value row[SQL_MAX_COLS];
+        decode_row(&p->t->schema, recbuf, row);
+        print_row(p->out, &p->t->schema, row);
+        p->count++;
+    }
+    return 0;
+}
 
 static int range_visit(bkey_t key, bval_t val, void *ctx_) {
     RangeCtx *r = ctx_;
@@ -1693,6 +1748,25 @@ static int mjoin_emit(MJoinCtx *m) {
     return (m->sel->limit >= 0 && m->count >= m->sel->limit);
 }
 
+/* 인덱스 NLJ용: PK로 '보이는' 버전 하나를 찾아 rec에 담는다(다중 버전 후보를 훑음). */
+typedef struct {
+    Table *t;
+    uint8_t *rec;
+    int found;
+} PkVisCtx;
+
+static int pk_vis_visit(bkey_t key, bval_t val, void *ctx_) {
+    (void)key;
+    PkVisCtx *c = ctx_;
+    uint16_t len;
+    if (heap_get(&c->t->heap, rid_decode(val), c->rec, &len) == 0 &&
+        rec_visible(c->t->owner, c->rec)) {
+        c->found = 1;
+        return 1; /* 첫 '보이는' 버전에서 멈춤 (논리적으로 PK당 하나) */
+    }
+    return 0;
+}
+
 static int mjoin_descend(MJoinCtx *m, int level);
 
 typedef struct {
@@ -1743,16 +1817,13 @@ static int mjoin_descend(MJoinCtx *m, int level) {
         /* 인덱스 NLJ: 앞 테이블의 키로 Tk의 PK 인덱스를 점 조회 */
         const Value *k = &m->rows[m->key_t[level]][m->key_i[level]];
         if (k->type == VAL_INT) {
-            bval_t encoded;
-            if (btree_search(&m->tabs[level]->index, k->int_val, &encoded) == 0) {
-                uint8_t recbuf[PAGE_SIZE];
-                uint16_t len2;
-                if (heap_get(&m->tabs[level]->heap, rid_decode(encoded), recbuf, &len2) == 0 &&
-                    rec_visible(m->tabs[level]->owner, recbuf)) {
-                    decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
-                    m->matched[level] = 1;
-                    r = mjoin_descend(m, level + 1);
-                }
+            uint8_t recbuf[PAGE_SIZE];
+            PkVisCtx pv = {m->tabs[level], recbuf, 0};
+            btree_find_all(&m->tabs[level]->index, k->int_val, pk_vis_visit, &pv);
+            if (pv.found) { /* 버전 후보들 중 '보이는' 것을 골랐다 */
+                decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
+                m->matched[level] = 1;
+                r = mjoin_descend(m, level + 1);
             }
         }
     } else if (level >= 1 && m->method[level] == JM_HASH) {
@@ -2155,20 +2226,11 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
                   strcmp(c0->col, t->schema.columns[0].name) == 0 && c0->val.type == VAL_INT;
 
     if (pk_cond && c0->op == CMP_EQ) {
-        /* = -> 점 조회 O(log n) */
+        /* = -> 점 조회 O(log n). 같은 키의 버전 후보들 중 '보이는' 것만. */
         db->used_index = 1;
-        bval_t encoded;
-        if (btree_search(&t->index, c0->val.int_val, &encoded) == 0) {
-            uint8_t recbuf[PAGE_SIZE];
-            uint16_t len;
-            if (heap_get(&t->heap, rid_decode(encoded), recbuf, &len) == 0 &&
-                rec_visible(db, recbuf)) { /* 지워진(xmax)/미커밋 버전은 '없는 행' */
-                Value row[SQL_MAX_COLS];
-                decode_row(&t->schema, recbuf, row);
-                print_row(out, &t->schema, row);
-                count++;
-            }
-        }
+        PointCtx pc = {t, out, 0};
+        btree_find_all(&t->index, c0->val.int_val, point_visit, &pc);
+        count = pc.count;
     } else if (pk_cond && (c0->op == CMP_GT || c0->op == CMP_GE || c0->op == CMP_LT ||
                            c0->op == CMP_LE)) {
         /* <, >, <=, >= -> 인덱스 범위 스캔 (리프 체인) */
@@ -2231,6 +2293,7 @@ static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", d->table);
         return -1;
     }
+    table_begin_write(db, t, db->cur_txn);
     CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &d->where, .db = db};
     heap_scan(&t->heap, collect_visit, &ctx);
     for (int i = 0; i < ctx.count; i++) {
@@ -2267,6 +2330,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         return -1;
     }
 
+    table_begin_write(db, t, db->cur_txn);
     CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &u->where, .db = db};
     heap_scan(&t->heap, collect_visit, &ctx);
 
@@ -2294,10 +2358,11 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         if (heap_insert(&t->heap, newbuf, newlen, &newrid) != 0) {
             continue;
         }
-        /* 새 RID로 인덱스 갱신 — 안 하면 인덱스가 삭제된 옛 위치를 가리켜 행이 사라진다.
-         * RID가 통째로 바뀌므로 바뀐 컬럼과 무관하게 모든 인덱스에 새 RID를 다시 넣는다. */
+        /* 새 버전의 인덱스 항목을 '추가'한다(덮어쓰기 아님) — 옛 버전의 항목은 남아서
+         * 스냅샷 reader가 옛 버전을 인덱스로 찾을 수 있어야 한다(다중 버전 인덱스).
+         * 죽은 버전의 항목은 나중에 VACUUM이 짝(키,RID)으로 지운다. */
         if (t->has_index && row[0].type == VAL_INT) {
-            btree_insert(&t->index, row[0].int_val, rid_encode(newrid));
+            btree_insert_dup(&t->index, row[0].int_val, rid_encode(newrid));
         }
         for (int k = 0; k < t->num_sec; k++) {
             int col = t->sec[k].col;
@@ -2386,6 +2451,7 @@ static int page_is_empty(const void *pg) {
 }
 
 static int vacuum_table(Database *db, Table *t, FILE *out) {
+    table_begin_write(db, t, db->cur_txn); /* 청소도 WAL로 원자 커밋 */
     /* 1) 죽은 버전 수집 */
     VacCtx c = {.db = db, .t = t, .dead = NULL, .n = 0, .cap = 0, .oom = 0};
     heap_scan(&t->heap, vacuum_collect_visit, &c);
@@ -2396,16 +2462,12 @@ static int vacuum_table(Database *db, Table *t, FILE *out) {
     }
 
     /* 2) 죽은 버전을 가리키는 인덱스 항목 제거.
-     * PK는 '인덱스가 지금도 이 죽은 RID를 가리킬 때만' 지운다 — UPDATE/재삽입이면
-     * 같은 키가 살아있는 새 버전을 가리키고 있어서 건드리면 안 된다.
-     * 보조 인덱스는 비유니크라 (키, 죽은 RID) 짝을 정확히 지운다. */
+     * PK도 이제 버전마다 항목이 있으므로(다중 버전 인덱스), (키, 죽은 RID) 짝만
+     * 정확히 지우면 된다 — 살아있는 새 버전의 항목은 자기 짝이 따로 있어 안전하다. */
     for (int i = 0; i < c.n; i++) {
         DeadRef *e = &c.dead[i];
         if (e->has_pk) {
-            bval_t v;
-            if (btree_search(&t->index, e->pk, &v) == 0 && v == rid_encode(e->rid)) {
-                btree_delete_val(&t->index, e->pk, v);
-            }
+            btree_delete_val(&t->index, e->pk, rid_encode(e->rid));
         }
         for (int k = 0; k < t->num_sec; k++) {
             if (e->has_sk[k]) {
@@ -2461,9 +2523,14 @@ static int vacuum_table(Database *db, Table *t, FILE *out) {
 }
 
 static int exec_vacuum(Database *db, const VacuumStmt *v, FILE *out) {
-    if (db->in_txn) { /* PostgreSQL과 동일: VACUUM cannot run inside a transaction block */
-        fprintf(out, "ERROR: VACUUM은 트랜잭션 안에서 실행할 수 없습니다\n");
-        return -1;
+    /* PostgreSQL과 동일: VACUUM cannot run inside a transaction block.
+     * 다중 세션에선 더 강하게 — '어느 세션이든' 트랜잭션이 열려 있으면 거부한다.
+     * (죽은 버전 판정 rec_dead가 "살아있는 스냅샷이 없다"를 전제하기 때문.) */
+    for (int i = 0; i < DB_MAX_SESSIONS; i++) {
+        if (db->sessions[i].in_txn) {
+            fprintf(out, "ERROR: VACUUM은 트랜잭션 안(다른 세션 포함)에서 실행할 수 없습니다\n");
+            return -1;
+        }
     }
     if (v->table[0]) {
         Table *t = find_table(db, v->table);
@@ -2481,14 +2548,18 @@ static int exec_vacuum(Database *db, const VacuumStmt *v, FILE *out) {
     return 0;
 }
 
-/* ------------- 트랜잭션 -------------
- * 데이터(.tbl)는 이제 WAL을 통해 커밋한다(write-ahead): 트랜잭션 중 바뀐 페이지는
- * no-steal로 버퍼 풀에만 두고, COMMIT이면 그 dirty 페이지들을 WAL에 stage한 뒤
- * wal_commit(로그+마커+fsync -> 데이터 적용 -> 로그 비움)으로 원자적으로 확정한다.
- * 크래시가 커밋 도중 나도, 다음 wal_open이 마커 유무로 redo/discard를 결정한다.
- * ROLLBACK은 dirty를 버리고 할당분을 잘라 되돌린다(아무것도 로그에 안 적었다).
- *  데이터(.tbl)와 인덱스(.idx) 둘 다 각자의 WAL로 커밋한다.
- *  DDL인 CREATE는 즉시 반영되며 트랜잭션에 묶이지 않는다.) */
+/* ------------- 트랜잭션 (다중 세션) -------------
+ * 세션마다 트랜잭션 핸들이 하나씩 있고, `SESSION n`으로 갈아타며 여러 트랜잭션을
+ * 인터리브한다. 핵심 규칙:
+ *   - 읽기는 락을 안 잡는다 — reader의 격리는 MVCC 가시성(스냅샷)이 맡는다.
+ *     그래서 reader가 writer를 안 막고, writer도 reader를 안 막는다.
+ *   - 쓰기는 테이블 X락(strict 2PL, 커밋까지 보유) — 같은 테이블의 두 번째 writer는
+ *     즉시 거부된다(first-updater-wins, 테이블 단위).
+ *   - 그 X락이 "테이블당 writer 하나"를 보장하므로, 테이블별 WAL은 여전히 한 번에
+ *     한 트랜잭션만 본다 — 14·15편의 steal/undo/no-force 복구가 무수정으로 성립한다.
+ * 테이블의 WAL 트랜잭션은 BEGIN이 아니라 "그 테이블에 처음 쓸 때" 열린다(lazy).
+ * COMMIT/ROLLBACK은 자기가 쓴(writer_txn==나) 테이블만 확정/되돌린다.
+ * DDL인 CREATE는 즉시 반영되며 트랜잭션에 묶이지 않는다. */
 
 static int wal_stage_sink(page_id_t pid, const void *data, void *ctx) {
     return wal_stage((Wal *)ctx, pid, data);
@@ -2508,49 +2579,44 @@ static int wal_flush_commit(BufferPool *bp, Wal *wal) {
         return -1;
     }
     if (n > 0) {
-        return wal_commit(wal); /* 로그+마커+fsync -> 데이터 적용 -> 로그 비움 */
+        return wal_commit(wal); /* 로그+마커+fsync(no-force) */
     }
     return 0; /* 바뀐 게 없으면 로그 쓸 것도 없다 */
 }
 
-static int exec_begin(Database *db, FILE *out) {
-    if (db->in_txn) {
-        fprintf(out, "ERROR: 이미 트랜잭션 중입니다\n");
-        return -1;
+/* 트랜잭션 txn이 테이블 t에 처음 쓰기 전에 부른다 — 이 테이블의 WAL 트랜잭션을 열고
+ * no-steal(+steal 핸들러)을 켠다. 호출 전에 X락을 이미 쥐고 있어야 한다. */
+static void table_begin_write(Database *db, Table *t, int txn) {
+    (void)db;
+    if (t->writer_txn == txn) {
+        return; /* 이 트랜잭션이 이미 쓰는 중 */
     }
-    db->in_txn = 1;
-    db->cur_txn = db->next_txn++; /* 이 트랜잭션의 락 소유자 id · 행 xmin */
-    txnlog_begin(&db->txnlog, db->cur_txn);
-    for (int i = 0; i < db->num_tables; i++) {
-        Table *t = &db->tables[i];
-        bufpool_set_no_steal(t->bp, 1);
-        bufpool_set_steal_handler(t->bp, wal_steal_cb, &t->wal);
-        wal_begin(&t->wal);
-        t->txn_data_pages = t->wal.data.num_pages;
-        if (t->has_index) {
-            bufpool_set_no_steal(t->index.bp, 1);
-            bufpool_set_steal_handler(t->index.bp, wal_steal_cb, &t->index.wal);
-            wal_begin(&t->index.wal);
-            t->txn_index_pages = t->index.wal.data.num_pages;
-        }
-        for (int k = 0; k < t->num_sec; k++) {
-            bufpool_set_no_steal(t->sec[k].tree.bp, 1);
-            bufpool_set_steal_handler(t->sec[k].tree.bp, wal_steal_cb, &t->sec[k].tree.wal);
-            wal_begin(&t->sec[k].tree.wal);
-            t->sec[k].txn_pages = t->sec[k].tree.wal.data.num_pages;
-        }
+    t->writer_txn = txn;
+    bufpool_set_no_steal(t->bp, 1);
+    bufpool_set_steal_handler(t->bp, wal_steal_cb, &t->wal);
+    wal_begin(&t->wal);
+    t->txn_data_pages = t->wal.data.num_pages;
+    if (t->has_index) {
+        bufpool_set_no_steal(t->index.bp, 1);
+        bufpool_set_steal_handler(t->index.bp, wal_steal_cb, &t->index.wal);
+        wal_begin(&t->index.wal);
+        t->txn_index_pages = t->index.wal.data.num_pages;
     }
-    fprintf(out, "트랜잭션 시작\n");
-    return 0;
+    for (int k = 0; k < t->num_sec; k++) {
+        bufpool_set_no_steal(t->sec[k].tree.bp, 1);
+        bufpool_set_steal_handler(t->sec[k].tree.bp, wal_steal_cb, &t->sec[k].tree.wal);
+        wal_begin(&t->sec[k].tree.wal);
+        t->sec[k].txn_pages = t->sec[k].tree.wal.data.num_pages;
+    }
 }
 
-static int exec_commit(Database *db, FILE *out) {
-    if (!db->in_txn) {
-        fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
-        return -1;
-    }
+/* txn이 쓴 테이블들만 WAL로 커밋하고 쓰기 상태를 정리한다. */
+static void txn_commit_tables(Database *db, int txn) {
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
+        if (t->writer_txn != txn) {
+            continue; /* 남의(또는 아무도 안 쓰는) 테이블은 건드리지 않는다 */
+        }
         wal_flush_commit(t->bp, &t->wal); /* 데이터: WAL로 원자 커밋 */
         bufpool_set_no_steal(t->bp, 0);
         bufpool_set_steal_handler(t->bp, NULL, NULL);
@@ -2564,35 +2630,28 @@ static int exec_commit(Database *db, FILE *out) {
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
             bufpool_set_steal_handler(t->sec[k].tree.bp, NULL, NULL);
         }
+        t->writer_txn = 0;
     }
-    txnlog_commit(&db->txnlog, db->cur_txn); /* MVCC: 이 트랜잭션을 커밋 표시 */
-    lock_release_all(&db->lm, db->cur_txn);  /* 2PL: 끝에서 한꺼번에 푼다 */
-    db->cur_txn = 0;
-    db->in_txn = 0;
-    fprintf(out, "커밋됨\n");
-    return 0;
 }
 
-static int exec_rollback(Database *db, FILE *out) {
-    if (!db->in_txn) {
-        fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
-        return -1;
-    }
+/* txn이 쓴 테이블들만 되돌린다(steal은 before-image로, 나머지는 discard+truncate). */
+static void txn_abort_tables(Database *db, int txn) {
     for (int i = 0; i < db->num_tables; i++) {
         Table *t = &db->tables[i];
+        if (t->writer_txn != txn) {
+            continue;
+        }
         /* steal이 있었으면 로그의 before-image로 디스크를 먼저 원복(+새 페이지 truncate).
          * 그다음 풀 전체를 무효화해 steal로 clean 처리된 미커밋 프레임까지 버린다. */
         wal_undo(&t->wal);
         bufpool_invalidate_all(t->bp);
         pager_truncate(&t->wal.data, t->txn_data_pages); /* non-steal 경로의 새 페이지 제거 */
-        wal_begin(&t->wal);
         bufpool_set_no_steal(t->bp, 0);
         bufpool_set_steal_handler(t->bp, NULL, NULL);
         if (t->has_index) {
             wal_undo(&t->index.wal);
             bufpool_invalidate_all(t->index.bp);
             pager_truncate(&t->index.wal.data, t->txn_index_pages);
-            wal_begin(&t->index.wal);
             btree_reload_root(&t->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
             bufpool_set_no_steal(t->index.bp, 0);
             bufpool_set_steal_handler(t->index.bp, NULL, NULL);
@@ -2601,16 +2660,63 @@ static int exec_rollback(Database *db, FILE *out) {
             wal_undo(&t->sec[k].tree.wal);
             bufpool_invalidate_all(t->sec[k].tree.bp);
             pager_truncate(&t->sec[k].tree.wal.data, t->sec[k].txn_pages);
-            wal_begin(&t->sec[k].tree.wal);
             btree_reload_root(&t->sec[k].tree);
             bufpool_set_no_steal(t->sec[k].tree.bp, 0);
             bufpool_set_steal_handler(t->sec[k].tree.bp, NULL, NULL);
         }
+        t->writer_txn = 0;
     }
-    txnlog_abort(&db->txnlog, db->cur_txn); /* MVCC: 이 트랜잭션을 아보트 표시 */
-    lock_release_all(&db->lm, db->cur_txn); /* 2PL: 끝에서 한꺼번에 푼다 */
+}
+
+static int exec_begin(Database *db, FILE *out) {
+    DbSession *s = &db->sessions[db->cur_session];
+    if (s->in_txn) {
+        fprintf(out, "ERROR: 이미 트랜잭션 중입니다\n");
+        return -1;
+    }
+    s->in_txn = 1;
+    s->txn = db->next_txn++; /* 이 트랜잭션의 락 소유자 id · 행 xmin */
+    txnlog_begin(&db->txnlog, s->txn);
+    db->cur_txn = s->txn;
+    /* 트랜잭션 시작 스냅샷: 이후에 발급될 id(>= snap_next)와, 지금 진행 중인 남의
+     * 트랜잭션은 — 나중에 커밋해도 — 이 트랜잭션에겐 안 보인다(스냅샷 격리). */
+    s->snap_next = db->next_txn;
+    s->n_snap_inprog = 0;
+    for (int i = 0; i < DB_MAX_SESSIONS; i++) {
+        if (i != db->cur_session && db->sessions[i].in_txn) {
+            s->snap_inprog[s->n_snap_inprog++] = db->sessions[i].txn;
+        }
+    }
+    fprintf(out, "트랜잭션 시작\n");
+    return 0;
+}
+
+static int exec_commit(Database *db, FILE *out) {
+    DbSession *s = &db->sessions[db->cur_session];
+    if (!s->in_txn) {
+        fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
+        return -1;
+    }
+    txn_commit_tables(db, s->txn);           /* 내가 쓴 테이블만 확정 */
+    txnlog_commit(&db->txnlog, s->txn);      /* MVCC: 이 트랜잭션을 커밋 표시 */
+    lock_release_all(&db->lm, s->txn);       /* 2PL: 끝에서 한꺼번에 푼다 */
+    s->in_txn = 0;
     db->cur_txn = 0;
-    db->in_txn = 0;
+    fprintf(out, "커밋됨\n");
+    return 0;
+}
+
+static int exec_rollback(Database *db, FILE *out) {
+    DbSession *s = &db->sessions[db->cur_session];
+    if (!s->in_txn) {
+        fprintf(out, "ERROR: 트랜잭션이 없습니다\n");
+        return -1;
+    }
+    txn_abort_tables(db, s->txn);           /* 내가 쓴 테이블만 되돌림 */
+    txnlog_abort(&db->txnlog, s->txn);      /* MVCC: 이 트랜잭션을 아보트 표시 */
+    lock_release_all(&db->lm, s->txn);      /* 2PL: 끝에서 한꺼번에 푼다 */
+    s->in_txn = 0;
+    db->cur_txn = 0;
     fprintf(out, "롤백됨\n");
     return 0;
 }
@@ -2621,7 +2727,8 @@ int db_open(Database *db, const char *path) {
     snprintf(db->path, sizeof(db->path), "%s", path);
     db->num_tables = 0;
     db->used_index = 0;
-    db->in_txn = 0;
+    memset(db->sessions, 0, sizeof(db->sessions));
+    db->cur_session = 0;
     lock_init(&db->lm);
     txnlog_init(&db->txnlog);
     db->cur_txn = 0;
@@ -2660,6 +2767,7 @@ int db_open(Database *db, const char *path) {
                     }
                 }
                 t->owner = db; /* 읽기 경로의 가시성 판정용 역참조 */
+                t->writer_txn = 0;
                 if (table_open_files(t, db->path) == 0) {
                     db->num_tables++;
                 }
@@ -2671,7 +2779,18 @@ int db_open(Database *db, const char *path) {
 }
 
 void db_close(Database *db) {
-    catalog_write(db); /* MVCC: 이번 세션의 최종 next_txn을 영속화(재오픈 시 옛 행 가시성) */
+    /* 열린 트랜잭션은 롤백하고 닫는다 — 커넥션이 끊기면 abort하는 진짜 DB와 같다.
+     * (안 그러면 닫힘 flush가 미커밋 dirty 페이지를 디스크에 쓰고, next_txn 영속화가
+     * 그 트랜잭션을 재오픈 시 '커밋'으로 승격시켜 미커밋이 유출된다.) */
+    for (int i = 0; i < DB_MAX_SESSIONS; i++) {
+        if (db->sessions[i].in_txn) {
+            txn_abort_tables(db, db->sessions[i].txn);
+            txnlog_abort(&db->txnlog, db->sessions[i].txn);
+            lock_release_all(&db->lm, db->sessions[i].txn);
+            db->sessions[i].in_txn = 0;
+        }
+    }
+    catalog_write(db); /* MVCC: 이번 실행의 최종 next_txn을 영속화(재오픈 시 옛 행 가시성) */
     for (int i = 0; i < db->num_tables; i++) {
         table_close_files(&db->tables[i]);
     }
@@ -2688,7 +2807,9 @@ static int lock_one(Database *db, const char *table, LockMode mode, int txn, FIL
     return 0;
 }
 
-/* 문장이 건드리는 테이블에 락(쓰기 X / 읽기 S). 충돌이면 -1. CREATE/INDEX/트랜잭션 제어는 안 검. */
+/* 쓰기 문장이 건드리는 테이블에 X락. 충돌이면 -1 = first-updater-wins(테이블 단위).
+ * SELECT는 락을 안 잡는다 — 11편의 S락은 MVCC 가시성(스냅샷)으로 대체됐다:
+ * reader는 writer의 미커밋 버전을 '가시성으로' 못 볼 뿐, 막히지 않는다. */
 static int acquire_stmt_locks(Database *db, const Statement *st, int txn, FILE *out) {
     switch (st->type) {
         case STMT_INSERT:
@@ -2697,19 +2818,6 @@ static int acquire_stmt_locks(Database *db, const Statement *st, int txn, FILE *
             return lock_one(db, st->del.table, LOCK_X, txn, out);
         case STMT_UPDATE:
             return lock_one(db, st->upd.table, LOCK_X, txn, out);
-        case STMT_SELECT:
-            if (st->select.explain) {
-                return 0; /* EXPLAIN은 실행을 안 하니 락 불필요 */
-            }
-            if (lock_one(db, st->select.table, LOCK_S, txn, out) != 0) {
-                return -1;
-            }
-            for (int k = 0; k < st->select.num_joins; k++) {
-                if (lock_one(db, st->select.joins[k].table, LOCK_S, txn, out) != 0) {
-                    return -1;
-                }
-            }
-            return 0;
         default:
             return 0;
     }
@@ -2733,49 +2841,37 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         statement_free(&st);
         return -1;
     }
-    /* 격리(2PL): 이 문장이 건드리는 테이블에 락을 건다. 명시적 트랜잭션이면 그 txn id로
-     * 잡아 COMMIT/ROLLBACK까지 쥐고, autocommit이면 임시 id로 잡았다가 문장 끝에 푼다.
-     * 다른 트랜잭션이 이미 충돌 락을 쥐고 있으면(단일 스레드라 "블록" 대신) 문장을 거부한다. */
-    int lock_txn = 0, lock_autorelease = 0;
-    if (st.type == STMT_INSERT || st.type == STMT_DELETE || st.type == STMT_UPDATE ||
-        (st.type == STMT_SELECT && !st.select.explain)) {
-        lock_txn = db->in_txn ? db->cur_txn : db->next_txn++;
-        lock_autorelease = !db->in_txn;
-        if (lock_autorelease) {
-            db->cur_txn = lock_txn; /* autocommit: 이 문장이 곧 한 트랜잭션 (행 xmin에 쓰임) */
-            txnlog_begin(&db->txnlog, lock_txn);
+    /* 쓰기 문장만 락을 건다(테이블 X, strict 2PL — 커밋까지 보유). 읽기는 락이 없다:
+     * reader의 격리는 MVCC 가시성(스냅샷)이 맡는다. 충돌이면(같은 테이블의 두 번째
+     * writer) 단일 스레드라 "블록" 대신 문장을 즉시 거부한다 = first-updater-wins.
+     * DDL인 CREATE는 트랜잭션에 묶이지 않고 항상 즉시(autocommit으로) 반영한다. */
+    DbSession *sess = &db->sessions[db->cur_session];
+    int is_write = (st.type == STMT_INSERT || st.type == STMT_DELETE ||
+                    st.type == STMT_UPDATE || st.type == STMT_VACUUM ||
+                    st.type == STMT_CREATE);
+    int autocommit = 0;
+    int stmt_txn = 0;
+    if (is_write) {
+        autocommit = !sess->in_txn || st.type == STMT_CREATE;
+        if (autocommit) {
+            stmt_txn = db->next_txn++; /* 이 문장이 곧 한 트랜잭션 (행 xmin에 쓰임) */
+            txnlog_begin(&db->txnlog, stmt_txn);
+        } else {
+            stmt_txn = sess->txn;
         }
-        if (acquire_stmt_locks(db, &st, lock_txn, out) != 0) {
-            if (lock_autorelease) {
-                lock_release_all(&db->lm, lock_txn);
+        db->cur_txn = stmt_txn;
+        if (acquire_stmt_locks(db, &st, stmt_txn, out) != 0) {
+            if (autocommit) {
+                txnlog_abort(&db->txnlog, stmt_txn);
+                lock_release_all(&db->lm, stmt_txn);
             }
+            db->cur_txn = sess->in_txn ? sess->txn : 0;
             statement_free(&st);
             return -1;
         }
-    }
-    /* autocommit: 트랜잭션 밖 DML은 이 문장 하나가 곧 한 트랜잭션이다. WAL로 커밋될
-     * 때까지 dirty 페이지(데이터·인덱스 둘 다)가 디스크로 새지 않게 no-steal을 켠다. */
-    int autocommit = !db->in_txn &&
-                     (st.type == STMT_CREATE || st.type == STMT_INSERT ||
-                      st.type == STMT_DELETE || st.type == STMT_UPDATE ||
-                      st.type == STMT_VACUUM); /* VACUUM의 힙·인덱스 청소도 WAL로 원자 커밋 */
-    if (autocommit) {
-        for (int i = 0; i < db->num_tables; i++) {
-            Table *t = &db->tables[i];
-            bufpool_set_no_steal(t->bp, 1);
-            bufpool_set_steal_handler(t->bp, wal_steal_cb, &t->wal);
-            wal_begin(&t->wal); /* base_pages 포착 — steal 시 undo truncate 기준 */
-            if (t->has_index) {
-                bufpool_set_no_steal(t->index.bp, 1);
-                bufpool_set_steal_handler(t->index.bp, wal_steal_cb, &t->index.wal);
-                wal_begin(&t->index.wal);
-            }
-            for (int k = 0; k < t->num_sec; k++) {
-                bufpool_set_no_steal(t->sec[k].tree.bp, 1);
-                bufpool_set_steal_handler(t->sec[k].tree.bp, wal_steal_cb, &t->sec[k].tree.wal);
-                wal_begin(&t->sec[k].tree.wal);
-            }
-        }
+    } else {
+        /* 읽기(SELECT)·트랜잭션 제어: 락도, 새 txn id도 없다. 가시성 기준만 세운다. */
+        db->cur_txn = sess->in_txn ? sess->txn : 0;
     }
     int rc;
     switch (st.type) {
@@ -2789,63 +2885,29 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         case STMT_COMMIT: rc = exec_commit(db, out); break;
         case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
         case STMT_VACUUM: rc = exec_vacuum(db, &st.vac, out); break;
+        case STMT_SESSION: /* 세션 전환 — 다중 트랜잭션 인터리브의 스위치 */
+            if (st.sess.n < 0 || st.sess.n >= DB_MAX_SESSIONS) {
+                fprintf(out, "ERROR: 세션 번호는 0..%d 입니다\n", DB_MAX_SESSIONS - 1);
+                rc = -1;
+            } else {
+                db->cur_session = st.sess.n;
+                fprintf(out, "세션 %d\n", st.sess.n);
+                rc = 0;
+            }
+            break;
         default: rc = -1;
     }
     if (autocommit) {
-        for (int i = 0; i < db->num_tables; i++) {
-            Table *t = &db->tables[i];
-            if (rc == 0) {
-                wal_flush_commit(t->bp, &t->wal); /* 데이터: WAL로 원자 커밋 */
-                if (t->has_index) {
-                    wal_flush_commit(t->index.bp, &t->index.wal); /* 인덱스: 인덱스 WAL로 */
-                }
-                for (int k = 0; k < t->num_sec; k++) {
-                    wal_flush_commit(t->sec[k].tree.bp, &t->sec[k].tree.wal);
-                }
-            } else {
-                /* 실패한 문장의 변경은 버린다. steal이 있었으면 before-image로 원복하고
-                 * 새로 할당한 페이지를 잘라낸다. */
-                uint64_t base = t->wal.base_pages;
-                wal_undo(&t->wal);
-                bufpool_invalidate_all(t->bp);
-                pager_truncate(&t->wal.data, base);
-                wal_begin(&t->wal);
-                if (t->has_index) {
-                    uint64_t ibase = t->index.wal.base_pages;
-                    wal_undo(&t->index.wal);
-                    bufpool_invalidate_all(t->index.bp);
-                    pager_truncate(&t->index.wal.data, ibase);
-                    wal_begin(&t->index.wal);
-                    btree_reload_root(&t->index);
-                }
-                for (int k = 0; k < t->num_sec; k++) {
-                    uint64_t sbase = t->sec[k].tree.wal.base_pages;
-                    wal_undo(&t->sec[k].tree.wal);
-                    bufpool_invalidate_all(t->sec[k].tree.bp);
-                    pager_truncate(&t->sec[k].tree.wal.data, sbase);
-                    wal_begin(&t->sec[k].tree.wal);
-                    btree_reload_root(&t->sec[k].tree);
-                }
-            }
-            bufpool_set_no_steal(t->bp, 0);
-            bufpool_set_steal_handler(t->bp, NULL, NULL);
-            if (t->has_index) {
-                bufpool_set_no_steal(t->index.bp, 0);
-                bufpool_set_steal_handler(t->index.bp, NULL, NULL);
-            }
-            for (int k = 0; k < t->num_sec; k++) {
-                bufpool_set_no_steal(t->sec[k].tree.bp, 0);
-                bufpool_set_steal_handler(t->sec[k].tree.bp, NULL, NULL);
-            }
-        }
-    }
-    if (lock_autorelease) {
+        /* 이 문장 하나가 곧 한 트랜잭션 — 자기가 쓴 테이블만 커밋/롤백한다. */
         if (rc == 0) {
-            txnlog_commit(&db->txnlog, lock_txn); /* 문장 성공 -> 이 트랜잭션 커밋 */
+            txn_commit_tables(db, stmt_txn);
+            txnlog_commit(&db->txnlog, stmt_txn);
         } else {
-            txnlog_abort(&db->txnlog, lock_txn);
+            txn_abort_tables(db, stmt_txn);
+            txnlog_abort(&db->txnlog, stmt_txn);
         }
-        lock_release_all(&db->lm, lock_txn); /* autocommit 문장: 잡았던 락을 푼다 */
+        lock_release_all(&db->lm, stmt_txn);
+        db->cur_txn = sess->in_txn ? sess->txn : 0;
     }
     statement_free(&st); /* 서브쿼리·IN 집합 해제 */
     return rc;

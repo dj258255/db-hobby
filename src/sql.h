@@ -101,6 +101,7 @@ typedef enum {
     STMT_ROLLBACK, /* ROLLBACK — 되돌리기 */
     STMT_CREATE_INDEX, /* CREATE INDEX <name> ON <table>(<col>) */
     STMT_VACUUM,       /* VACUUM [<table>] — 죽은 버전(안 보이는 옛 버전) 공간 회수 */
+    STMT_SESSION,      /* SESSION <n> — 현재 세션 전환(다중 트랜잭션 인터리브용) */
 } StmtType;
 
 typedef struct {
@@ -195,6 +196,10 @@ typedef struct {
 } VacuumStmt;
 
 typedef struct {
+    int n; /* 전환할 세션 번호 */
+} SessionStmt;
+
+typedef struct {
     StmtType type;
     union {
         CreateStmt create;
@@ -204,6 +209,7 @@ typedef struct {
         UpdateStmt upd;
         CreateIndexStmt cidx;
         VacuumStmt vac;
+        SessionStmt sess;
     };
 } Statement;
 

@@ -33,8 +33,22 @@
 
 #define DB_MAX_TABLES 16
 #define DB_MAX_SEC_IDX 4 /* 테이블당 보조 인덱스 최대 개수 */
+#define DB_MAX_SESSIONS 8 /* 동시에 열 수 있는 트랜잭션 핸들(세션) 수 */
 
 typedef struct Database Database; /* Table이 소유 DB를 역참조(가시성 판정용) */
+
+/* 한 세션 = 하나의 (열려 있을 수 있는) 트랜잭션 핸들. 단일 스레드지만 `SESSION n`으로
+ * 세션을 갈아타며 여러 트랜잭션을 인터리브한다 — reader가 writer를 안 막는 걸
+ * 진짜 두 트랜잭션으로 시연하기 위한 장치. */
+typedef struct {
+    int in_txn; /* BEGIN 중인가 */
+    int txn;    /* 이 세션의 트랜잭션 id (in_txn일 때) */
+    /* 트랜잭션 시작 스냅샷(스냅샷 격리): snap_next 이후에 발급됐거나 시작 시점에
+     * 진행 중이던 트랜잭션은, 나중에 커밋해도 이 트랜잭션에겐 안 보인다. */
+    int snap_next;
+    int snap_inprog[DB_MAX_SESSIONS];
+    int n_snap_inprog;
+} DbSession;
 
 /* 보조 인덱스(CREATE INDEX) — PK가 아닌 INT 컬럼에 거는 비유니크 B+Tree.
  * 자기 파일 <db>.<tbl>.<name>.idx(+.wal)를 쓰고, 키=컬럼값, 값=RID. */
@@ -56,8 +70,12 @@ typedef struct {
     SecIndex sec[DB_MAX_SEC_IDX]; /* 보조 인덱스들 */
     int num_sec;
 
-    uint64_t txn_data_pages;  /* BEGIN 시점 데이터 파일 페이지 수(롤백 복원용) */
-    uint64_t txn_index_pages; /* BEGIN 시점 인덱스 파일 페이지 수 */
+    uint64_t txn_data_pages;  /* 쓰기 시작 시점 데이터 파일 페이지 수(롤백 복원용) */
+    uint64_t txn_index_pages; /* 쓰기 시작 시점 인덱스 파일 페이지 수 */
+
+    int writer_txn; /* 이 테이블에 미커밋 변경을 가진 트랜잭션(0=없음). 테이블 X락이
+                     * "테이블당 writer 하나"를 보장 — 그래서 테이블별 WAL은 여전히
+                     * 단일 트랜잭션만 보고, 14·15편의 복구가 무수정으로 성립한다. */
 
     Database *owner; /* 이 테이블이 속한 DB — 읽기 경로의 MVCC 가시성 판정용 */
 } Table;
@@ -68,10 +86,13 @@ struct Database {
     int num_tables;
 
     int used_index; /* 직전 SELECT가 인덱스를 썼나 (시연·테스트용) */
-    int in_txn;     /* 명시적 트랜잭션(BEGIN) 중인가 */
 
-    LockManager lm; /* 2PL 테이블 락 — 인터리브된 트랜잭션 충돌 탐지(격리) */
-    int cur_txn;    /* 현재 트랜잭션 id (락 소유자·행 xmin). 0이면 없음 */
+    DbSession sessions[DB_MAX_SESSIONS]; /* 다중 트랜잭션 핸들 */
+    int cur_session;                     /* 현재 문장이 속한 세션 (SESSION n으로 전환) */
+
+    LockManager lm; /* 쓰기 전용 2PL 테이블 X락 — write-write 충돌(first-updater-wins).
+                     * 읽기는 락을 안 잡는다: reader의 격리는 MVCC 가시성이 맡는다. */
+    int cur_txn;    /* 현재 문장의 트랜잭션 id (락 소유자·행 xmin·가시성 기준). 0이면 없음 */
     int next_txn;   /* 다음 트랜잭션 id 발급기 */
     int committed_below; /* 이 세션 시작 시점의 txn 번호 — 그 미만 id는 전부 커밋된 것으로 본다
                           * (no-steal+WAL이라 디스크엔 커밋분만 있음). 재오픈 시 옛 행 가시성. */

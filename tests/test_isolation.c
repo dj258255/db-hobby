@@ -26,8 +26,10 @@ static char *run(Database *db, const char *sql) {
     return buf;
 }
 
-/* 단일 스레드에서, 다른 트랜잭션(T99)의 락을 직접 주입해 격리(2PL 충돌)를 시연한다.
- * 충돌은 "블록" 대신 문장 거부(ERROR)로 나타난다. */
+/* 격리 시연 — 16·18편 이후의 의미론:
+ *   쓰기 vs 쓰기 = 테이블 X락으로 즉시 거부(first-updater-wins).
+ *   읽기 = 락 없음. reader는 writer에게 절대 안 막힌다(MVCC 가시성이 격리를 맡는다).
+ * 다른 트랜잭션(T99)의 락을 직접 주입해 충돌을 시연한다. */
 int main(void) {
     const char *path = "build/test_isolation.db";
     unlink(path);
@@ -44,30 +46,27 @@ int main(void) {
     lock_acquire(&db.lm, 99, "t", 0, LOCK_X);
 
     o = run(&db, "SELECT * FROM t WHERE id = 1");
-    CHECK(strstr(o, "ERROR") && strstr(o, "잠겨"),
-          "X로 잠긴 t를 SELECT -> 거부 (dirty read 방지)");
+    CHECK(!strstr(o, "ERROR") && strstr(o, "(1행"),
+          "X로 잠긴 t를 SELECT -> 정상 (reader는 writer에게 안 막힌다 — MVCC)");
     free(o);
     o = run(&db, "INSERT INTO t VALUES (3, 30)");
     CHECK(strstr(o, "ERROR") && strstr(o, "잠겨"),
-          "X로 잠긴 t에 INSERT -> 거부 (lost update 방지)");
+          "X로 잠긴 t에 INSERT -> 거부 (write-write = first-updater-wins)");
     free(o);
 
     lock_release_all(&db.lm, 99);
 
-    o = run(&db, "SELECT * FROM t WHERE id = 1");
-    CHECK(!strstr(o, "ERROR") && strstr(o, "(1행"), "T99 해제 후 SELECT 정상");
-    free(o);
     o = run(&db, "SELECT * FROM t");
     CHECK(strstr(o, "(2행"), "거부된 INSERT는 반영 안 됨(여전히 2행)");
     free(o);
 
-    /* --- S-S는 호환: T99가 S로 잠가도 다른 reader는 읽을 수 있다 --- */
+    /* --- S락(레거시 호환 행렬)은 락 매니저 차원에서 여전히 X와 충돌한다 --- */
     lock_acquire(&db.lm, 99, "t", 0, LOCK_S);
     o = run(&db, "SELECT * FROM t WHERE id = 1");
-    CHECK(!strstr(o, "ERROR"), "S로 잠긴 t를 SELECT(S) -> 호환, 정상 (reader는 reader를 안 막음)");
+    CHECK(!strstr(o, "ERROR"), "S로 잠긴 t를 SELECT -> 정상 (읽기는 락을 안 잡는다)");
     free(o);
     o = run(&db, "INSERT INTO t VALUES (3, 30)");
-    CHECK(strstr(o, "ERROR"), "S로 잠긴 t에 INSERT(X) -> 충돌");
+    CHECK(strstr(o, "ERROR"), "S로 잠긴 t에 INSERT(X) -> 충돌 (호환 행렬)");
     free(o);
     lock_release_all(&db.lm, 99);
 

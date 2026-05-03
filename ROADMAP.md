@@ -3,7 +3,7 @@
 진행 상황 한눈에. 블로그 시리즈(1~12편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope", 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 380개 / 23스위트 통과.**
+현재: **테스트 396개 / 24스위트 통과.**
 
 > 저장 철학에 따라 갈리는 일을 나눈다 — **A: PostgreSQL식**(현재 정체성), **B: MySQL/InnoDB 대조**,
 > 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
@@ -35,16 +35,15 @@ db-hobby는 이미 PG식이다 — 힙 + 별도 인덱스(RID), relfilenode, dea
 MVCC 토대(13편)·DELETE=xmax(16편)·**VACUUM(17편)까지 완성** — 단일 트랜잭션 기준 "미니 PostgreSQL"의
 저장·복구·격리 축이 다 섰다. 남은 프론티어는 **진짜 다중 트랜잭션**(A1-3·4). (2PL vs MVCC 대조는 12편.)
 
-### A1. MVCC (스냅샷 격리) — 2c 도달(16편). 남은 프론티어 = 3·4(다중 트랜잭션)
-> 1~2b(13편)에 이어, 트랙 E가 steal+undo(14편)·no-force(15편)로 전제를 깔아 준 덕에
-> 2c(DELETE->xmax + 게이트 통일)를 16편에서 심었다. 이제 남은 건 진짜 다중 트랜잭션(3)과
-> 쓰기충돌(4) — 단일 트랜잭션 실행기를 다중 핸들로 여는 마지막 재작성.
+### A1. MVCC (스냅샷 격리) — **완성(18편).** 13편이 남긴 프론티어를 전부 통과
+> 1~2b(13편) -> 트랙 E(14·15편)가 전제(steal·abort롤백·로그 복구)를 깔고 -> 2c(16편) ->
+> 3·4(18편). "reader가 writer를 안 막는다"가 시연이 아니라 **실행**이 됐다.
 - [x] **1. 트랜잭션 상태 로그 + 가시성 규칙** (mvcc.c, standalone) — "xmin 커밋 AND xmax 미커밋이면 보임". abort된 INSERT/DELETE/UPDATE가 상태만으로 롤백되는 것까지 test_mvcc로 검증
 - [x] **2a. 행 codec에 xmin/xmax 헤더 + INSERT/UPDATE가 xmin 기록 + TxnLog를 트랜잭션 생명주기(BEGIN/COMMIT/ROLLBACK·autocommit)에 연결.** 실제 힙 행 가시성을 test_mvcc_store로 증명(txn 아보트하면 그 행이 안 보임). 헤더는 SELECT 출력에 투명(무회귀)
 - [x] **2b. MVCC 가시성 게이트를 SELECT* 읽기 경로에 + next_txn 영속화(committed_below)** — select_visit이 row_visible(xmin/xmax, my_txn)로 거른다. db_close가 next_txn 저장 -> 재오픈 시 그 미만 txn=커밋으로 봐 옛 행이 보임(no-steal라 디스크엔 커밋분만). 닫고 다시 열어 SELECT가 옛 행을 보이는 것 test로 증명. 경합 없으면 무회귀
 - [x] **2c(대부분). DELETE를 tombstone -> xmax로 + 읽기 경로 게이트 통일 (16편)** — DELETE/UPDATE 옛 버전이 xmax를 받고(heap_overwrite 제자리 헤더 갱신), 힙을 읽는 모든 경로(풀스캔·PK 점/범위·보조 인덱스·조인 3방식·집계·정렬·서브쿼리·DML 수집·인덱스 빌드)가 rec_visible 게이트를 지난다. DELETE ROLLBACK -> 행이 되살아남(test_mvcc_dml). 죽은 버전 누적 = VACUUM(A2)의 동기. ※ '트랜잭션 시작 스냅샷'은 남음 — 동시성(3) 없인 관찰 불가라 그때 함께
-- [ ] 3. 다중 트랜잭션 핸들 + 인터리브 데모 (reader가 writer를 안 막는 걸 진짜로 시연) + 시작 스냅샷
-- [ ] 4. 쓰기-쓰기 충돌(first-updater-wins)
+- [x] **3. 다중 트랜잭션 핸들 + 인터리브 + 시작 스냅샷 (18편)** — 세션(`SESSION n`, 최대 8)마다 트랜잭션 핸들. **읽기는 락을 안 잡는다**(11편 S락 제거) — reader는 writer의 미커밋을 '가시성으로' 못 볼 뿐 막히지 않는다. BEGIN 시점 스냅샷(snap_next + 진행 중 목록)으로 REPEATABLE READ; 트랜잭션 밖은 read committed. PK 인덱스를 다중 버전화(버전마다 항목, 조회가 보이는 버전 선택). 테이블별 WAL은 X락 덕에 여전히 단일 writer — 14·15편 복구 무수정 성립. db_close는 열린 트랜잭션을 롤백(진짜 DB의 커넥션 끊김과 동일)
+- [x] **4. 쓰기-쓰기 충돌 = first-updater-wins (18편)** — 테이블 X락(strict 2PL)이라 같은 테이블의 두 번째 writer는 즉시 거부. ※ PG는 행 단위지만 원리는 동일(테이블 granularity로 정직하게 명시)
 
 ### A2. VACUUM (죽은 공간 회수) — 도달(17편)
 16편(DELETE=xmax)이 쌓은 죽은 버전을 치운다. SQL `VACUUM [<table>]`, 트랜잭션 안에서는 거부(PG 동일).

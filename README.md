@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (380 checks across 23 suites).
+covered by tests (396 checks across 24 suites).
 
 ![db-hobby REPL demo](docs/demo.svg)
 
@@ -154,12 +154,18 @@ to 4 tables (`INNER` and `LEFT`, aliases supported, so self-joins work);
 projection, aggregation, `GROUP BY`, and `HAVING` work over a single table or a
 join result; `NULL` can be stored (nullable columns) or arise from `LEFT JOIN`, except the PK column; subqueries are
 uncorrelated and single-table/single-column; execution is single-threaded, but
-interleaved transactions are isolated by 2PL **table-level** locks (writes take an
-`X` lock, reads an `S` lock, held until commit/rollback), and a conflict is
-rejected rather than blocked on since there are no threads to wait. This is
-lock-based (2PL), **not** MVCC/snapshot isolation, and the executor keeps one
-transaction open at a time (a conflict is demonstrated by injecting a competing
-lock). The WAL
+**multiple transactions interleave** through sessions (`SESSION n` switches the
+current one, up to 8): **readers take no locks** -- a reader is never blocked by
+a writer, it simply sees the old version through MVCC visibility, and an open
+transaction reads from its **begin-time snapshot** (repeatable-read-style; plain
+statements outside a transaction are read-committed). Writers take table-level
+`X` locks (strict 2PL, held to commit), so a second writer on the same table is
+rejected immediately -- **first-updater-wins at table granularity**. That same
+X lock guarantees one writer per table, which is exactly why the per-table WAL
+recovery (steal/undo/no-force) still holds unchanged. The PK index is
+**multi-version** (one entry per row version, like PostgreSQL); lookups pick the
+visible version. Closing the database rolls back any open transactions, like a
+real server dropping connections. The WAL
 protects both the data (`.tbl`) and index
 (`.idx`) files; a transaction larger than the buffer pool is handled by stealing
 dirty pages to disk with undo (before-image) logging, and commit is **no-force**
