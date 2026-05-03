@@ -36,8 +36,14 @@ int heap_insert(Heap *h, const void *rec, uint16_t len, RID *rid_out);
 /* RID의 행을 buf로 복사한다. 0 성공, -1 없는/삭제된 행. */
 int heap_get(Heap *h, RID rid, void *buf, uint16_t *len_out);
 
-/* RID의 행을 삭제(tombstone)한다. 0 성공, -1 실패. */
+/* RID의 행을 삭제(tombstone)한다. 0 성공, -1 실패.
+ * ※ db 실행기의 DELETE는 이제 이걸 안 쓴다 — MVCC답게 xmax를 새긴다(heap_overwrite).
+ *   물리 슬롯 회수는 VACUUM(예정)의 일. */
 int heap_delete(Heap *h, RID rid);
+
+/* RID의 행을 '같은 길이'의 새 내용으로 제자리 덮어쓴다(MVCC 헤더 xmax 갱신용).
+ * 길이가 다르거나 삭제된 슬롯이면 -1. 0 성공. */
+int heap_overwrite(Heap *h, RID rid, const void *rec, uint16_t len);
 
 /* 풀 스캔: 모든 살아있는 행을 차례로 visit에 넘긴다. visit가 0이 아닌 값을 반환하면
  * 스캔을 멈추고 그 값을 돌려준다(early stop). rec 포인터는 콜백 동안만 유효. */

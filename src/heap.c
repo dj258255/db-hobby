@@ -75,6 +75,16 @@ int heap_delete(Heap *h, RID rid) {
     return rc;
 }
 
+int heap_overwrite(Heap *h, RID rid, const void *rec, uint16_t len) {
+    void *page = bufpool_fetch(h->bp, rid.page_id);
+    if (!page) {
+        return -1;
+    }
+    int rc = slotpage_overwrite(page, rid.slot, rec, len);
+    bufpool_unpin(h->bp, rid.page_id, rc == 0 ? 1 : 0);
+    return rc;
+}
+
 int heap_scan(Heap *h, heap_visit_fn visit, void *ctx) {
     uint64_t np = h->pager->num_pages;
     for (page_id_t pid = h->first_page; pid < np; pid++) {

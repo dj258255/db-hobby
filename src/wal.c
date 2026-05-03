@@ -7,6 +7,7 @@
 
 int wal_test_crash_after_log = 0;
 int wal_test_crash_before_commit = 0;
+int wal_test_crash_in_undo = 0;
 
 typedef struct {
     page_id_t page_id;
@@ -189,6 +190,13 @@ static int wal_recover(Wal *w) {
                 }
                 if (pager_write(&w->data, pid, before) != 0) {
                     rc = -1;
+                }
+                if (wal_test_crash_in_undo) {
+                    /* 크래시 주입: undo를 하나만 적용하고 죽는다(로그도 안 자름).
+                     * before-image 재적용은 idempotent라 다음 복구가 처음부터
+                     * 다시 돌려도 정확히 수렴한다 — CLR이 필요 없는 이유의 증명. */
+                    free(redo);
+                    return rc;
                 }
             } else if (type == REC_PAGE) {
                 /* loser의 after-image는 디스크에 적용된 적 없다(적용은 마커 뒤) -> 무시. */

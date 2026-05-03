@@ -34,6 +34,8 @@
 #define DB_MAX_TABLES 16
 #define DB_MAX_SEC_IDX 4 /* 테이블당 보조 인덱스 최대 개수 */
 
+typedef struct Database Database; /* Table이 소유 DB를 역참조(가시성 판정용) */
+
 /* 보조 인덱스(CREATE INDEX) — PK가 아닌 INT 컬럼에 거는 비유니크 B+Tree.
  * 자기 파일 <db>.<tbl>.<name>.idx(+.wal)를 쓰고, 키=컬럼값, 값=RID. */
 typedef struct {
@@ -56,9 +58,11 @@ typedef struct {
 
     uint64_t txn_data_pages;  /* BEGIN 시점 데이터 파일 페이지 수(롤백 복원용) */
     uint64_t txn_index_pages; /* BEGIN 시점 인덱스 파일 페이지 수 */
+
+    Database *owner; /* 이 테이블이 속한 DB — 읽기 경로의 MVCC 가시성 판정용 */
 } Table;
 
-typedef struct {
+struct Database {
     char path[512]; /* 카탈로그 파일 경로 (테이블 파일 경로 유도용) */
     Table tables[DB_MAX_TABLES];
     int num_tables;
@@ -72,7 +76,7 @@ typedef struct {
     int committed_below; /* 이 세션 시작 시점의 txn 번호 — 그 미만 id는 전부 커밋된 것으로 본다
                           * (no-steal+WAL이라 디스크엔 커밋분만 있음). 재오픈 시 옛 행 가시성. */
     TxnLog txnlog;  /* MVCC: 트랜잭션 상태(진행/커밋/아보트) — 행 가시성 판정용 */
-} Database;
+};
 
 /* 파일을 열어 DB를 준비한다. 0 성공, -1 실패. */
 int db_open(Database *db, const char *path);

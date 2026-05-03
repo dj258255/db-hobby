@@ -31,6 +31,10 @@ int slotpage_get(const void *page, uint16_t slot, const void **rec_out, uint16_t
 /* 슬롯을 삭제(빈 칸으로 표시)한다. 0 성공, -1 잘못된 슬롯. */
 int slotpage_delete(void *page, uint16_t slot);
 
+/* 슬롯의 레코드를 '같은 길이'의 새 내용으로 제자리 덮어쓴다(헤더 필드 갱신용).
+ * 길이가 다르거나 삭제된 슬롯이면 -1 — 이웃 레코드를 침범하지 않기 위한 안전장치. */
+int slotpage_overwrite(void *page, uint16_t slot, const void *rec, uint16_t len);
+
 /* 현재 슬롯 개수(삭제된 것 포함). */
 uint16_t slotpage_num_slots(const void *page);
 

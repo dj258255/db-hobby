@@ -101,6 +101,43 @@ int main(void) {
     wal_read(&w, 1, buf);
     CHECK(buf[0] == 0xE5, "롤백 후 재오픈 -> 마지막 커밋 값 유지");
 
+    /* 6) undo 도중 '재크래시' -> 다음 복구가 처음부터 다시 돌아도 수렴 (CLR 불필요 증명)
+     * 페이지 2개를 커밋해 두고(A1,B1), 트랜잭션이 둘 다 steal(A2,B2)한 채 크래시.
+     * 첫 복구는 undo를 하나만 적용하고 죽는다(주입) -> 반쯤 되돌린 위험한 상태.
+     * 두 번째 복구가 before-image를 처음부터 재적용 -> 둘 다 A1,B1로 정확히 복원.
+     * 이게 가능한 건 before-image 덮어쓰기가 idempotent라서다 — CLR이 지키려는
+     * 성질을 페이지 전체 물리 로깅이 공짜로 준다. */
+    wal_begin(&w);
+    fill(page, 0xA1);
+    wal_stage(&w, 1, page);
+    fill(page, 0xB1);
+    wal_stage(&w, 2, page);
+    CHECK(wal_commit(&w) == 0, "두 페이지 커밋 (A1, B1)");
+    wal_close(&w);
+    wal_open(&w, dp, lp); /* 열기 = 체크포인트: 로그를 비워 둔다 */
+
+    wal_begin(&w);
+    fill(page, 0xA2);
+    CHECK(wal_steal(&w, 1, page) == 0, "페이지1 steal (미커밋 A2)");
+    fill(page, 0xB2);
+    CHECK(wal_steal(&w, 2, page) == 0, "페이지2 steal (미커밋 B2)");
+    wal_close(&w); /* 크래시 — 로그: [BEGIN][UNDO A1][UNDO B1], 디스크: A2,B2 */
+
+    wal_test_crash_in_undo = 1;
+    wal_open(&w, dp, lp); /* 복구가 undo 하나만 적용하고 '재크래시' */
+    wal_test_crash_in_undo = 0;
+    wal_read(&w, 1, buf);
+    CHECK(buf[0] == 0xA1, "1차 복구(중단됨): 페이지1은 되돌아감");
+    wal_read(&w, 2, buf);
+    CHECK(buf[0] == 0xB2, "1차 복구(중단됨): 페이지2는 아직 미커밋 값 (반쯤 undo)");
+    wal_close(&w);
+
+    wal_open(&w, dp, lp); /* 2차 복구: 같은 undo를 처음부터 다시 -> 수렴 */
+    wal_read(&w, 1, buf);
+    CHECK(buf[0] == 0xA1, "2차 복구: 페이지1 정확 (idempotent 재적용)");
+    wal_read(&w, 2, buf);
+    CHECK(buf[0] == 0xB1, "2차 복구: 페이지2도 복원 — CLR 없이 수렴");
+
     wal_close(&w);
     unlink(dp);
     unlink(lp);

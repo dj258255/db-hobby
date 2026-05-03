@@ -102,3 +102,16 @@ int slotpage_delete(void *page, uint16_t slot) {
     s->length = 0;
     return 0;
 }
+
+int slotpage_overwrite(void *page, uint16_t slot, const void *rec, uint16_t len) {
+    SlotPageHeader *h = header(page);
+    if (slot >= h->num_slots) {
+        return -1;
+    }
+    Slot *s = slot_at(page, slot);
+    if (s->offset == 0 || s->length != len) {
+        return -1; /* 삭제된 슬롯이거나 길이가 달라 이웃을 침범할 위험 */
+    }
+    memcpy((uint8_t *)page + s->offset, rec, len);
+    return 0;
+}

@@ -91,5 +91,8 @@ int wal_commit(Wal *w);
 extern int wal_test_crash_after_log;
 /* 1이면 커밋이 커밋 마커 없이 페이지 로그만 쓰고 멈춘다 = "커밋 전 크래시". */
 extern int wal_test_crash_before_commit;
+/* 1이면 복구의 undo가 첫 before-image 하나만 적용하고 멈춘다(로그 안 자름)
+ * = "undo 도중 재크래시". CLR 없이도 재복구가 수렴함을 증명하는 용도. */
+extern int wal_test_crash_in_undo;
 
 #endif /* MINIDB_WAL_H */

@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (338 checks across 21 suites).
+covered by tests (363 checks across 22 suites).
 
 ![db-hobby REPL demo](docs/demo.svg)
 
@@ -164,11 +164,16 @@ protects both the data (`.tbl`) and index
 (`.idx`) files; a transaction larger than the buffer pool is handled by stealing
 dirty pages to disk with undo (before-image) logging, and commit is **no-force**
 (one log `fsync`; the log is the source of truth, trimmed by a simple size-threshold
-checkpoint). Logging is whole-page physical -- redo is idempotent, so there is no
-pageLSN -- and there's no CLR, no fuzzy checkpoint, and no 3-pass ARIES recovery
-yet. B+Tree
-deletion isn't implemented (deleted rows are tombstoned in the heap, so a stale
-index entry is harmless). These are noted in the code where they matter.
+checkpoint). Logging is whole-page physical -- redo *and* undo are idempotent, so
+pageLSN and CLRs are unnecessary here (a crash-injection test proves recovery
+converges even when re-crashed mid-undo); fuzzy checkpoints and 3-pass ARIES
+await the preconditions that actually demand them (concurrency, physiological
+logging). `DELETE` is MVCC-style: rows are never physically removed -- `DELETE`
+(and `UPDATE`'s old version) just stamps `xmax`, and **every** read path (full
+scan, PK point/range lookup, secondary index, joins, aggregates, subqueries)
+filters by visibility; dead versions accumulate until a future VACUUM. B+Tree
+deletion isn't implemented (a stale index entry is filtered by the same
+visibility gate). These are noted in the code where they matter.
 
 ## License
 

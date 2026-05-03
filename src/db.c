@@ -236,6 +236,25 @@ static int row_visible(Database *db, int32_t xmin, int32_t xmax, int my_txn) {
     return 1;
 }
 
+/* 스캔/조회가 받은 원시 레코드가 현재 문장(트랜잭션)에 보이는 버전인가.
+ * DELETE가 tombstone이 아니라 xmax를 새기므로(논리 삭제), 힙을 읽는 '모든' 경로가
+ * 이 게이트를 지나야 한다 — 풀스캔·인덱스 조회·조인·집계·서브쿼리·DML 수집까지. */
+static int rec_visible(Database *db, const void *rec) {
+    return row_visible(db, db_rec_xmin(rec), db_rec_xmax(rec), db->cur_txn);
+}
+
+/* DELETE/UPDATE의 옛 버전 처리: 행을 지우지 않고 xmax만 새긴다(PostgreSQL식 논리 삭제).
+ * 길이가 같아 제자리 덮어쓰기 — 물리 공간 회수는 VACUUM(예정)의 일. */
+static int stamp_xmax(Table *t, RID rid, int32_t xmax) {
+    uint8_t rec[PAGE_SIZE];
+    uint16_t len;
+    if (heap_get(&t->heap, rid, rec, &len) != 0) {
+        return -1;
+    }
+    memcpy(rec + 4, &xmax, 4); /* MVCC 헤더 = [xmin(4)][xmax(4)] */
+    return heap_overwrite(&t->heap, rid, rec, len);
+}
+
 /* ------------- WHERE 평가 -------------
  * 한정자(tbl)가 있으면 그 테이블의 컬럼만, 없으면 이름으로 찾는다.
  */
@@ -467,6 +486,7 @@ static int exec_create(Database *db, const CreateStmt *c, FILE *out) {
     Table *t = &db->tables[db->num_tables];
     t->schema = *c;
     t->num_sec = 0; /* 새 테이블은 보조 인덱스 없음 */
+    t->owner = db;  /* 읽기 경로의 가시성 판정용 역참조 */
     if (table_open_files(t, db->path) != 0) {
         fprintf(out, "ERROR: 테이블 파일을 열 수 없습니다\n");
         return -1;
@@ -487,11 +507,15 @@ typedef struct {
     int col;
     const CreateStmt *schema;
     int count;
+    Database *db;
 } SecBuildCtx;
 
 static int secidx_build_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)len;
     SecBuildCtx *c = ctx_;
+    if (!rec_visible(c->db, rec)) {
+        return 0; /* 지워진(xmax) 옛 버전은 색인하지 않는다 */
+    }
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, (const uint8_t *)rec, row);
     if (row[c->col].type == VAL_INT) { /* NULL/비INT는 색인 안 함 */
@@ -552,7 +576,7 @@ static int exec_create_index(Database *db, const CreateIndexStmt *ci, FILE *out)
         return -1;
     }
     /* 기존 행을 훑어 (컬럼값 -> RID) 등록 */
-    SecBuildCtx bc = {si, col, &t->schema, 0};
+    SecBuildCtx bc = {si, col, &t->schema, 0, db};
     heap_scan(&t->heap, secidx_build_visit, &bc);
     bufpool_flush_all(si->tree.bp); /* WAL 없이 직접 영속화(한 번 만드는 DDL) */
     si->txn_pages = si->tree.wal.data.num_pages; /* 혹시 트랜잭션 중이면 롤백이 이 크기로(=no-op) */
@@ -633,7 +657,7 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
 }
 
 /* 인덱스 범위 스캔: B+Tree가 준 (키, RID)마다 힙 행을 읽어 출력한다.
- * tombstone(삭제된 슬롯)이면 heap_get이 -1이라 자동으로 빠진다. */
+ * 인덱스는 MVCC를 모른다 — 힙 행을 읽은 뒤 가시성 게이트로 거른다(지워진/미커밋 버전 제외). */
 typedef struct {
     Table *t;
     bkey_t bound;
@@ -649,7 +673,8 @@ static int range_visit(bkey_t key, bval_t val, void *ctx_) {
     if (r->op == CMP_LE && key > r->bound) return 1;
     uint8_t recbuf[PAGE_SIZE];
     uint16_t len;
-    if (heap_get(&r->t->heap, rid_decode(val), recbuf, &len) == 0) {
+    if (heap_get(&r->t->heap, rid_decode(val), recbuf, &len) == 0 &&
+        rec_visible(r->t->owner, recbuf)) {
         Value row[SQL_MAX_COLS];
         decode_row(&r->t->schema, recbuf, row);
         print_row(r->out, &r->t->schema, row);
@@ -671,12 +696,16 @@ typedef struct {
     int ncols;
     int cap;
     int count;
+    Database *db; /* MVCC 가시성 판정용 */
 } MatCtx;
 
 static int mat_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)rid;
     (void)len;
     MatCtx *m = ctx_;
+    if (!rec_visible(m->db, rec)) {
+        return 0; /* 안 보이는 버전(미커밋/아보트/지워짐)은 건너뜀 */
+    }
     if (m->count >= m->cap) {
         return 0; /* 버퍼 가득 — 학습용 상한 */
     }
@@ -731,7 +760,8 @@ static int exec_select_sorted(Table *t, const char *tname, const SelectStmt *sel
                 .rows = rows,
                 .ncols = ncols,
                 .cap = SELECT_MAX_ROWS,
-                .count = 0};
+                .count = 0,
+                .db = t->owner};
     heap_scan(&t->heap, mat_visit, &m);
 
     if (sel->num_order > 0) {
@@ -1222,7 +1252,8 @@ static int exec_select_project(Table *t, const char *tname, const SelectStmt *se
                 .rows = rows,
                 .ncols = ncols,
                 .cap = SELECT_MAX_ROWS,
-                .count = 0};
+                .count = 0,
+                .db = t->owner};
     heap_scan(&t->heap, mat_visit, &m);
 
     ColRef cols[SQL_MAX_COLS];
@@ -1301,12 +1332,16 @@ typedef struct {
     HashTab *ht;
     const CreateStmt *schema;
     int col_idx;
+    Database *db; /* MVCC 가시성 판정용 */
 } HBuildCtx;
 
 static int hbuild_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)rid;
     (void)len;
     HBuildCtx *c = ctx_;
+    if (!rec_visible(c->db, rec)) {
+        return 0; /* 빌드 단계에서 걸러야 탐사가 안 보이는 버전을 못 만난다 */
+    }
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, rec, row);
     hash_insert(c->ht, &row[c->col_idx], row);
@@ -1319,7 +1354,7 @@ static HashTab *hash_build(Table *t, int col_idx) {
         return NULL;
     }
     ht->ncols = t->schema.num_columns;
-    HBuildCtx c = {ht, &t->schema, col_idx};
+    HBuildCtx c = {ht, &t->schema, col_idx, t->owner};
     heap_scan(&t->heap, hbuild_visit, &c);
     return ht;
 }
@@ -1670,6 +1705,9 @@ static int mjoin_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     MJoinLevel *lv = ctx_;
     MJoinCtx *m = lv->m;
     int level = lv->level;
+    if (!rec_visible(m->tabs[level]->owner, rec)) {
+        return 0; /* 조인도 보이는 버전만 짝을 짓는다 */
+    }
     decode_row(&m->tabs[level]->schema, rec, m->rows[level]);
     if (level >= 1) {
         /* 이 레벨의 ON 등식을 확인한다 */
@@ -1708,7 +1746,8 @@ static int mjoin_descend(MJoinCtx *m, int level) {
             if (btree_search(&m->tabs[level]->index, k->int_val, &encoded) == 0) {
                 uint8_t recbuf[PAGE_SIZE];
                 uint16_t len2;
-                if (heap_get(&m->tabs[level]->heap, rid_decode(encoded), recbuf, &len2) == 0) {
+                if (heap_get(&m->tabs[level]->heap, rid_decode(encoded), recbuf, &len2) == 0 &&
+                    rec_visible(m->tabs[level]->owner, recbuf)) {
                     decode_row(&m->tabs[level]->schema, recbuf, m->rows[level]);
                     m->matched[level] = 1;
                     r = mjoin_descend(m, level + 1);
@@ -1968,12 +2007,16 @@ typedef struct {
     Value *set;
     int cap;
     int n;
+    Database *db; /* MVCC 가시성 판정용 */
 } SubCtx;
 
 static int sub_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)rid;
     (void)len;
     SubCtx *c = ctx_;
+    if (!rec_visible(c->db, rec)) {
+        return 0; /* 서브쿼리 결과 집합도 보이는 버전으로만 */
+    }
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, rec, row);
     if (where_matches(c->schema, c->tname, c->where, row) && c->n < c->cap) {
@@ -2007,7 +2050,7 @@ static int run_subquery(Database *db, SelectStmt *sub, Value **out_set, int *out
     if (!set) {
         return -1;
     }
-    SubCtx c = {&t->schema, tname, &sub->where, col, set, SELECT_MAX_ROWS, 0};
+    SubCtx c = {&t->schema, tname, &sub->where, col, set, SELECT_MAX_ROWS, 0, db};
     heap_scan(&t->heap, sub_visit, &c);
     *out_set = set;
     *out_n = c.n;
@@ -2031,8 +2074,8 @@ static int prepare_where(Database *db, Where *w) {
 }
 
 /* 보조 인덱스 스캔: find_all로 받은 후보 RID를 heap_get으로 읽고 WHERE를 재검사한다.
- * 재검사가 필요한 이유 — 삭제된 행(tombstone)은 heap_get이 거르고, UPDATE로 값이 바뀌어
- * 남은 stale 인덱스 항목이나 슬롯 재사용은 cond 재평가로 거른다. */
+ * 재검사가 필요한 이유 — 지워진/미커밋 버전은 가시성 게이트가 거르고, UPDATE로 값이 바뀌어
+ * 남은 stale 인덱스 항목은 cond 재평가로 거른다(인덱스는 MVCC를 모른다). */
 typedef struct {
     Table *t;
     const char *tname;
@@ -2047,7 +2090,10 @@ static int sec_scan_visit(bkey_t key, bval_t val, void *ctx_) {
     uint8_t recbuf[PAGE_SIZE];
     uint16_t len;
     if (heap_get(&s->t->heap, rid_decode(val), recbuf, &len) != 0) {
-        return 0; /* 삭제된(tombstone) 행 */
+        return 0; /* 사라진 슬롯 */
+    }
+    if (!rec_visible(s->t->owner, recbuf)) {
+        return 0; /* 지워진(xmax)/미커밋 버전 */
     }
     Value row[SQL_MAX_COLS];
     decode_row(&s->t->schema, recbuf, row);
@@ -2114,7 +2160,8 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         if (btree_search(&t->index, c0->val.int_val, &encoded) == 0) {
             uint8_t recbuf[PAGE_SIZE];
             uint16_t len;
-            if (heap_get(&t->heap, rid_decode(encoded), recbuf, &len) == 0) {
+            if (heap_get(&t->heap, rid_decode(encoded), recbuf, &len) == 0 &&
+                rec_visible(db, recbuf)) { /* 지워진(xmax)/미커밋 버전은 '없는 행' */
                 Value row[SQL_MAX_COLS];
                 decode_row(&t->schema, recbuf, row);
                 print_row(out, &t->schema, row);
@@ -2159,11 +2206,15 @@ typedef struct {
     int count;
     const CreateStmt *schema;
     const Where *where;
+    Database *db; /* MVCC 가시성 판정용 */
 } CollectCtx;
 
 static int collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     (void)len;
     CollectCtx *c = ctx_;
+    if (!rec_visible(c->db, rec)) {
+        return 0; /* 이미 지워진(xmax)/안 보이는 버전은 DML 대상이 아니다 */
+    }
     Value row[SQL_MAX_COLS];
     decode_row(c->schema, rec, row);
     /* DELETE/UPDATE는 별칭이 없으니 실효 이름 = 테이블명 */
@@ -2179,13 +2230,15 @@ static int exec_delete(Database *db, const DeleteStmt *d, FILE *out) {
         fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", d->table);
         return -1;
     }
-    CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &d->where};
+    CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &d->where, .db = db};
     heap_scan(&t->heap, collect_visit, &ctx);
     for (int i = 0; i < ctx.count; i++) {
-        heap_delete(&t->heap, ctx.rids[i]);
+        /* PostgreSQL식 논리 삭제: 행을 지우지 않고 xmax만 새긴다. 커밋되면 가시성
+         * 게이트가 숨기고, 아보트하면 xmax가 무효라 되살아난다(MVCC 롤백). */
+        stamp_xmax(t, ctx.rids[i], db->cur_txn);
     }
-    /* 인덱스 항목은 남겨둬도 무해하다: 가리키는 슬롯이 tombstone이라 heap_get이 -1을
-     * 돌려줘 결과에서 자동으로 빠진다. (B+Tree 삭제는 별도 주제로 미룬다.) */
+    /* 인덱스 항목은 남겨둬도 무해하다: 가리키는 행이 안 보이는 버전이면 가시성
+     * 게이트가 걸러 결과에서 자동으로 빠진다. (B+Tree 삭제는 VACUUM에서.) */
     fprintf(out, "%d개 행 삭제됨\n", ctx.count);
     return 0;
 }
@@ -2213,7 +2266,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         return -1;
     }
 
-    CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &u->where};
+    CollectCtx ctx = {.count = 0, .schema = &t->schema, .where = &u->where, .db = db};
     heap_scan(&t->heap, collect_visit, &ctx);
 
     int n = 0;
@@ -2227,14 +2280,15 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
         decode_row(&t->schema, recbuf, row);
         row[sci] = u->set_val; /* SET 적용 */
 
-        /* 가변 길이라 제자리 수정이 안 된다 -> 옛 행 삭제 + 새 행 삽입 */
+        /* MVCC식 UPDATE = 옛 버전에 xmax + 새 버전 추가(새 RID). 옛 버전은 힙에
+         * 남아 롤백 시 되살아난다 — PostgreSQL이 UPDATE를 다루는 방식 그대로. */
         uint8_t newbuf[PAGE_SIZE];
         uint16_t newlen;
         if (encode_row(&t->schema, row, t->schema.num_columns, db->cur_txn, 0, newbuf, &newlen) !=
             0) {
             continue;
         }
-        heap_delete(&t->heap, ctx.rids[i]);
+        stamp_xmax(t, ctx.rids[i], db->cur_txn);
         RID newrid;
         if (heap_insert(&t->heap, newbuf, newlen, &newrid) != 0) {
             continue;
@@ -2434,6 +2488,7 @@ int db_open(Database *db, const char *path) {
                         t->num_sec++;
                     }
                 }
+                t->owner = db; /* 읽기 경로의 가시성 판정용 역참조 */
                 if (table_open_files(t, db->path) == 0) {
                     db->num_tables++;
                 }
