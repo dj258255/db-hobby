@@ -1,4 +1,5 @@
 #include "db.h"
+#include "page.h" /* VACUUM의 슬롯 검사·compaction */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -2310,6 +2311,176 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
     return 0;
 }
 
+/* ------------- 실행기: VACUUM -------------
+ * 16편이 만든 문제를 치운다: DELETE/UPDATE가 xmax만 새기니 죽은 버전이 힙에 쌓인다.
+ * VACUUM은 ① 죽은 버전의 인덱스 항목을 지우고(드디어 필요해진 B+Tree 삭제 — lazy),
+ * ② 힙 슬롯을 비워 페이지를 compaction하고, ③ 꼬리가 전부 빈 페이지면 파일을 자른다
+ * (PostgreSQL의 조건부 truncate와 같은 결). PG처럼 트랜잭션 안에서는 못 돈다. */
+
+/* 죽은 버전인가 — 커밋된 xmax가 찍혀 이제 아무 트랜잭션에게도 안 보일 옛 버전.
+ * (단일 트랜잭션 + 물리 롤백이라 '아보트된 xmin' 행은 디스크에 없고, VACUUM은
+ * 트랜잭션 밖에서만 돌므로 미커밋 xmax도 없다.) */
+static int rec_dead(Database *db, const void *rec) {
+    int32_t xmax = db_rec_xmax(rec);
+    return xmax != 0 && txn_committed_view(db, xmax);
+}
+
+typedef struct {
+    RID rid;
+    bkey_t pk;
+    int has_pk;
+    bkey_t sk[DB_MAX_SEC_IDX];
+    int has_sk[DB_MAX_SEC_IDX];
+} DeadRef;
+
+typedef struct {
+    Database *db;
+    Table *t;
+    DeadRef *dead;
+    int n, cap;
+    int oom;
+} VacCtx;
+
+/* 죽은 버전을 모은다. 인덱스 항목을 지우려면 키 값이 필요하므로 여기서 미리 decode. */
+static int vacuum_collect_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)len;
+    VacCtx *c = ctx_;
+    if (!rec_dead(c->db, rec)) {
+        return 0;
+    }
+    if (c->n >= c->cap) {
+        int cap = c->cap ? c->cap * 2 : 256;
+        DeadRef *p = realloc(c->dead, sizeof(DeadRef) * (size_t)cap);
+        if (!p) {
+            c->oom = 1;
+            return 1; /* 스캔 중단 */
+        }
+        c->dead = p;
+        c->cap = cap;
+    }
+    Value row[SQL_MAX_COLS];
+    decode_row(&c->t->schema, rec, row);
+    DeadRef *e = &c->dead[c->n++];
+    e->rid = rid;
+    e->has_pk = (c->t->has_index && row[0].type == VAL_INT);
+    e->pk = e->has_pk ? row[0].int_val : 0;
+    for (int k = 0; k < c->t->num_sec; k++) {
+        int col = c->t->sec[k].col;
+        e->has_sk[k] = (row[col].type == VAL_INT);
+        e->sk[k] = e->has_sk[k] ? row[col].int_val : 0;
+    }
+    return 0;
+}
+
+/* 페이지에 살아있는 슬롯이 하나도 없나(꼬리 truncate 판정). */
+static int page_is_empty(const void *pg) {
+    uint16_t n = slotpage_num_slots(pg);
+    for (uint16_t s = 0; s < n; s++) {
+        const void *r;
+        uint16_t l;
+        if (slotpage_get(pg, s, &r, &l) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int vacuum_table(Database *db, Table *t, FILE *out) {
+    /* 1) 죽은 버전 수집 */
+    VacCtx c = {.db = db, .t = t, .dead = NULL, .n = 0, .cap = 0, .oom = 0};
+    heap_scan(&t->heap, vacuum_collect_visit, &c);
+    if (c.oom) {
+        free(c.dead);
+        fprintf(out, "ERROR: 메모리 부족\n");
+        return -1;
+    }
+
+    /* 2) 죽은 버전을 가리키는 인덱스 항목 제거.
+     * PK는 '인덱스가 지금도 이 죽은 RID를 가리킬 때만' 지운다 — UPDATE/재삽입이면
+     * 같은 키가 살아있는 새 버전을 가리키고 있어서 건드리면 안 된다.
+     * 보조 인덱스는 비유니크라 (키, 죽은 RID) 짝을 정확히 지운다. */
+    for (int i = 0; i < c.n; i++) {
+        DeadRef *e = &c.dead[i];
+        if (e->has_pk) {
+            bval_t v;
+            if (btree_search(&t->index, e->pk, &v) == 0 && v == rid_encode(e->rid)) {
+                btree_delete_val(&t->index, e->pk, v);
+            }
+        }
+        for (int k = 0; k < t->num_sec; k++) {
+            if (e->has_sk[k]) {
+                btree_delete_val(&t->sec[k].tree, e->sk[k], rid_encode(e->rid));
+            }
+        }
+    }
+
+    /* 3) 힙 슬롯 비우기 — 이제야 heap_delete(tombstone)가 제 일을 찾았다:
+     * DELETE의 의미론이 아니라 VACUUM의 청소 도구로. 그리고 죽은 행이 있던
+     * 페이지만 compaction해 레코드 공간을 회수한다(슬롯 번호 = RID는 불변). */
+    for (int i = 0; i < c.n; i++) {
+        heap_delete(&t->heap, c.dead[i].rid);
+    }
+    for (int i = 0; i < c.n; i++) {
+        page_id_t pid = c.dead[i].rid.page_id;
+        if (i > 0 && pid == c.dead[i - 1].rid.page_id) {
+            continue; /* 같은 페이지는 한 번만 (수집이 페이지 순서라 인접해 있다) */
+        }
+        void *pg = bufpool_fetch(t->bp, pid);
+        if (pg) {
+            slotpage_compact(pg);
+            bufpool_unpin(t->bp, pid, 1);
+        }
+    }
+
+    /* 4) 꼬리의 빈 페이지 잘라내기 (PG의 조건부 truncate — 가운데 빈 페이지는 남는다).
+     * 파일 축소는 WAL에 안 적히지만, 잘린 페이지엔 죽은 버전만 있었으므로 커밋 전에
+     * 크래시해도 사용자 가시 상태는 동일하다(그 행들은 원래 아무에게도 안 보였다). */
+    uint64_t np = t->wal.data.num_pages;
+    uint64_t new_np = np;
+    while (new_np > t->heap.first_page) {
+        void *pg = bufpool_fetch(t->bp, new_np - 1);
+        if (!pg) {
+            break;
+        }
+        int empty = page_is_empty(pg);
+        bufpool_unpin(t->bp, new_np - 1, 0);
+        if (!empty) {
+            break;
+        }
+        new_np--;
+    }
+    if (new_np < np) {
+        bufpool_invalidate_from(t->bp, new_np); /* 잘린 페이지의 프레임이 파일을 되살리지 않게 */
+        pager_truncate(&t->wal.data, new_np);
+    }
+
+    fprintf(out, "VACUUM %s: 죽은 버전 %d개 회수, 빈 페이지 %llu개 반환\n", t->schema.table,
+            c.n, (unsigned long long)(np - new_np));
+    free(c.dead);
+    return 0;
+}
+
+static int exec_vacuum(Database *db, const VacuumStmt *v, FILE *out) {
+    if (db->in_txn) { /* PostgreSQL과 동일: VACUUM cannot run inside a transaction block */
+        fprintf(out, "ERROR: VACUUM은 트랜잭션 안에서 실행할 수 없습니다\n");
+        return -1;
+    }
+    if (v->table[0]) {
+        Table *t = find_table(db, v->table);
+        if (!t) {
+            fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", v->table);
+            return -1;
+        }
+        return vacuum_table(db, t, out);
+    }
+    for (int i = 0; i < db->num_tables; i++) {
+        if (vacuum_table(db, &db->tables[i], out) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* ------------- 트랜잭션 -------------
  * 데이터(.tbl)는 이제 WAL을 통해 커밋한다(write-ahead): 트랜잭션 중 바뀐 페이지는
  * no-steal로 버퍼 풀에만 두고, COMMIT이면 그 dirty 페이지들을 WAL에 stage한 뒤
@@ -2586,7 +2757,8 @@ int db_exec(Database *db, const char *sql, FILE *out) {
      * 때까지 dirty 페이지(데이터·인덱스 둘 다)가 디스크로 새지 않게 no-steal을 켠다. */
     int autocommit = !db->in_txn &&
                      (st.type == STMT_CREATE || st.type == STMT_INSERT ||
-                      st.type == STMT_DELETE || st.type == STMT_UPDATE);
+                      st.type == STMT_DELETE || st.type == STMT_UPDATE ||
+                      st.type == STMT_VACUUM); /* VACUUM의 힙·인덱스 청소도 WAL로 원자 커밋 */
     if (autocommit) {
         for (int i = 0; i < db->num_tables; i++) {
             Table *t = &db->tables[i];
@@ -2616,6 +2788,7 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         case STMT_BEGIN: rc = exec_begin(db, out); break;
         case STMT_COMMIT: rc = exec_commit(db, out); break;
         case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
+        case STMT_VACUUM: rc = exec_vacuum(db, &st.vac, out); break;
         default: rc = -1;
     }
     if (autocommit) {

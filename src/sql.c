@@ -14,7 +14,7 @@ typedef enum {
     TOK_LT, TOK_GT, TOK_LE, TOK_GE, TOK_NE,
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
-    TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK,
+    TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK, TOK_VACUUM,
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
@@ -48,6 +48,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "BEGIN")) return TOK_BEGIN;
     if (!strcasecmp(s, "COMMIT")) return TOK_COMMIT;
     if (!strcasecmp(s, "ROLLBACK")) return TOK_ROLLBACK;
+    if (!strcasecmp(s, "VACUUM")) return TOK_VACUUM;
     if (!strcasecmp(s, "DELETE")) return TOK_DELETE;
     if (!strcasecmp(s, "UPDATE")) return TOK_UPDATE;
     if (!strcasecmp(s, "SET")) return TOK_SET;
@@ -723,7 +724,15 @@ int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
         case TOK_BEGIN: out->type = STMT_BEGIN; p_advance(&p); break;
         case TOK_COMMIT: out->type = STMT_COMMIT; p_advance(&p); break;
         case TOK_ROLLBACK: out->type = STMT_ROLLBACK; p_advance(&p); break;
-        default: p_fail(&p, "CREATE / INSERT / SELECT / BEGIN / COMMIT / ROLLBACK 로 시작해야 합니다"); break;
+        case TOK_VACUUM: /* VACUUM [<table>] — 테이블 생략 시 전체 */
+            out->type = STMT_VACUUM;
+            p_advance(&p);
+            if (p.cur.type == TOK_IDENT) {
+                snprintf(out->vac.table, sizeof(out->vac.table), "%s", p.cur.text);
+                p_advance(&p);
+            }
+            break;
+        default: p_fail(&p, "CREATE / INSERT / SELECT / BEGIN / COMMIT / ROLLBACK / VACUUM 로 시작해야 합니다"); break;
     }
 
     if (p.ok) {

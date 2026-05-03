@@ -100,6 +100,7 @@ typedef enum {
     STMT_COMMIT,   /* COMMIT — 확정 */
     STMT_ROLLBACK, /* ROLLBACK — 되돌리기 */
     STMT_CREATE_INDEX, /* CREATE INDEX <name> ON <table>(<col>) */
+    STMT_VACUUM,       /* VACUUM [<table>] — 죽은 버전(안 보이는 옛 버전) 공간 회수 */
 } StmtType;
 
 typedef struct {
@@ -190,6 +191,10 @@ typedef struct {
 } CreateIndexStmt;
 
 typedef struct {
+    char table[SQL_NAME_LEN]; /* ""이면 모든 테이블 */
+} VacuumStmt;
+
+typedef struct {
     StmtType type;
     union {
         CreateStmt create;
@@ -198,6 +203,7 @@ typedef struct {
         DeleteStmt del;
         UpdateStmt upd;
         CreateIndexStmt cidx;
+        VacuumStmt vac;
     };
 } Statement;
 

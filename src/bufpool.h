@@ -63,6 +63,10 @@ void bufpool_discard_dirty(BufferPool *bp);
  * (steal로 clean 처리됐지만 미커밋 내용인) 프레임을 버려 다음 fetch가 디스크를 읽게 한다. */
 void bufpool_invalidate_all(BufferPool *bp);
 
+/* first 이후(포함) 페이지를 담은 프레임을 전부 무효화한다 — 파일 truncate 전에 불러,
+ * 잘린 페이지의 dirty 프레임이 나중에 flush되며 파일을 되살리는 걸 막는다(VACUUM용). */
+void bufpool_invalidate_from(BufferPool *bp, page_id_t first);
+
 /* 통계 (시연·테스트용). */
 size_t bufpool_hits(const BufferPool *bp);
 size_t bufpool_misses(const BufferPool *bp);

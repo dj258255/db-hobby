@@ -115,3 +115,22 @@ int slotpage_overwrite(void *page, uint16_t slot, const void *rec, uint16_t len)
     memcpy((uint8_t *)page + s->offset, rec, len);
     return 0;
 }
+
+void slotpage_compact(void *page) {
+    SlotPageHeader *h = header(page);
+    uint8_t tmp[PAGE_SIZE];
+    uint16_t new_end = PAGE_SIZE;
+    /* 살아있는 레코드만 임시 버퍼의 끝에서부터 다시 패킹하고 슬롯 offset을 갱신한다.
+     * (원본 페이지 위에서 바로 밀면 레코드끼리 겹칠 수 있어 임시 버퍼를 쓴다.) */
+    for (uint16_t i = 0; i < h->num_slots; i++) {
+        Slot *s = slot_at(page, i);
+        if (s->offset == 0) {
+            continue; /* 삭제된 슬롯 — 공간을 회수한다 */
+        }
+        new_end -= s->length;
+        memcpy(tmp + new_end, (uint8_t *)page + s->offset, s->length);
+        s->offset = new_end;
+    }
+    memcpy((uint8_t *)page + new_end, tmp + new_end, (size_t)(PAGE_SIZE - new_end));
+    h->free_end = new_end;
+}

@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (363 checks across 22 suites).
+covered by tests (380 checks across 23 suites).
 
 ![db-hobby REPL demo](docs/demo.svg)
 
@@ -171,9 +171,13 @@ await the preconditions that actually demand them (concurrency, physiological
 logging). `DELETE` is MVCC-style: rows are never physically removed -- `DELETE`
 (and `UPDATE`'s old version) just stamps `xmax`, and **every** read path (full
 scan, PK point/range lookup, secondary index, joins, aggregates, subqueries)
-filters by visibility; dead versions accumulate until a future VACUUM. B+Tree
-deletion isn't implemented (a stale index entry is filtered by the same
-visibility gate). These are noted in the code where they matter.
+filters by visibility; dead versions accumulate until **`VACUUM [table]`**
+reclaims them: it deletes their index entries (lazy B+Tree leaf deletion,
+PostgreSQL-nbtree-style -- no merge/redistribute), empties their heap slots,
+compacts each page (RIDs stay stable), and truncates trailing all-empty pages
+(PG-style conditional truncation). VACUUM refuses to run inside a transaction
+(as in PostgreSQL), and its heap/index cleanup commits atomically through the
+WAL. These are noted in the code where they matter.
 
 ## License
 

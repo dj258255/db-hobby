@@ -211,6 +211,57 @@ int btree_insert_dup(BTree *bt, bkey_t key, bval_t val) {
     return insert_root(bt, key, val, 1); /* 비유니크: 같은 키도 새 항목으로 */
 }
 
+int btree_delete_val(BTree *bt, bkey_t key, bval_t val) {
+    /* 하한 탐색(find_all과 동일): 같은 키가 여러 리프에 있을 수 있으니 가장 왼쪽 후보로. */
+    page_id_t pid = bt->root;
+    for (;;) {
+        BTNode *n = fetch(bt, pid);
+        if (!n) {
+            return -1;
+        }
+        if (n->is_leaf) {
+            bufpool_unpin(bt->bp, pid, 0);
+            break;
+        }
+        int i = 0;
+        while (i < n->num_keys && key > n->keys[i]) {
+            i++;
+        }
+        page_id_t c = n->u.children[i];
+        bufpool_unpin(bt->bp, pid, 0);
+        pid = c;
+    }
+    /* 리프 체인을 훑어 (key, val) 짝을 찾아 자리를 당겨 지운다. */
+    while (pid != 0) {
+        BTNode *n = fetch(bt, pid);
+        if (!n) {
+            return -1;
+        }
+        for (int i = 0; i < n->num_keys; i++) {
+            if (n->keys[i] < key) {
+                continue;
+            }
+            if (n->keys[i] > key) { /* 정렬돼 있으니 더 볼 것 없음 */
+                bufpool_unpin(bt->bp, pid, 0);
+                return -1;
+            }
+            if (n->u.values[i] == val) {
+                for (int j = i; j < n->num_keys - 1; j++) {
+                    n->keys[j] = n->keys[j + 1];
+                    n->u.values[j] = n->u.values[j + 1];
+                }
+                n->num_keys--; /* 리프가 비어도 체인에 남는다(lazy) — 스캔이 그냥 지나간다 */
+                bufpool_unpin(bt->bp, pid, 1);
+                return 0;
+            }
+        }
+        page_id_t nxt = n->next_leaf;
+        bufpool_unpin(bt->bp, pid, 0);
+        pid = nxt;
+    }
+    return -1;
+}
+
 void btree_reload_root(BTree *bt) {
     uint64_t *meta = (uint64_t *)bufpool_fetch(bt->bp, 0);
     bt->root = meta[0];

@@ -206,6 +206,17 @@ void bufpool_invalidate_all(BufferPool *bp) {
     }
 }
 
+void bufpool_invalidate_from(BufferPool *bp, page_id_t first) {
+    for (size_t i = 0; i < bp->num_frames; i++) {
+        Frame *f = &bp->frames[i];
+        if (f->valid && f->page_id >= first) {
+            f->valid = 0;
+            f->dirty = 0;
+            f->pin_count = 0;
+        }
+    }
+}
+
 void bufpool_destroy(BufferPool *bp) {
     if (!bp) {
         return;

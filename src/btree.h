@@ -42,6 +42,12 @@ int btree_insert(BTree *bt, bkey_t key, bval_t val);
 /* 키에 값을 넣되 같은 키를 덮어쓰지 않고 추가한다(비유니크). 보조 인덱스용. 0/-1. */
 int btree_insert_dup(BTree *bt, bkey_t key, bval_t val);
 
+/* (key, val) 항목 하나를 리프에서 제거한다 — VACUUM이 죽은 버전의 인덱스 항목을
+ * 지울 때 쓴다. lazy 삭제: 노드 병합·재분배는 안 한다(PostgreSQL nbtree도 리프
+ * 항목 삭제 + 빈 페이지 재활용만 하지 재분배는 안 한다). 내부 노드의 분리키가
+ * stale해질 수 있지만 라우팅 안내판일 뿐이라 탐색은 정확하다. 0 성공, -1 없음. */
+int btree_delete_val(BTree *bt, bkey_t key, bval_t val);
+
 /* 키를 찾는다. 있으면 *out에 값을 넣고 0, 없으면 -1. (같은 키가 여럿이면 그중 하나.) */
 int btree_search(BTree *bt, bkey_t key, bval_t *out);
 

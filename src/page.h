@@ -35,6 +35,10 @@ int slotpage_delete(void *page, uint16_t slot);
  * 길이가 다르거나 삭제된 슬롯이면 -1 — 이웃 레코드를 침범하지 않기 위한 안전장치. */
 int slotpage_overwrite(void *page, uint16_t slot, const void *rec, uint16_t len);
 
+/* 삭제된 슬롯이 차지하던 레코드 공간을 회수한다 — 살아있는 레코드를 페이지 끝쪽으로
+ * 다시 패킹하고 free_end를 되돌린다. 슬롯 번호는 그대로라 RID가 안 바뀐다. VACUUM용. */
+void slotpage_compact(void *page);
+
 /* 현재 슬롯 개수(삭제된 것 포함). */
 uint16_t slotpage_num_slots(const void *page);
 
