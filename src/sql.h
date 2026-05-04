@@ -102,6 +102,7 @@ typedef enum {
     STMT_CREATE_INDEX, /* CREATE INDEX <name> ON <table>(<col>) */
     STMT_VACUUM,       /* VACUUM [<table>] — 죽은 버전(안 보이는 옛 버전) 공간 회수 */
     STMT_SESSION,      /* SESSION <n> — 현재 세션 전환(다중 트랜잭션 인터리브용) */
+    STMT_ANALYZE,      /* ANALYZE [<table>] — 옵티마이저 통계 수집 */
 } StmtType;
 
 typedef struct {
@@ -200,6 +201,10 @@ typedef struct {
 } SessionStmt;
 
 typedef struct {
+    char table[SQL_NAME_LEN]; /* ""이면 모든 테이블 */
+} AnalyzeStmt;
+
+typedef struct {
     StmtType type;
     union {
         CreateStmt create;
@@ -210,6 +215,7 @@ typedef struct {
         CreateIndexStmt cidx;
         VacuumStmt vac;
         SessionStmt sess;
+        AnalyzeStmt analyze;
     };
 } Statement;
 

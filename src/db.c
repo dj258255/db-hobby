@@ -146,6 +146,13 @@ static void catalog_write(Database *db) {
             int32_t col = db->tables[i].sec[k].col;
             fwrite(&col, sizeof(col), 1, f);
         }
+        /* 옵티마이저 통계도 영속화 (ANALYZE 결과) */
+        Table *tt = &db->tables[i];
+        fwrite(&tt->stat_valid, sizeof(int32_t), 1, f);
+        fwrite(&tt->stat_rows, sizeof(int64_t), 1, f);
+        fwrite(&tt->stat_pages, sizeof(int64_t), 1, f);
+        fwrite(&tt->stat_pk_min, sizeof(int64_t), 1, f);
+        fwrite(&tt->stat_pk_max, sizeof(int64_t), 1, f);
     }
     fclose(f);
 }
@@ -1455,6 +1462,109 @@ typedef struct {
     int count;
 } MJoinCtx;
 
+/* ------------- 옵티마이저: 통계(ANALYZE) + 비용 기반 접근 방법 선택 -------------
+ * 지금까지 플래너는 규칙 기반이었다 — "PK 조건이면 무조건 인덱스". 그런데 넓은 범위
+ * (테이블 대부분이 매칭)엔 인덱스 범위 스캔이 행마다 랜덤 힙 페치를 하느라 순차 스캔보다
+ * 느리다. ANALYZE로 행 수·PK 범위를 재고, 선택도로 매칭 행 수를 추정해 비용으로 고른다. */
+
+typedef struct {
+    Database *db;
+    const CreateStmt *schema;
+    int64_t rows;
+    int64_t pk_min, pk_max;
+    int have;
+} AnalyzeCtx;
+
+static int analyze_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid; (void)len;
+    AnalyzeCtx *c = ctx_;
+    if (!rec_visible(c->db, rec)) {
+        return 0; /* 보이는 행만 센다 (죽은 버전 제외) */
+    }
+    Value row[SQL_MAX_COLS];
+    decode_row(c->schema, rec, row);
+    c->rows++;
+    if (c->schema->columns[0].type == COL_INT && row[0].type == VAL_INT) {
+        long v = row[0].int_val;
+        if (!c->have || v < c->pk_min) c->pk_min = v;
+        if (!c->have || v > c->pk_max) c->pk_max = v;
+        c->have = 1;
+    }
+    return 0;
+}
+
+static void analyze_table(Database *db, Table *t) {
+    AnalyzeCtx c = {db, &t->schema, 0, 0, 0, 0};
+    heap_scan(&t->heap, analyze_visit, &c);
+    t->stat_rows = c.rows;
+    int64_t pages = (int64_t)t->wal.data.num_pages - (int64_t)t->heap.first_page;
+    t->stat_pages = pages < 1 ? 1 : pages;
+    t->stat_pk_min = c.have ? c.pk_min : 0;
+    t->stat_pk_max = c.have ? c.pk_max : 0;
+    t->stat_valid = 1;
+}
+
+/* PK 범위 조건이 잡을 행 수 추정 (선택도 = 범위가 [min,max]에서 차지하는 비율) */
+static int64_t est_pk_range_rows(const Table *t, CmpOp op, long v) {
+    int64_t rows = t->stat_rows;
+    if (rows <= 0) return 0;
+    double lo = (double)t->stat_pk_min, hi = (double)t->stat_pk_max, span = hi - lo;
+    double f;
+    if (span <= 0) {
+        f = 1.0;
+    } else if (op == CMP_GT || op == CMP_GE) {
+        f = (hi - (double)v) / span;
+    } else { /* CMP_LT, CMP_LE */
+        f = ((double)v - lo) / span;
+    }
+    if (f < 0) f = 0;
+    if (f > 1) f = 1;
+    int64_t est = (int64_t)(rows * f + 0.5);
+    if (est < 1) est = 1;
+    if (est > rows) est = rows;
+    return est;
+}
+
+/* 비용 모델(단순): 순차 스캔 = 페이지 수(순차 I/O), 인덱스 범위 = 1(트리 하강) +
+ * 매칭 행수(행마다 랜덤 힙 페치 ≈ 페이지 1개). "페치할 행이 페이지 수보다 많으면
+ * 순차가 이긴다"는 PostgreSQL random_page_cost 직관의 축소판. */
+static double cost_seq(const Table *t) { return (double)t->stat_pages; }
+static double cost_idx_range(int64_t est_rows) { return 1.0 + (double)est_rows; }
+
+/* PK 범위에서 인덱스 vs 순차 선택. 통계 없으면 옛 규칙(인덱스) 유지.
+ * est_rows/idx_cost/seq_cost를 채운다(EXPLAIN 표시용). 반환 1=인덱스, 0=순차. */
+static int choose_pk_range(const Table *t, CmpOp op, long v,
+                           int64_t *est_rows, double *idx_cost, double *seq_cost) {
+    if (!t->stat_valid) {
+        *est_rows = -1; *idx_cost = -1; *seq_cost = -1;
+        return 1; /* 통계 없음 -> 옛 규칙대로 인덱스 */
+    }
+    int64_t er = est_pk_range_rows(t, op, v);
+    *est_rows = er;
+    *idx_cost = cost_idx_range(er);
+    *seq_cost = cost_seq(t);
+    return *idx_cost < *seq_cost ? 1 : 0;
+}
+
+static int exec_analyze(Database *db, const AnalyzeStmt *a, FILE *out) {
+    if (a->table[0]) {
+        Table *t = find_table(db, a->table);
+        if (!t) {
+            fprintf(out, "ERROR: 그런 테이블이 없습니다 (%s)\n", a->table);
+            return -1;
+        }
+        analyze_table(db, t);
+        fprintf(out, "ANALYZE %s: 행 %lld · 페이지 %lld · PK 범위 [%lld, %lld]\n",
+                t->schema.table, (long long)t->stat_rows, (long long)t->stat_pages,
+                (long long)t->stat_pk_min, (long long)t->stat_pk_max);
+    } else {
+        for (int i = 0; i < db->num_tables; i++) analyze_table(db, &db->tables[i]);
+        fprintf(out, "ANALYZE: %d개 테이블 통계 갱신\n", db->num_tables);
+    }
+    catalog_write(db); /* 통계 영속화 */
+    return 0;
+}
+
 /* ------------- EXPLAIN: 실행기와 같은 결정 로직으로 쿼리 플랜을 출력 ------------- */
 
 static const char *xop_str(CmpOp op) {
@@ -1647,14 +1757,25 @@ static void explain_single(FILE *out, Table *t, const char *tname, const SelectS
                   (c0->tbl[0] == '\0' || strcmp(c0->tbl, tname) == 0) &&
                   strcmp(c0->col, pkcol) == 0 && c0->val.type == VAL_INT;
 
+    /* PK 범위면 비용으로 인덱스/순차를 고른다(exec_select와 동일 결정). */
+    int pk_range = can_index && pk_cond &&
+                   (c0->op == CMP_LT || c0->op == CMP_GT || c0->op == CMP_LE || c0->op == CMP_GE);
+    int64_t er = -1; double ic = -1, sc = -1;
+    int range_use_idx = pk_range ? choose_pk_range(t, c0->op, c0->val.int_val, &er, &ic, &sc) : 0;
+
     xindent(out, ind);
     if (can_index && pk_cond && c0->op == CMP_EQ) {
-        fprintf(out, "Index Point Lookup on %s using %s  (%s = %ld)\n", tname, pkcol, pkcol,
-                c0->val.int_val);
-    } else if (can_index && pk_cond &&
-               (c0->op == CMP_LT || c0->op == CMP_GT || c0->op == CMP_LE || c0->op == CMP_GE)) {
-        fprintf(out, "Index Range Scan on %s using %s  (%s %s %ld)\n", tname, pkcol, pkcol,
+        fprintf(out, "Index Point Lookup on %s using %s  (%s = %ld)%s\n", tname, pkcol, pkcol,
+                c0->val.int_val, t->stat_valid ? "  rows=1 cost=1" : "");
+    } else if (pk_range && range_use_idx) {
+        fprintf(out, "Index Range Scan on %s using %s  (%s %s %ld)", tname, pkcol, pkcol,
                 xop_str(c0->op), c0->val.int_val);
+        if (t->stat_valid) fprintf(out, "  rows=%lld cost=%.0f", (long long)er, ic);
+        fprintf(out, "\n");
+    } else if (pk_range && !range_use_idx) {
+        /* 비용상 순차가 더 싸다 — 규칙이라면 인덱스를 썼을 자리 */
+        fprintf(out, "Seq Scan on %s  (filter: %s %s %ld)  rows=%lld cost=%.0f  [비용 기반: 인덱스보다 쌈]\n",
+                tname, pkcol, xop_str(c0->op), c0->val.int_val, (long long)er, sc);
     } else if (can_index && sec_index_for(t, tname, c0, pk_cond) >= 0) {
         int sk = sec_index_for(t, tname, c0, pk_cond);
         fprintf(out, "Index Scan using %s on %s  (%s = %ld, recheck)\n", t->sec[sk].name, tname,
@@ -2225,15 +2346,20 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
                   (c0->tbl[0] == '\0' || strcmp(c0->tbl, tname) == 0) &&
                   strcmp(c0->col, t->schema.columns[0].name) == 0 && c0->val.type == VAL_INT;
 
+    /* PK 범위면 비용으로 인덱스/순차 결정 (explain_single과 동일). */
+    int pk_range = pk_cond && (c0->op == CMP_GT || c0->op == CMP_GE || c0->op == CMP_LT ||
+                               c0->op == CMP_LE);
+    int64_t er_; double ic_, sc_;
+    int range_use_idx = pk_range && choose_pk_range(t, c0->op, c0->val.int_val, &er_, &ic_, &sc_);
+
     if (pk_cond && c0->op == CMP_EQ) {
         /* = -> 점 조회 O(log n). 같은 키의 버전 후보들 중 '보이는' 것만. */
         db->used_index = 1;
         PointCtx pc = {t, out, 0};
         btree_find_all(&t->index, c0->val.int_val, point_visit, &pc);
         count = pc.count;
-    } else if (pk_cond && (c0->op == CMP_GT || c0->op == CMP_GE || c0->op == CMP_LT ||
-                           c0->op == CMP_LE)) {
-        /* <, >, <=, >= -> 인덱스 범위 스캔 (리프 체인) */
+    } else if (pk_range && range_use_idx) {
+        /* <, >, <=, >= 이고 비용상 인덱스가 쌈 -> 인덱스 범위 스캔 (리프 체인) */
         db->used_index = 1;
         RangeCtx rc = {t, c0->val.int_val, c0->op, out, 0};
         if (c0->op == CMP_GT || c0->op == CMP_GE) {
@@ -2766,6 +2892,15 @@ int db_open(Database *db, const char *path) {
                         t->num_sec++;
                     }
                 }
+                /* 옵티마이저 통계 복원 (없던 옛 카탈로그면 fread 실패 -> stat_valid=0 유지) */
+                int32_t sv = 0;
+                if (fread(&sv, sizeof(int32_t), 1, f) == 1) {
+                    t->stat_valid = sv;
+                    if (fread(&t->stat_rows, sizeof(int64_t), 1, f) != 1) t->stat_valid = 0;
+                    if (fread(&t->stat_pages, sizeof(int64_t), 1, f) != 1) t->stat_valid = 0;
+                    if (fread(&t->stat_pk_min, sizeof(int64_t), 1, f) != 1) t->stat_valid = 0;
+                    if (fread(&t->stat_pk_max, sizeof(int64_t), 1, f) != 1) t->stat_valid = 0;
+                }
                 t->owner = db; /* 읽기 경로의 가시성 판정용 역참조 */
                 t->writer_txn = 0;
                 if (table_open_files(t, db->path) == 0) {
@@ -2885,6 +3020,7 @@ int db_exec(Database *db, const char *sql, FILE *out) {
         case STMT_COMMIT: rc = exec_commit(db, out); break;
         case STMT_ROLLBACK: rc = exec_rollback(db, out); break;
         case STMT_VACUUM: rc = exec_vacuum(db, &st.vac, out); break;
+        case STMT_ANALYZE: rc = exec_analyze(db, &st.analyze, out); break;
         case STMT_SESSION: /* 세션 전환 — 다중 트랜잭션 인터리브의 스위치 */
             if (st.sess.n < 0 || st.sess.n >= DB_MAX_SESSIONS) {
                 fprintf(out, "ERROR: 세션 번호는 0..%d 입니다\n", DB_MAX_SESSIONS - 1);

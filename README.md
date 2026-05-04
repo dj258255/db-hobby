@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (400 checks across 25 suites).
+covered by tests (412 checks across 26 suites).
 
 ![db-hobby REPL demo](docs/demo.svg)
 

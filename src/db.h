@@ -73,6 +73,13 @@ typedef struct {
     uint64_t txn_data_pages;  /* 쓰기 시작 시점 데이터 파일 페이지 수(롤백 복원용) */
     uint64_t txn_index_pages; /* 쓰기 시작 시점 인덱스 파일 페이지 수 */
 
+    /* 옵티마이저 통계 (ANALYZE가 채운다. PostgreSQL의 pg_statistic 축소판) */
+    int      stat_valid;  /* ANALYZE를 돌린 적 있나 */
+    int64_t  stat_rows;   /* 보이는 행 수 */
+    int64_t  stat_pages;  /* 힙 페이지 수(순차 스캔 비용 단위) */
+    int64_t  stat_pk_min; /* PK(첫 컬럼) 최소/최대 — 범위 선택도 추정용 */
+    int64_t  stat_pk_max;
+
     int writer_txn; /* 이 테이블에 미커밋 변경을 가진 트랜잭션(0=없음). 테이블 X락이
                      * "테이블당 writer 하나"를 보장 — 그래서 테이블별 WAL은 여전히
                      * 단일 트랜잭션만 보고, 14·15편의 복구가 무수정으로 성립한다. */

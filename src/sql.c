@@ -14,7 +14,7 @@ typedef enum {
     TOK_LT, TOK_GT, TOK_LE, TOK_GE, TOK_NE,
     TOK_CREATE, TOK_TABLE, TOK_INSERT, TOK_INTO, TOK_VALUES,
     TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_INT_TYPE, TOK_TEXT_TYPE,
-    TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK, TOK_VACUUM, TOK_SESSION,
+    TOK_BEGIN, TOK_COMMIT, TOK_ROLLBACK, TOK_VACUUM, TOK_SESSION, TOK_ANALYZE,
     TOK_DELETE, TOK_UPDATE, TOK_SET, TOK_AND, TOK_OR,
     TOK_ORDER, TOK_BY, TOK_ASC, TOK_DESC, TOK_LIMIT,
     TOK_JOIN, TOK_ON, TOK_GROUP, TOK_HAVING, TOK_LEFT, TOK_OUTER,
@@ -50,6 +50,7 @@ static TokType keyword_of(const char *s) {
     if (!strcasecmp(s, "ROLLBACK")) return TOK_ROLLBACK;
     if (!strcasecmp(s, "VACUUM")) return TOK_VACUUM;
     if (!strcasecmp(s, "SESSION")) return TOK_SESSION;
+    if (!strcasecmp(s, "ANALYZE")) return TOK_ANALYZE;
     if (!strcasecmp(s, "DELETE")) return TOK_DELETE;
     if (!strcasecmp(s, "UPDATE")) return TOK_UPDATE;
     if (!strcasecmp(s, "SET")) return TOK_SET;
@@ -740,6 +741,14 @@ int sql_parse(const char *sql, Statement *out, char *errbuf, size_t errlen) {
             p_advance(&p);
             if (p.cur.type == TOK_IDENT) {
                 snprintf(out->vac.table, sizeof(out->vac.table), "%s", p.cur.text);
+                p_advance(&p);
+            }
+            break;
+        case TOK_ANALYZE: /* ANALYZE [<table>] — 통계 수집 */
+            out->type = STMT_ANALYZE;
+            p_advance(&p);
+            if (p.cur.type == TOK_IDENT) {
+                snprintf(out->analyze.table, sizeof(out->analyze.table), "%s", p.cur.text);
                 p_advance(&p);
             }
             break;
