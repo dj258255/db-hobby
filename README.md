@@ -7,7 +7,7 @@ a hand-written SQL parser and executor, a write-ahead log, and transactions.
 
 This is a learning project. The goal isn't to invent something new; it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (396 checks across 24 suites).
+covered by tests (400 checks across 25 suites).
 
 ![db-hobby REPL demo](docs/demo.svg)
 
@@ -24,10 +24,15 @@ make repl            # build the REPL
 psql "host=127.0.0.1 port=5433 dbname=db-hobby"
 ```
 
-The `--serve` mode is a single-threaded `poll()` server that speaks PostgreSQL's
+The `--serve` mode is a **thread-per-connection** server that speaks PostgreSQL's
 v3 wire protocol, so **an actual `psql` connects to it** (tested against psql
-14.19). Each connection gets one of the multi-transaction sessions, so two `psql`
-windows demonstrate "readers don't block writers" over the network. (Simple query
+14.19). Each connection gets its own OS thread and one of the multi-transaction
+sessions, so two `psql` windows demonstrate "readers don't block writers" over
+the network. The buffer pool is thread-safe (a per-pool latch; the pin protocol
+protects the returned page data), verified by a pthreads stress test that runs
+clean under ThreadSanitizer. Execution itself is still serialized by one coarse
+engine latch -- finer-grained latching (B+Tree latch crabbing, a blocking lock
+manager, dropping the engine latch) is the remaining frontier. (Simple query
 only -- no extended/prepared protocol; SELECT rows are parsed from the executor's
 text output, so a `TEXT` value containing `" | "` splits columns.)
 

@@ -1,5 +1,6 @@
 CC ?= cc
 CFLAGS ?= -std=gnu11 -Wall -Wextra -g
+CFLAGS += -pthread   # 트랙 D: 버퍼 풀 latch·스레드 서버
 BUILD := build
 
 # 핵심 소스 (계층이 늘면 여기에 추가)
@@ -9,9 +10,14 @@ SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/b
 BINSRCS := src/server.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency
 
-.PHONY: test repl serve clean bench
+.PHONY: test repl serve clean bench test-tsan
+
+# 버퍼 풀 스레드 안전성을 ThreadSanitizer로 검사 (data race가 있으면 잡힌다)
+test-tsan: | $(BUILD)
+	$(CC) $(CFLAGS) -fsanitize=thread -Isrc tests/test_concurrency.c $(SRCS) -o $(BUILD)/test_concurrency_tsan
+	./$(BUILD)/test_concurrency_tsan
 
 test: $(addprefix $(BUILD)/, $(TESTS))
 	@for t in $(TESTS); do echo "=== $$t ==="; ./$(BUILD)/$$t || exit 1; echo; done

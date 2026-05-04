@@ -1,5 +1,6 @@
 #include "bufpool.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,6 +23,11 @@ struct BufferPool {
     int no_steal;          /* 트랜잭션 중: dirty 페이지를 교체 대상에서 제외 */
     bufpool_sink_fn steal_fn; /* no-steal 중 dirty 축출 시 부를 핸들러(WAL undo). NULL이면 옛 동작 */
     void *steal_ctx;
+    /* 트랙 D: 프레임 테이블(메타데이터)을 보호하는 latch. 반환된 페이지 데이터 자체는
+     * pin이 지킨다(pin>0이면 축출 안 되므로 mutex 밖에서 써도 안전) — 이게 pin 프로토콜.
+     * I/O(pager_read/write)도 이 latch 안에서 한다: 직렬화되지만 단순하고 정확하다.
+     * (진짜 DB는 "read-in-progress" 상태로 I/O를 latch 밖으로 뺀다.) */
+    pthread_mutex_t latch;
 };
 
 BufferPool *bufpool_create(Pager *pager, size_t num_frames) {
@@ -37,12 +43,13 @@ BufferPool *bufpool_create(Pager *pager, size_t num_frames) {
         free(bp);
         return NULL;
     }
+    pthread_mutex_init(&bp->latch, NULL);
     bp->pager = pager;
     bp->num_frames = num_frames;
     return bp;
 }
 
-/* page_id를 담은 프레임을 찾는다. 없으면 NULL. (학습용이라 선형 탐색 —
+/* page_id를 담은 프레임을 찾는다. 없으면 NULL. (latch 보유 가정. 학습용이라 선형 탐색 —
  * 진짜 DB는 page_id -> frame 해시 테이블을 둔다.) */
 static Frame *find_frame(BufferPool *bp, page_id_t page_id) {
     for (size_t i = 0; i < bp->num_frames; i++) {
@@ -53,7 +60,7 @@ static Frame *find_frame(BufferPool *bp, page_id_t page_id) {
     return NULL;
 }
 
-/* 새 페이지를 올릴 프레임을 고른다: 빈 프레임 우선, 없으면 LRU victim.
+/* 새 페이지를 올릴 프레임을 고른다: 빈 프레임 우선, 없으면 LRU victim. (latch 보유 가정)
  * victim이 dirty면 디스크로 flush한다. 모두 pin되어 있으면 NULL. */
 static Frame *pick_frame(BufferPool *bp) {
     /* 1) 빈 프레임 */
@@ -62,9 +69,7 @@ static Frame *pick_frame(BufferPool *bp) {
             return &bp->frames[i];
         }
     }
-    /* 2) LRU victim: pin 안 된 것 중 last_used가 가장 작은 것.
-     * no-steal이고 steal 핸들러가 없으면 dirty는 제외(옛 동작). 핸들러가 있으면
-     * dirty도 후보 — 축출할 때 핸들러가 undo 로깅 후 디스크로 내보낸다(steal). */
+    /* 2) LRU victim: pin 안 된 것 중 last_used가 가장 작은 것. */
     int can_steal_dirty = !bp->no_steal || bp->steal_fn != NULL;
     Frame *victim = NULL;
     for (size_t i = 0; i < bp->num_frames; i++) {
@@ -84,7 +89,6 @@ static Frame *pick_frame(BufferPool *bp) {
     }
     if (victim->dirty) {
         if (bp->no_steal && bp->steal_fn) {
-            /* STEAL: 핸들러가 WAL undo 로깅 + 디스크 쓰기까지 책임진다. */
             if (bp->steal_fn(victim->page_id, victim->data, bp->steal_ctx) != 0) {
                 return NULL;
             }
@@ -97,116 +101,134 @@ static Frame *pick_frame(BufferPool *bp) {
     return victim;
 }
 
-void *bufpool_fetch(BufferPool *bp, page_id_t page_id) {
+/* latch 보유 상태에서 page_id 프레임을 확보한다(hit면 pin, miss면 load). */
+static Frame *fetch_locked(BufferPool *bp, page_id_t page_id) {
     Frame *f = find_frame(bp, page_id);
     if (f) {
-        /* cache hit */
         bp->hits++;
         f->pin_count++;
         f->last_used = ++bp->clock;
-        return f->data;
+        return f;
     }
-    /* cache miss */
     bp->misses++;
     f = pick_frame(bp);
     if (!f) {
         return NULL;
     }
     if (pager_read(bp->pager, page_id, f->data) != 0) {
-        return NULL;
+        return NULL; /* f는 이미 valid=0(빈 프레임) 상태 */
     }
     f->page_id = page_id;
     f->valid = 1;
     f->dirty = 0;
     f->pin_count = 1;
     f->last_used = ++bp->clock;
-    return f->data;
+    return f;
+}
+
+void *bufpool_fetch(BufferPool *bp, page_id_t page_id) {
+    pthread_mutex_lock(&bp->latch);
+    Frame *f = fetch_locked(bp, page_id);
+    void *ret = f ? f->data : NULL;
+    pthread_mutex_unlock(&bp->latch);
+    return ret;
 }
 
 void *bufpool_new_page(BufferPool *bp, page_id_t *page_id_out) {
-    page_id_t id = pager_allocate(bp->pager); /* 디스크에 0으로 찬 페이지 확보 */
-    if (id == PAGE_ID_INVALID) {
-        return NULL;
+    pthread_mutex_lock(&bp->latch);
+    void *ret = NULL;
+    page_id_t id = pager_allocate(bp->pager); /* latch가 num_pages 경쟁도 막는다 */
+    if (id != PAGE_ID_INVALID) {
+        Frame *f = fetch_locked(bp, id);
+        if (f) {
+            ret = f->data;
+            if (page_id_out) *page_id_out = id;
+        }
     }
-    void *data = bufpool_fetch(bp, id); /* 그 페이지를 풀에 올린다 */
-    if (!data) {
-        return NULL;
-    }
-    if (page_id_out) {
-        *page_id_out = id;
-    }
-    return data;
+    pthread_mutex_unlock(&bp->latch);
+    return ret;
 }
 
 void bufpool_unpin(BufferPool *bp, page_id_t page_id, int is_dirty) {
+    pthread_mutex_lock(&bp->latch);
     Frame *f = find_frame(bp, page_id);
-    if (!f) {
-        return;
+    if (f) {
+        if (is_dirty) {
+            f->dirty = 1;
+        }
+        if (f->pin_count > 0) {
+            f->pin_count--;
+        }
     }
-    if (is_dirty) {
-        f->dirty = 1;
-    }
-    if (f->pin_count > 0) {
-        f->pin_count--;
-    }
+    pthread_mutex_unlock(&bp->latch);
 }
 
 int bufpool_flush_all(BufferPool *bp) {
+    pthread_mutex_lock(&bp->latch);
+    int rc = 0;
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
         if (f->valid && f->dirty) {
-            if (pager_write(bp->pager, f->page_id, f->data) != 0) {
-                return -1;
-            }
+            if (pager_write(bp->pager, f->page_id, f->data) != 0) { rc = -1; break; }
             f->dirty = 0;
         }
     }
-    return 0;
+    pthread_mutex_unlock(&bp->latch);
+    return rc;
 }
 
 int bufpool_flush_cb(BufferPool *bp, bufpool_sink_fn sink, void *ctx) {
+    pthread_mutex_lock(&bp->latch);
     int n = 0;
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
         if (f->valid && f->dirty) {
-            if (sink(f->page_id, f->data, ctx) != 0) {
-                return -1;
-            }
+            if (sink(f->page_id, f->data, ctx) != 0) { n = -1; break; }
             f->dirty = 0; /* WAL이 받아갔으니 풀에선 clean. 적용은 WAL이 한다. */
             n++;
         }
     }
+    pthread_mutex_unlock(&bp->latch);
     return n;
 }
 
 void bufpool_set_no_steal(BufferPool *bp, int on) {
+    pthread_mutex_lock(&bp->latch);
     bp->no_steal = on;
+    pthread_mutex_unlock(&bp->latch);
 }
 
 void bufpool_set_steal_handler(BufferPool *bp, bufpool_sink_fn fn, void *ctx) {
+    pthread_mutex_lock(&bp->latch);
     bp->steal_fn = fn;
     bp->steal_ctx = ctx;
+    pthread_mutex_unlock(&bp->latch);
 }
 
 void bufpool_discard_dirty(BufferPool *bp) {
+    pthread_mutex_lock(&bp->latch);
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
         if (f->valid && f->dirty) {
-            f->valid = 0; /* 디스크에 안 쓰고 무효화 -> 다음 fetch가 원본을 읽는다 */
+            f->valid = 0;
             f->dirty = 0;
         }
     }
+    pthread_mutex_unlock(&bp->latch);
 }
 
 void bufpool_invalidate_all(BufferPool *bp) {
+    pthread_mutex_lock(&bp->latch);
     for (size_t i = 0; i < bp->num_frames; i++) {
         bp->frames[i].valid = 0;
         bp->frames[i].dirty = 0;
         bp->frames[i].pin_count = 0;
     }
+    pthread_mutex_unlock(&bp->latch);
 }
 
 void bufpool_invalidate_from(BufferPool *bp, page_id_t first) {
+    pthread_mutex_lock(&bp->latch);
     for (size_t i = 0; i < bp->num_frames; i++) {
         Frame *f = &bp->frames[i];
         if (f->valid && f->page_id >= first) {
@@ -215,6 +237,7 @@ void bufpool_invalidate_from(BufferPool *bp, page_id_t first) {
             f->pin_count = 0;
         }
     }
+    pthread_mutex_unlock(&bp->latch);
 }
 
 void bufpool_destroy(BufferPool *bp) {
@@ -222,12 +245,13 @@ void bufpool_destroy(BufferPool *bp) {
         return;
     }
     bufpool_flush_all(bp);
+    pthread_mutex_destroy(&bp->latch);
     free(bp->frames);
     free(bp);
 }
 
 size_t bufpool_hits(const BufferPool *bp) {
-    return bp->hits;
+    return bp->hits; /* 통계 — 경합 없는 관찰용이라 latch 생략 */
 }
 
 size_t bufpool_misses(const BufferPool *bp) {
