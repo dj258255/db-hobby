@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="430" viewBox="0 0 1000 430" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
+  <rect width="1000" height="430" rx="12" fill="#0d1117"/>
+  <text x="500" y="32" text-anchor="middle" fill="#8b949e" font-family="ui-sans-serif, system-ui, sans-serif" font-size="17">진짜 psql 두 개가 동시에 붙는다 — reader가 writer를 안 막는다 (MVCC)</text>
+
+  <!-- 터미널 A (writer) -->
+  <rect x="30" y="56" width="460" height="330" rx="10" fill="#010409" stroke="#1f6feb"/>
+  <rect x="30" y="56" width="460" height="26" rx="10" fill="#13283f"/>
+  <circle cx="48" cy="69" r="5" fill="#f85149"/><circle cx="66" cy="69" r="5" fill="#f0b429"/><circle cx="84" cy="69" r="5" fill="#3fb950"/>
+  <text x="250" y="73" text-anchor="middle" fill="#58a6ff" font-size="12">터미널 A — writer (psql)</text>
+  <g font-size="12.5">
+    <text x="46" y="108" fill="#3fb950">db-hobby=&gt;</text><text x="120" y="108" fill="#c9d1d9">BEGIN;</text>
+    <text x="46" y="132" fill="#3fb950">db-hobby=*&gt;</text><text x="128" y="132" fill="#c9d1d9">UPDATE t SET v=999 WHERE id=1;</text>
+    <text x="46" y="152" fill="#8b949e">1개 행 수정됨</text>
+    <text x="46" y="176" fill="#6e7681">-- 아직 커밋 안 함 (프롬프트 =*&gt; = 트랜잭션 중)</text>
+    <text x="46" y="212" fill="#6e7681">-- ... B가 읽고 쓰기 시도하는 동안 ...</text>
+    <text x="46" y="256" fill="#3fb950">db-hobby=*&gt;</text><text x="128" y="256" fill="#c9d1d9">COMMIT;</text>
+    <text x="46" y="276" fill="#8b949e">커밋됨</text>
+  </g>
+
+  <!-- 터미널 B (reader) -->
+  <rect x="510" y="56" width="460" height="330" rx="10" fill="#010409" stroke="#238636"/>
+  <rect x="510" y="56" width="460" height="26" rx="10" fill="#0e1b12"/>
+  <circle cx="528" cy="69" r="5" fill="#f85149"/><circle cx="546" cy="69" r="5" fill="#f0b429"/><circle cx="564" cy="69" r="5" fill="#3fb950"/>
+  <text x="740" y="73" text-anchor="middle" fill="#3fb950" font-size="12">터미널 B — reader (psql)</text>
+  <g font-size="12.5">
+    <text x="526" y="108" fill="#3fb950">db-hobby=&gt;</text><text x="600" y="108" fill="#c9d1d9">SELECT * FROM t WHERE id=1;</text>
+    <text x="540" y="130" fill="#c9d1d9"> id | v</text>
+    <text x="540" y="148" fill="#c9d1d9">----+-----</text>
+    <text x="540" y="166" fill="#58a6ff">  1 | 100</text><text x="640" y="166" fill="#6e7681">← 안 막힘! 옛 버전 (dirty read 없음)</text>
+    <text x="526" y="198" fill="#3fb950">db-hobby=&gt;</text><text x="600" y="198" fill="#c9d1d9">UPDATE t SET v=555 WHERE id=1;</text>
+    <text x="526" y="220" fill="#f85149">ERROR: 't'가 다른 트랜잭션에 잠김 (쓰기 충돌)</text>
+    <text x="640" y="240" fill="#6e7681">← 쓰기만 first-updater-wins</text>
+    <text x="526" y="276" fill="#3fb950">db-hobby=&gt;</text><text x="600" y="276" fill="#c9d1d9">SELECT * FROM t WHERE id=1;</text>
+    <text x="540" y="298" fill="#c9d1d9"> id | v</text>
+    <text x="540" y="316" fill="#c9d1d9">----+-----</text>
+    <text x="540" y="334" fill="#3fb950">  1 | 999</text><text x="640" y="334" fill="#6e7681">← A 커밋 후엔 새 값</text>
+  </g>
+
+  <text x="500" y="410" text-anchor="middle" fill="#6e7681" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12.5">./build/db-hobby my.db --serve 5433  ·  PostgreSQL v3 wire protocol  ·  커넥션당 스레드  ·  실제 psql 14.19로 검증</text>
+</svg>

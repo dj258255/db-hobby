@@ -1,13 +1,31 @@
 # db-hobby
 
-A small relational database written from scratch in C, built to dissect how
-PostgreSQL and MySQL actually work inside. It goes from raw fixed-size pages all
-the way up to running SQL: page storage, a buffer pool, a heap, a B+Tree index,
-a hand-written SQL parser and executor, a write-ahead log, and transactions.
+A small relational database written from scratch in C — one that **an actual
+`psql` connects to**, with **MVCC snapshot isolation where readers don't block
+writers**, WAL crash recovery, VACUUM, a thread-safe buffer pool, and a
+cost-based query planner. Built from raw fixed-size pages all the way up to
+running SQL, to dissect how PostgreSQL and MySQL actually work inside.
 
-This is a learning project. The goal isn't to invent something new; it's to
+![db-hobby: two psql clients, readers don't block writers](docs/psql-demo.svg)
+
+Two real `psql` clients above, interleaving over the PostgreSQL wire protocol:
+while A holds an uncommitted `UPDATE`, B reads the **old** version (not blocked),
+a second writer is rejected (first-updater-wins), and after A commits B sees the
+new value. That's MVCC — and it's a 400-line server speaking Postgres's protocol,
+so psql can't tell the difference.
+
+It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (425 checks across 28 suites).
+covered by tests (**425 checks across 28 suites**), and the concurrency is
+verified under ThreadSanitizer. The 23-part build log is at
+[IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
+
+**What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
+B+Tree (+ concurrent latch-crabbing variant) · hand-written SQL parser & executor ·
+joins (nested-loop / index / hash) · aggregates · WAL with **steal + no-force**
+recovery · **MVCC** (xmin/xmax, snapshot isolation, VACUUM) · multi-transaction
+sessions · a **PostgreSQL-wire server** · a **cost-based optimizer** (ANALYZE,
+selectivity). Heap (PG) vs clustered (InnoDB) storage is benchmarked side by side.
 
 ![db-hobby REPL demo](docs/demo.svg)
 
