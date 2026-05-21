@@ -14,11 +14,8 @@ typedef struct {
     uint8_t data[PAGE_SIZE];
 } StagedPage;
 
-/* 레코드 공통 머리: type(1B) + lsn(8B). 그 뒤에 타입별 payload. */
-#define REC_PAGE 'P'   /* pid + after-image (redo) */
-#define REC_COMMIT 'C' /* 커밋 마커 */
-#define REC_BEGIN 'B'  /* base_pages (steal이 처음 일어날 때 한 번) */
-#define REC_UNDO 'U'   /* pid + before-image (undo) */
+/* 레코드 타입(REC_PAGE/COMMIT/BEGIN/UNDO)과 포맷은 wal.h에 정의 — 복제와 공유한다.
+ * 공통 머리: type(1B) + lsn(8B), 그 뒤 타입별 payload. */
 
 /* no-force라 로그가 커밋 이력으로 자란다. 이 크기를 넘으면 커밋 끝에 체크포인트
  * (데이터 fsync -> 로그 truncate)로 자른다. 복구 시간과 로그 크기의 상한. */

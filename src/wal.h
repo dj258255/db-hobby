@@ -31,6 +31,18 @@
 
 #define WAL_MAX_STAGED 64
 
+/* WAL 레코드 포맷 (복구·복제가 공유하는 단일 진실 원천).
+ * 모든 레코드 = type(1B) + lsn(8B) + 타입별 payload.
+ *   REC_PAGE   : pid(8B) + after-image(PAGE_SIZE)  — redo용. 커밋 구간에 쌓인다.
+ *   REC_COMMIT : payload 없음                        — 커밋 마커.
+ *   REC_BEGIN  : base_pages(8B)                      — steal 최초 1회(undo truncate 기준).
+ *   REC_UNDO   : pid(8B) + before-image(PAGE_SIZE)   — undo용.
+ * 복제(replica)는 이 스트림에서 커밋된 구간의 REC_PAGE를 순서대로 재적용한다. */
+#define REC_PAGE 'P'
+#define REC_COMMIT 'C'
+#define REC_BEGIN 'B'
+#define REC_UNDO 'U'
+
 typedef struct {
     Pager data;   /* 데이터 파일 */
     int log_fd;   /* 로그 파일 */
