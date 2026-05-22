@@ -34,6 +34,7 @@ typedef struct {
     int alive[RAFT_MAX_NODES];
     int64_t applied[RAFT_MAX_NODES][MAXLOG]; /* applied[node][index] = command */
     int64_t applied_hi[RAFT_MAX_NODES];      /* 적용한 마지막 인덱스 */
+    int64_t sm[RAFT_MAX_NODES];              /* 레지스터 상태기계 = 마지막 적용 커맨드 값 */
     RaftMsg q[QCAP];
     int qhead, qtail;
 } Cluster;
@@ -42,10 +43,19 @@ static Cluster g; /* 단일 스레드 테스트 — 전역이면 apply 콜백이
 
 static void on_apply(int id, int64_t index, int64_t command, void *ctx) {
     (void)ctx;
+    g.sm[id] = command; /* 레지스터 SM: 마지막 적용 커맨드가 곧 상태 */
     if (index < MAXLOG) {
         g.applied[id][index] = command;
         if (index > g.applied_hi[id]) g.applied_hi[id] = index;
     }
+}
+
+/* InstallSnapshot 수신 시 SM에 스냅샷을 설치(§7): 레지스터 값을 통째로 얹고
+ * 적용 인덱스를 스냅샷 지점으로 점프한다(중간 인덱스를 하나씩 적용하지 않음). */
+static void on_snap_install(int id, int64_t last_index, int64_t value, void *ctx) {
+    (void)ctx;
+    g.sm[id] = value;
+    if (last_index > g.applied_hi[id]) g.applied_hi[id] = last_index;
 }
 
 static void qpush(RaftMsg m) {
@@ -68,6 +78,7 @@ static void cluster_init(int n) {
         /* 서로 다른 선거 타임아웃 -> '누가 먼저 타임아웃하나'가 결정적.
          * 노드 i = 6 + 4i (6,10,14,...), 하트비트 2(<최소 선거) -> 리더가 권위 유지. */
         raft_init(&g.nodes[i], i, n, 6 + 4 * i, 2, on_apply, &g);
+        g.nodes[i].snap_install = on_snap_install; /* §7 스냅샷 설치 콜백 */
         g.alive[i] = 1;
         g.applied_hi[i] = 0;
         for (int j = 0; j < n; j++) g.connected[i][j] = 1;
@@ -331,6 +342,96 @@ int main(void) {
               "지속성: 로그 길이·term 일치");
         CHECK(R.log[1].command == 42 && R.log[2].command == 43,
               "지속성: 엔트리 순서·값(42,43) 보존");
+        raft_free(&R);
+        unlink(path);
+    }
+
+    /* ── 8. 스냅샷(§7): 로그 압축 후에도 복제·커밋이 정확 (log_base>0 전 경로) ──
+     * 압축은 인덱스에 base 오프셋을 도입한다. 압축 '후' 새 엔트리를 복제·커밋해
+     * send_append_entries·handle_append_entries·leader_advance_commit·apply가
+     * log_base>0에서 모두 옳게 도는지 관통 검증한다. */
+    {
+        cluster_init(3);
+        cluster_run(20);
+        int lead = find_leader();
+        for (int64_t v = 1; v <= 5; v++) raft_submit(&g.nodes[lead], 100 + v);
+        cluster_run(20);
+        CHECK(g.nodes[lead].commit_index == 5, "스냅샷: 5개 커밋(압축 전)");
+        int64_t before_len = g.nodes[lead].log_len;
+        CHECK(raft_snapshot(&g.nodes[lead], 5, g.sm[lead]) == 0, "스냅샷: index5까지 압축 성공");
+        CHECK(g.nodes[lead].log_base == 5, "스냅샷: log_base가 5로 전진");
+        CHECK(g.nodes[lead].log_len < before_len, "스냅샷: 물리 로그 길이 축소");
+        CHECK(raft_last_log_index(&g.nodes[lead]) == 5, "스냅샷: 논리 마지막 인덱스 보존(5)");
+        CHECK(raft_snapshot(&g.nodes[lead], 5, g.sm[lead]) == -1,
+              "스냅샷: 이미 압축된 지점 재압축은 거부");
+
+        /* 압축 후 새 커맨드 -> log_base>0에서 복제·커밋 (전 경로 관통) */
+        raft_submit(&g.nodes[lead], 999);
+        cluster_run(20);
+        CHECK(g.nodes[lead].commit_index == 6, "스냅샷: 압축 후 새 엔트리(6) 커밋");
+        int sok = 1, cok = 1;
+        for (int i = 0; i < 3; i++) {
+            if (g.sm[i] != 999) sok = 0;
+            if (g.nodes[i].commit_index != 6) cok = 0;
+        }
+        CHECK(sok, "스냅샷: 압축 후에도 모든 노드 SM 수렴(999)");
+        CHECK(cok, "스냅샷: 팔로워들도 commit_index=6");
+    }
+
+    /* ── 9. 스냅샷(§7): 뒤처진 팔로워가 InstallSnapshot으로 따라잡는다 ──
+     * 리더가 팔로워가 필요로 하는 엔트리를 이미 압축해 버렸으면 AppendEntries로는
+     * 못 보낸다 -> 스냅샷을 통째로 전송(InstallSnapshot). */
+    {
+        cluster_init(3);
+        cluster_run(20);
+        int lead = find_leader();
+        int lag = (lead + 1) % 3;
+        /* 팔로워를 크래시(다운) — 이후 커밋을 통째로 놓친다. */
+        g.alive[lag] = 0;
+        raft_crash_restart(&g.nodes[lag]);
+        for (int64_t v = 1; v <= 6; v++) raft_submit(&g.nodes[lead], 500 + v);
+        cluster_run(25); /* 남은 과반(리더+1)으로 커밋 */
+        CHECK(g.nodes[lead].commit_index == 6, "InstallSnapshot: 다수파로 6개 커밋(lag는 못 받음)");
+        /* 리더가 압축 -> lag가 필요로 하는 엔트리(1..6)가 사라진다. */
+        raft_snapshot(&g.nodes[lead], g.nodes[lead].commit_index, g.sm[lead]);
+        CHECK(g.nodes[lead].log_base == 6, "InstallSnapshot: 리더 압축(log_base=6)");
+        CHECK(g.sm[lag] != g.sm[lead], "InstallSnapshot: 크래시된 팔로워는 아직 뒤처짐");
+
+        /* 재시작 -> next_index[lag]-1 < log_base 이므로 리더가 InstallSnapshot 전송 */
+        g.alive[lag] = 1;
+        cluster_run(40);
+        CHECK(g.nodes[lag].log_base == 6, "InstallSnapshot: 팔로워가 스냅샷 설치(log_base 점프)");
+        CHECK(g.sm[lag] == g.sm[lead], "InstallSnapshot: 팔로워 SM이 리더와 일치(catch-up)");
+        CHECK(g.nodes[lag].commit_index == g.nodes[lead].commit_index,
+              "InstallSnapshot: commit_index 일치");
+    }
+
+    /* ── 10. 스냅샷+지속성: 재기동 시 스냅샷 상태를 SM에 복원한다 ──
+     * log_base>0 노드를 디스크에 저장 후 새 노드로 load하면, 1..log_base 엔트리는
+     * 압축돼 사라졌으므로 재적용으론 SM을 못 채운다 -> raft_load가 snap_install로
+     * 스냅샷 값을 SM에 직접 시드해야 한다(안 그러면 그 구간 상태가 영구히 빔). */
+    {
+        const char *path = "build/test_raft_snap.dat";
+        unlink(path);
+        cluster_init(3);
+        cluster_run(20);
+        int lead = find_leader();
+        for (int64_t v = 1; v <= 4; v++) raft_submit(&g.nodes[lead], 700 + v);
+        cluster_run(20);
+        raft_snapshot(&g.nodes[lead], 4, g.sm[lead]); /* log_base=4, snapshot_value=704 */
+        CHECK(g.nodes[lead].log_base == 4, "스냅샷+지속: 리더 압축(log_base=4)");
+        CHECK(raft_save(&g.nodes[lead], path) == 0, "스냅샷+지속: 스냅샷 노드 저장");
+
+        g.sm[0] = -1; /* SM을 오염시켜 load가 다시 시드하는지 확인 */
+        Raft R;
+        raft_init(&R, 0, 3, 10, 2, on_apply, &g);
+        R.snap_install = on_snap_install;
+        CHECK(raft_load(&R, path) == 0, "스냅샷+지속: load 성공");
+        CHECK(R.log_base == 4 && R.snapshot_value == 704,
+              "스냅샷+지속: log_base·snapshot_value 복원");
+        CHECK(g.sm[0] == 704, "스냅샷+지속: raft_load가 SM에 스냅샷을 시드(704)");
+        CHECK(R.commit_index == 4 && R.last_applied == 4,
+              "스냅샷+지속: commit/applied 하한 = log_base");
         raft_free(&R);
         unlink(path);
     }

@@ -51,7 +51,9 @@ typedef enum {
     MSG_REQUEST_VOTE,
     MSG_REQUEST_VOTE_REPLY,
     MSG_APPEND_ENTRIES,
-    MSG_APPEND_ENTRIES_REPLY
+    MSG_APPEND_ENTRIES_REPLY,
+    MSG_INSTALL_SNAPSHOT,       /* 리더가 압축돼 사라진 prefix를 스냅샷으로 보냄(§7) */
+    MSG_INSTALL_SNAPSHOT_REPLY
 } RaftMsgType;
 
 /* 한 RPC(또는 그 응답). 학습용이라 union 대신 넉넉한 평면 구조체로 복사해 나른다. */
@@ -77,6 +79,11 @@ typedef struct {
     /* AppendEntriesReply */
     int success;
     int64_t match_index;        /* 성공 시 팔로워가 확정한 마지막 인덱스 */
+
+    /* InstallSnapshot (§7) */
+    int64_t last_included_index; /* 스냅샷이 담은 마지막 인덱스 */
+    uint64_t last_included_term; /* 그 인덱스의 term */
+    int64_t snapshot_value;      /* 상태기계 스냅샷(학습용: 레지스터 SM의 값 하나) */
 } RaftMsg;
 
 /* 노드가 이번 tick/수신에서 '보내고 싶은' 메시지들을 담는 봉투. 하버스가 라우팅한다. */
@@ -89,6 +96,10 @@ typedef struct {
  * 기록해 '모든 노드가 같은 순서로 같은 커맨드를 적용했나'(합의)를 검증한다. */
 typedef void (*RaftApplyFn)(int node_id, int64_t index, int64_t command, void *ctx);
 
+/* InstallSnapshot을 받았을 때, 상태기계에 스냅샷을 설치하라고 부르는 콜백(§7).
+ * 학습용 레지스터 SM에선 값 하나(sm_state)를 통째로 얹고 인덱스를 점프한다. */
+typedef void (*RaftSnapInstallFn)(int node_id, int64_t last_index, int64_t sm_state, void *ctx);
+
 typedef struct {
     int id;
     int n_nodes;                /* 클러스터 크기(과반 계산용) */
@@ -96,9 +107,13 @@ typedef struct {
     /* ---- 지속 상태(persistent): 크래시에도 살아남아야 한다 ---- */
     uint64_t current_term;
     int voted_for;              /* 이번 term에 표를 준 노드 id, 없으면 -1 */
-    RaftEntry *log;             /* 1-indexed. log[0]은 sentinel(term 0) */
-    int64_t log_len;            /* sentinel 포함 길이. 마지막 인덱스 = log_len-1 */
+    RaftEntry *log;             /* log[0]은 base 마커. 논리 인덱스 i = log[i - log_base] */
+    int64_t log_len;            /* 마커 포함 물리 길이 */
     int64_t log_cap;
+    /* 스냅샷(§7): log[0]은 논리 인덱스 log_base를 대표하고 그 term=lastIncludedTerm.
+     * log_base 이전 엔트리는 압축돼 사라졌고 snapshot_value가 그 상태를 대신한다. */
+    int64_t log_base;           /* log[0]이 대표하는 논리 인덱스(=마지막 스냅샷 인덱스) */
+    int64_t snapshot_value;     /* log_base 시점의 상태기계 스냅샷(레지스터 SM 값) */
 
     /* ---- 휘발 상태(volatile): 크래시 시 초기화 ---- */
     RaftRole role;
@@ -117,6 +132,7 @@ typedef struct {
     int heartbeat_timeout;      /* 리더가 이 주기로 AppendEntries(하트비트) */
 
     RaftApplyFn apply;
+    RaftSnapInstallFn snap_install; /* InstallSnapshot 수신 시 SM에 스냅샷 설치 */
     void *apply_ctx;
 } Raft;
 
@@ -150,6 +166,12 @@ int raft_save(const Raft *r, const char *path);
 /* raft_init으로 초기화된 노드에 디스크의 지속 상태를 되읽는다. 휘발 상태는
  * init 기본값 그대로(§5.1: 크래시 시 volatile은 잃어도 됨). 0 성공, -1 실패. */
 int raft_load(Raft *r, const char *path);
+
+/* 로그 압축(§7): index까지의 로그를 버리고 스냅샷으로 대체한다. index는 이미
+ * 커밋·적용된 지점이어야 한다(index <= commit_index, index > log_base). sm_state는
+ * 그 시점의 상태기계 스냅샷(레지스터 SM 값). 이후 log[0]이 index를 대표하고,
+ * index+1.. 엔트리만 남는다. 성공 0, 조건 불만족 -1. */
+int raft_snapshot(Raft *r, int64_t index, int64_t sm_state);
 
 /* 관측용 헬퍼. */
 int64_t raft_last_log_index(const Raft *r);

@@ -7,13 +7,24 @@
 #include <string.h>
 #include <unistd.h>
 
-/* ── 로그 헬퍼 (log[0]은 term 0 sentinel, 실제 엔트리는 1-indexed) ── */
+/* ── 로그 헬퍼 ──
+ * 스냅샷(§7) 이후 로그는 base 오프셋을 가진다: 논리 인덱스 i의 엔트리는 물리
+ * 위치 log[i - log_base]에 산다. log[0]은 논리 인덱스 log_base를 대표하는 마커
+ * (term=lastIncludedTerm). log_base=0이면 변환은 무연산이라 예전과 동일하다. */
 
 int64_t raft_last_log_index(const Raft *r) {
-    return r->log_len - 1;
+    return r->log_base + r->log_len - 1; /* 마지막 논리 인덱스 */
 }
 uint64_t raft_last_log_term(const Raft *r) {
-    return r->log[r->log_len - 1].term;
+    return r->log[r->log_len - 1].term; /* 물리 마지막 = 논리 마지막 */
+}
+/* 논리 인덱스 i(>= log_base)의 term. */
+static uint64_t term_at(const Raft *r, int64_t i) {
+    return r->log[i - r->log_base].term;
+}
+/* 논리 인덱스 i(>= log_base)의 엔트리 포인터. */
+static RaftEntry *ent(Raft *r, int64_t i) {
+    return &r->log[i - r->log_base];
 }
 
 static int log_append(Raft *r, RaftEntry e) {
@@ -60,8 +71,34 @@ static void step_down_if_higher(Raft *r, uint64_t term) {
     }
 }
 
+static void push_msg(RaftOutbox *out, const RaftMsg *m) {
+    if (out->n < (int)(sizeof(out->m) / sizeof(out->m[0]))) {
+        out->m[out->n++] = *m;
+    }
+}
+
+/* 리더가 압축된 prefix를 스냅샷으로 통째로 보낸다(§7). */
+static void send_install_snapshot(Raft *r, int peer, RaftOutbox *out) {
+    RaftMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = MSG_INSTALL_SNAPSHOT;
+    m.from = r->id;
+    m.to = peer;
+    m.term = r->current_term;
+    m.last_included_index = r->log_base;
+    m.last_included_term = r->log[0].term;
+    m.snapshot_value = r->snapshot_value;
+    push_msg(out, &m);
+}
+
 static void send_append_entries(Raft *r, int peer, RaftOutbox *out) {
     int64_t prev = r->next_index[peer] - 1;
+    /* 팔로워가 필요로 하는 prev가 우리 로그에서 이미 압축돼 사라졌다면(<log_base),
+     * AppendEntries로는 보낼 수 없다 -> 스냅샷을 통째로 보낸다. */
+    if (prev < r->log_base) {
+        send_install_snapshot(r, peer, out);
+        return;
+    }
     RaftMsg m;
     memset(&m, 0, sizeof(m));
     m.type = MSG_APPEND_ENTRIES;
@@ -69,17 +106,15 @@ static void send_append_entries(Raft *r, int peer, RaftOutbox *out) {
     m.to = peer;
     m.term = r->current_term;
     m.prev_log_index = prev;
-    m.prev_log_term = r->log[prev].term;
+    m.prev_log_term = term_at(r, prev);
     m.leader_commit = r->commit_index;
     int n = 0;
     for (int64_t idx = r->next_index[peer]; idx <= raft_last_log_index(r) && n < RAFT_MAX_BATCH;
          idx++) {
-        m.entries[n++] = r->log[idx];
+        m.entries[n++] = *ent(r, idx);
     }
     m.n_entries = n;
-    if (out->n < (int)(sizeof(out->m) / sizeof(out->m[0]))) {
-        out->m[out->n++] = m;
-    }
+    push_msg(out, &m);
 }
 
 static void become_leader(Raft *r, RaftOutbox *out) {
@@ -131,7 +166,7 @@ static void apply_committed(Raft *r) {
     while (r->last_applied < r->commit_index) {
         r->last_applied++;
         if (r->apply) {
-            r->apply(r->id, r->last_applied, r->log[r->last_applied].command, r->apply_ctx);
+            r->apply(r->id, r->last_applied, ent(r, r->last_applied)->command, r->apply_ctx);
         }
     }
 }
@@ -265,16 +300,23 @@ static void handle_append_entries(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
     if (msg->prev_log_index > raft_last_log_index(r)) {
         return; /* 내 로그가 짧다 -> 실패(리더가 next_index를 낮춰 재시도) */
     }
-    if (r->log[msg->prev_log_index].term != msg->prev_log_term) {
-        return; /* prev에서 term 불일치 -> 실패 */
+    if (msg->prev_log_index >= r->log_base) {
+        if (term_at(r, msg->prev_log_index) != msg->prev_log_term) {
+            return; /* prev에서 term 불일치 -> 실패 */
+        }
     }
+    /* prev < log_base면 그 지점은 내 스냅샷 안이라 term 검증 불가하지만, 스냅샷이
+     * 그 prefix를 이미 보장하므로 통과시키고 아래에서 log_base 이하 엔트리는 건너뛴다. */
 
     /* 엔트리 이어붙이기: 충돌(term 다름)이 나는 첫 지점부터 꼬리를 덮어쓴다. */
     for (int i = 0; i < msg->n_entries; i++) {
         int64_t idx = msg->prev_log_index + 1 + i;
+        if (idx <= r->log_base) {
+            continue; /* 이미 스냅샷에 담긴 인덱스 -> 건너뜀 */
+        }
         if (idx <= raft_last_log_index(r)) {
-            if (r->log[idx].term != msg->entries[i].term) {
-                r->log_len = idx; /* 충돌 꼬리 절단 */
+            if (term_at(r, idx) != msg->entries[i].term) {
+                r->log_len = idx - r->log_base; /* 충돌 꼬리 절단(물리 길이) */
                 log_append(r, msg->entries[i]);
             }
             /* 같으면 이미 가진 엔트리 -> 유지(커밋된 걸 지우지 않기 위함) */
@@ -296,8 +338,9 @@ static void handle_append_entries(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
 /* 리더가 과반 복제를 확인해 commit_index를 올린다(§5.3, §5.4.2 현재-term 규칙). */
 static void leader_advance_commit(Raft *r) {
     for (int64_t N = raft_last_log_index(r); N > r->commit_index; N--) {
-        /* §5.4.2: 리더는 '현재 term'의 엔트리가 과반에 닿을 때만 commit한다. */
-        if (r->log[N].term != r->current_term) {
+        /* §5.4.2: 리더는 '현재 term'의 엔트리가 과반에 닿을 때만 commit한다.
+         * N > commit_index >= log_base 이므로 term_at(N)은 항상 유효(N > log_base). */
+        if (term_at(r, N) != r->current_term) {
             continue;
         }
         int count = 1; /* 자기 자신 */
@@ -333,6 +376,61 @@ static void handle_append_entries_reply(Raft *r, const RaftMsg *msg) {
     }
 }
 
+/* InstallSnapshot 수신(§7): 리더가 보낸 스냅샷으로 로그 prefix를 통째로 대체한다. */
+static void handle_install_snapshot(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
+    step_down_if_higher(r, msg->term);
+    memset(reply, 0, sizeof(*reply));
+    reply->type = MSG_INSTALL_SNAPSHOT_REPLY;
+    reply->from = r->id;
+    reply->to = msg->from;
+    reply->term = r->current_term;
+    if (msg->term < r->current_term) {
+        reply->match_index = 0; /* 낡은 리더 -> 무시 */
+        return;
+    }
+    r->role = RAFT_FOLLOWER;
+    r->election_elapsed = 0;
+    reply->term = r->current_term;
+
+    /* 이미 커밋된 지점까지의 스냅샷이면(오래됐거나 중복) 설치하지 않는다.
+     * match_index는 스냅샷 인덱스로만 답한다 — raft_last_log_index를 답하면 팔로워의
+     * 미커밋·갈린 꼬리까지 확정한 것처럼 보여, 리더가 그걸 과반에 넣어 divergent 인덱스를
+     * 커밋할 수 있다(State Machine Safety 위반). 가드도 log_base가 아니라 commit_index
+     * 기준으로 둬, last_included가 내 커밋보다 낮으면 commit을 되돌리지 않는다. */
+    if (msg->last_included_index <= r->commit_index) {
+        reply->match_index = msg->last_included_index;
+        return;
+    }
+    /* 스냅샷 설치: 로그를 버리고 base를 스냅샷 지점으로 옮긴다(학습용: 팔로워가
+     * 그 뒤 일부 엔트리를 갖고 있더라도 통째로 버린다 — 정확하되 약간 비효율). */
+    r->log[0].term = msg->last_included_term;
+    r->log[0].command = 0;
+    r->log_len = 1;
+    r->log_base = msg->last_included_index;
+    r->commit_index = msg->last_included_index;
+    r->last_applied = msg->last_included_index;
+    r->snapshot_value = msg->snapshot_value;
+    if (r->snap_install) {
+        r->snap_install(r->id, msg->last_included_index, msg->snapshot_value, r->apply_ctx);
+    }
+    reply->match_index = msg->last_included_index;
+}
+
+static void handle_install_snapshot_reply(Raft *r, const RaftMsg *msg) {
+    if (msg->term > r->current_term) {
+        become_follower(r, msg->term);
+        return;
+    }
+    if (r->role != RAFT_LEADER || msg->term != r->current_term) {
+        return;
+    }
+    if (msg->match_index > r->match_index[msg->from]) {
+        r->match_index[msg->from] = msg->match_index;
+    }
+    r->next_index[msg->from] = r->match_index[msg->from] + 1;
+    leader_advance_commit(r);
+}
+
 void raft_recv(Raft *r, const RaftMsg *msg, RaftMsg *reply, int *has_reply, RaftOutbox *out) {
     *has_reply = 0;
     switch (msg->type) {
@@ -350,14 +448,40 @@ void raft_recv(Raft *r, const RaftMsg *msg, RaftMsg *reply, int *has_reply, Raft
         case MSG_APPEND_ENTRIES_REPLY:
             handle_append_entries_reply(r, msg);
             break;
+        case MSG_INSTALL_SNAPSHOT:
+            handle_install_snapshot(r, msg, reply);
+            *has_reply = 1;
+            break;
+        case MSG_INSTALL_SNAPSHOT_REPLY:
+            handle_install_snapshot_reply(r, msg);
+            break;
     }
 }
 
+/* 로그 압축(§7): index까지 버리고 스냅샷으로 대체. index+1.. 엔트리만 남긴다. */
+int raft_snapshot(Raft *r, int64_t index, int64_t sm_state) {
+    if (index <= r->log_base || index > r->commit_index || index > raft_last_log_index(r)) {
+        return -1; /* 이미 압축됐거나, 아직 커밋 안 됐거나, 범위 밖 */
+    }
+    uint64_t inc_term = term_at(r, index);
+    int64_t keep = raft_last_log_index(r) - index; /* index+1.. 남길 엔트리 수 */
+    int64_t src = (index + 1) - r->log_base;       /* 남길 첫 엔트리의 물리 위치 */
+    memmove(&r->log[1], &r->log[src], (size_t)keep * sizeof(RaftEntry));
+    r->log[0].term = inc_term; /* 마커: 논리 인덱스 index를 대표 */
+    r->log[0].command = 0;
+    r->log_len = keep + 1;
+    r->log_base = index;
+    r->snapshot_value = sm_state;
+    return 0;
+}
+
 void raft_crash_restart(Raft *r) {
-    /* 지속 상태(current_term, voted_for, log)는 보존. 휘발 상태만 초기화(§5.1). */
+    /* 지속 상태(current_term, voted_for, log, 스냅샷)는 보존. 휘발만 초기화(§5.1).
+     * commit/applied의 하한은 log_base다 — 스냅샷은 이미 적용된 상태를 대표하므로
+     * 재시작 후에도 그 앞으로는 돌아가지 않는다(스냅샷 없으면 log_base=0 = 예전과 동일). */
     r->role = RAFT_FOLLOWER;
-    r->commit_index = 0;
-    r->last_applied = 0;
+    r->commit_index = r->log_base;
+    r->last_applied = r->log_base;
     r->votes_granted = 0;
     r->election_elapsed = 0;
     r->heartbeat_elapsed = 0;
@@ -404,6 +528,8 @@ int raft_save(const Raft *r, const char *path) {
     int rc = 0;
     if (wr_all(fd, &r->current_term, sizeof(r->current_term)) != 0 ||
         wr_all(fd, &r->voted_for, sizeof(r->voted_for)) != 0 ||
+        wr_all(fd, &r->log_base, sizeof(r->log_base)) != 0 ||
+        wr_all(fd, &r->snapshot_value, sizeof(r->snapshot_value)) != 0 ||
         wr_all(fd, &r->log_len, sizeof(r->log_len)) != 0 ||
         wr_all(fd, r->log, (size_t)r->log_len * sizeof(RaftEntry)) != 0) {
         rc = -1;
@@ -422,8 +548,9 @@ int raft_load(Raft *r, const char *path) {
     }
     uint64_t term;
     int voted;
-    int64_t len;
+    int64_t base, snap, len;
     if (rd_all(fd, &term, sizeof(term)) != 0 || rd_all(fd, &voted, sizeof(voted)) != 0 ||
+        rd_all(fd, &base, sizeof(base)) != 0 || rd_all(fd, &snap, sizeof(snap)) != 0 ||
         rd_all(fd, &len, sizeof(len)) != 0 || len < 1) {
         close(fd);
         return -1;
@@ -444,6 +571,17 @@ int raft_load(Raft *r, const char *path) {
     close(fd);
     r->current_term = term;
     r->voted_for = voted;
+    r->log_base = base;
+    r->snapshot_value = snap;
     r->log_len = len;
+    /* 스냅샷은 이미 적용된 상태를 대표하므로 commit/applied 하한을 log_base로. */
+    r->commit_index = base;
+    r->last_applied = base;
+    /* 스냅샷이 있었다면(log_base>0), 1..log_base 엔트리는 압축돼 사라졌으므로 재적용
+     * 경로로는 SM을 복원할 수 없다 -> 스냅샷 값을 SM에 직접 시드해야 한다.
+     * (이걸 빠뜨리면 재기동 노드의 SM에 log_base까지의 상태가 영구히 빈다.) */
+    if (r->log_base > 0 && r->snap_install) {
+        r->snap_install(r->id, r->log_base, r->snapshot_value, r->apply_ctx);
+    }
     return 0;
 }
