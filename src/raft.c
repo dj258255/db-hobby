@@ -2,8 +2,10 @@
  * Raft 논문(Ongaro & Ousterhout 2014) §5의 규칙을 학습용으로 옮긴다. */
 #include "raft.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ── 로그 헬퍼 (log[0]은 term 0 sentinel, 실제 엔트리는 1-indexed) ── */
 
@@ -361,4 +363,87 @@ void raft_crash_restart(Raft *r) {
     r->heartbeat_elapsed = 0;
     memset(r->next_index, 0, sizeof(r->next_index));
     memset(r->match_index, 0, sizeof(r->match_index));
+}
+
+/* ── 지속성(§5.1): current_term/voted_for/log를 디스크에 내구화 ──
+ * 포맷(단순 바이너리): [current_term 8B][voted_for 4B][log_len 8B][entries...].
+ * 진짜 Raft는 이 저장을 RPC 응답 '전에' 부른다(그래야 표/로그가 내구화된 뒤
+ * 응답이 나감). 여기선 하버스가 크래시 지점에서 호출해 디스크 라운드트립을
+ * 검증한다 — 코어를 순수하게 유지하려는 학습용 타협. */
+
+static int wr_all(int fd, const void *buf, size_t n) {
+    const unsigned char *p = buf;
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) {
+            return -1;
+        }
+        p += (size_t)w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+static int rd_all(int fd, void *buf, size_t n) {
+    unsigned char *p = buf;
+    while (n) {
+        ssize_t r = read(fd, p, n);
+        if (r <= 0) {
+            return -1;
+        }
+        p += (size_t)r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+int raft_save(const Raft *r, const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc = 0;
+    if (wr_all(fd, &r->current_term, sizeof(r->current_term)) != 0 ||
+        wr_all(fd, &r->voted_for, sizeof(r->voted_for)) != 0 ||
+        wr_all(fd, &r->log_len, sizeof(r->log_len)) != 0 ||
+        wr_all(fd, r->log, (size_t)r->log_len * sizeof(RaftEntry)) != 0) {
+        rc = -1;
+    }
+    if (fsync(fd) != 0) { /* 내구성의 지점 — 여기를 지나야 '저장됨' */
+        rc = -1;
+    }
+    close(fd);
+    return rc;
+}
+
+int raft_load(Raft *r, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    uint64_t term;
+    int voted;
+    int64_t len;
+    if (rd_all(fd, &term, sizeof(term)) != 0 || rd_all(fd, &voted, sizeof(voted)) != 0 ||
+        rd_all(fd, &len, sizeof(len)) != 0 || len < 1) {
+        close(fd);
+        return -1;
+    }
+    if (len > r->log_cap) {
+        RaftEntry *p = realloc(r->log, (size_t)len * sizeof(RaftEntry));
+        if (!p) {
+            close(fd);
+            return -1;
+        }
+        r->log = p;
+        r->log_cap = len;
+    }
+    if (rd_all(fd, r->log, (size_t)len * sizeof(RaftEntry)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    r->current_term = term;
+    r->voted_for = voted;
+    r->log_len = len;
+    return 0;
 }

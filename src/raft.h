@@ -141,6 +141,16 @@ void raft_recv(Raft *r, const RaftMsg *msg, RaftMsg *reply, int *has_reply, Raft
 /* 크래시 후 재시작: 지속 상태(term/votedFor/log)는 보존, 휘발 상태만 초기화. */
 void raft_crash_restart(Raft *r);
 
+/* 지속 상태(current_term, voted_for, log)를 디스크에 저장하고 fsync한다(§5.1).
+ * Raft 규칙: 이 셋은 RPC에 응답하기 '전에' 내구화돼야 안전하다 — votedFor가
+ * 안 남으면 크래시 후 같은 term에 두 번 투표해 리더가 둘 생길 수 있다. 0/-1.
+ * (15편 WAL의 no-force와 같은 뿌리: fsync가 내구성의 지점.) */
+int raft_save(const Raft *r, const char *path);
+
+/* raft_init으로 초기화된 노드에 디스크의 지속 상태를 되읽는다. 휘발 상태는
+ * init 기본값 그대로(§5.1: 크래시 시 volatile은 잃어도 됨). 0 성공, -1 실패. */
+int raft_load(Raft *r, const char *path);
+
 /* 관측용 헬퍼. */
 int64_t raft_last_log_index(const Raft *r);
 uint64_t raft_last_log_term(const Raft *r);

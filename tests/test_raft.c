@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /*
  * 트랙 H2 — Raft 합의 단위 테스트 (결정적 시뮬레이션 네트워크).
@@ -269,6 +270,69 @@ int main(void) {
         cluster_run(25);
         CHECK(g.nodes[victim].commit_index == 3, "재시작: 희생 노드가 커밋 로그를 따라잡음");
         CHECK(applied_agree(3), "재시작: 재적용 후 모든 노드 로그 일치(idempotent 재적용)");
+    }
+
+    /* ── 6. 지속성(§5.1): votedFor가 크래시를 살아남아 이중 투표를 막는다 ──
+     * votedFor가 안 남으면 한 노드가 같은 term에 두 번 투표해 리더가 둘 생길 수
+     * 있다(Election Safety 붕괴). 진짜 디스크 라운드트립으로 이를 검증한다. */
+    {
+        const char *path = "build/test_raft_persist.dat";
+        unlink(path);
+        cluster_init(3);
+        Raft *V = &g.nodes[1];
+        RaftMsg rv1;
+        memset(&rv1, 0, sizeof(rv1));
+        rv1.type = MSG_REQUEST_VOTE; rv1.from = 0; rv1.to = 1; rv1.term = 5;
+        rv1.last_log_index = 0; rv1.last_log_term = 0;
+        RaftMsg rep; int hr = 0; RaftOutbox out; out.n = 0;
+        raft_recv(V, &rv1, &rep, &hr, &out);
+        CHECK(hr && rep.vote_granted == 1, "지속성: term5에서 후보 0에게 투표");
+        CHECK(V->voted_for == 0, "지속성: votedFor=0 기록");
+        CHECK(raft_save(V, path) == 0, "지속성: 지속 상태 fsync 저장(응답 전 내구화)");
+
+        /* 진짜 크래시: 구조체를 처음부터 다시(메모리 날림) 만들고 디스크에서 복구. */
+        Raft V2;
+        raft_init(&V2, 1, 3, 10, 2, on_apply, &g);
+        CHECK(V2.voted_for == -1, "지속성: 새 노드는 votedFor 없음(-1)");
+        CHECK(raft_load(&V2, path) == 0, "지속성: 디스크에서 지속 상태 복구");
+        CHECK(V2.current_term == 5 && V2.voted_for == 0,
+              "지속성: term5·votedFor=0가 크래시를 살아남음");
+
+        /* 같은 term5에서 다른 후보 2가 표를 구한다 -> 거절(이중 투표 방지). */
+        RaftMsg rv2;
+        memset(&rv2, 0, sizeof(rv2));
+        rv2.type = MSG_REQUEST_VOTE; rv2.from = 2; rv2.to = 1; rv2.term = 5;
+        rv2.last_log_index = 0; rv2.last_log_term = 0;
+        hr = 0; out.n = 0;
+        raft_recv(&V2, &rv2, &rep, &hr, &out);
+        CHECK(hr && rep.vote_granted == 0,
+              "지속성: 복구 후 같은 term 다른 후보엔 표 거절(이중 투표 방지 → Election Safety)");
+        raft_free(&V2);
+        unlink(path);
+    }
+
+    /* ── 7. 지속성: 커밋된 로그가 디스크 라운드트립을 그대로 살아남는다 ── */
+    {
+        const char *path = "build/test_raft_log.dat";
+        unlink(path);
+        cluster_init(3);
+        cluster_run(20);
+        int lead = find_leader();
+        raft_submit(&g.nodes[lead], 42);
+        raft_submit(&g.nodes[lead], 43);
+        cluster_run(15);
+        CHECK(raft_save(&g.nodes[lead], path) == 0, "지속성: 리더 로그 저장");
+        int64_t saved_len = g.nodes[lead].log_len;
+        uint64_t saved_term = g.nodes[lead].current_term;
+        Raft R;
+        raft_init(&R, lead, 3, 10, 2, on_apply, &g);
+        CHECK(raft_load(&R, path) == 0, "지속성: 로그 복구");
+        CHECK(R.log_len == saved_len && R.current_term == saved_term,
+              "지속성: 로그 길이·term 일치");
+        CHECK(R.log[1].command == 42 && R.log[2].command == 43,
+              "지속성: 엔트리 순서·값(42,43) 보존");
+        raft_free(&R);
+        unlink(path);
     }
 
     for (int i = 0; i < RAFT_MAX_NODES; i++) {
