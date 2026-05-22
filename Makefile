@@ -10,7 +10,7 @@ SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/b
 BINSRCS := src/server.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_raft
 
 .PHONY: test repl serve clean bench test-tsan
 
@@ -31,6 +31,10 @@ $(BUILD)/test_joinopt: tests/test_joinopt.c src/joinopt.c | $(BUILD)
 
 # lsm도 엔진과 별개(독립 LSM 저장 엔진, db.c 저장 계층에 미배선). lsm.c만 링크.
 $(BUILD)/test_lsm: tests/test_lsm.c src/lsm.c | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc $(filter %.c,$^) -o $@
+
+# raft도 엔진과 별개(합의 코어, 결정적 시뮬레이션으로 검증). raft.c만 링크.
+$(BUILD)/test_raft: tests/test_raft.c src/raft.c | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(filter %.c,$^) -o $@
 
 test: $(addprefix $(BUILD)/, $(TESTS))
