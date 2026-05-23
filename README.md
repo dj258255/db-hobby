@@ -20,8 +20,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**557 checks across 33 suites**), and the concurrency is
-verified under ThreadSanitizer. The 30-part build log is at
+covered by tests (**565 checks across 34 suites**), and the concurrency is
+verified under ThreadSanitizer. The 31-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
@@ -125,15 +125,16 @@ mydb.orders.idx.wal
 
 The core above is one coherent single-node database. On top of it, the harder
 axes of a real system are built as **focused, independently-tested modules** —
-each with an honest boundary spelled out in its part of the build log. They are
-deliberately kept as standalone modules (rather than wired into the engine) so
-the 550+ green tests stay safe; each part marks exactly where the module ends
-and integration would begin.
+each with an honest boundary spelled out in its part of the build log. Most are
+kept as standalone modules (so the 560+ green tests stay safe), each marking
+where it ends and integration would begin — **except replication, which is wired
+end-to-end as a capstone**: a replica replays the *real engine's* committed WAL
+and then opens as a full database serving `SELECT`.
 
 | Module | What it does | Mirrors |
 |---|---|---|
 | `raft.c` | **Raft consensus** — leader election, log replication, the five §5 safety properties, disk-persisted term/vote (prevents double-voting across a crash), log compaction + InstallSnapshot (§7). Verified on a *deterministic simulated network* that injects partitions, crashes, and reordering | etcd / Consul Raft |
-| `replica.c` + `replnet.c` | **WAL replication** — a replica tails the primary's WAL and replays committed records (the crash-recovery redo, run as a stream); carried over a real socket via a walsender/walreceiver | PostgreSQL streaming replication |
+| `replica.c` + `replnet.c` | **WAL replication** — a replica tails the primary's WAL and replays committed records (the crash-recovery redo, run as a stream); carried over a real socket via a walsender/walreceiver. **Wired end-to-end**: replicates the real engine's writes into a replica that serves `SELECT` (base snapshot + WAL replay, pg_basebackup-style) | PostgreSQL streaming replication |
 | `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree | RocksDB / LevelDB |
 | `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |
 | `cbtree.c` | a **concurrent B+Tree** with latch crabbing (per-node rwlocks), ThreadSanitizer-clean | InnoDB index concurrency |
