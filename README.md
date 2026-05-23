@@ -3,8 +3,12 @@
 A small relational database written from scratch in C — one that **an actual
 `psql` connects to**, with **MVCC snapshot isolation where readers don't block
 writers**, WAL crash recovery, VACUUM, a thread-safe buffer pool, and a
-cost-based query planner. Built from raw fixed-size pages all the way up to
-running SQL, to dissect how PostgreSQL and MySQL actually work inside.
+cost-based query planner. And past the single node into the hard parts:
+**primary→replica replication over a real socket, Raft consensus** (leader
+election, log replication, disk-persisted votes, snapshots), and an **LSM
+storage engine**. Built from raw fixed-size pages all the way up to running
+SQL — and out to a small distributed system — to dissect how PostgreSQL and
+MySQL actually work inside.
 
 ![db-hobby: two psql clients, readers don't block writers](docs/psql-demo.svg)
 
@@ -25,7 +29,10 @@ B+Tree (+ concurrent latch-crabbing variant) · hand-written SQL parser & execut
 joins (nested-loop / index / hash) · aggregates · WAL with **steal + no-force**
 recovery · **MVCC** (xmin/xmax, snapshot isolation, VACUUM) · multi-transaction
 sessions · a **PostgreSQL-wire server** · a **cost-based optimizer** (ANALYZE,
-selectivity). Heap (PG) vs clustered (InnoDB) storage is benchmarked side by side.
+selectivity, Selinger join-order DP) · **log-shipping + TCP replication** ·
+**Raft consensus** (election, log replication, persistence, snapshots) · an
+**LSM storage engine**. Heap (PG) vs clustered (InnoDB) storage is benchmarked
+side by side.
 
 ![db-hobby REPL demo](docs/demo.svg)
 
@@ -94,6 +101,7 @@ Built bottom-up; each layer sits on the one below it.
 | `db.c` | executor: tuple codec, multi-table catalog, joins (NLJ/index/hash), aggregates | pg_catalog, executor |
 | `btree.c` | on-disk B+Tree index for O(log n) lookups, with node splits | InnoDB clustered index |
 | `wal.c` | write-ahead log on each table's data file: atomic commit + crash recovery | PG WAL / redo log |
+| `mvcc.c` | transaction-state log + visibility rule (xmin committed AND xmax not) | PG MVCC / tqual |
 | `lock.c` | 2PL table locks (S/X) + deadlock detection (wait-for graph) for isolation | PG/InnoDB lock manager |
 
 ### Storage layout
@@ -112,6 +120,23 @@ mydb.orders.wal
 mydb.orders.idx   orders PK index
 mydb.orders.idx.wal
 ```
+
+## Beyond the single-node engine
+
+The core above is one coherent single-node database. On top of it, the harder
+axes of a real system are built as **focused, independently-tested modules** —
+each with an honest boundary spelled out in its part of the build log. They are
+deliberately kept as standalone modules (rather than wired into the engine) so
+the 550+ green tests stay safe; each part marks exactly where the module ends
+and integration would begin.
+
+| Module | What it does | Mirrors |
+|---|---|---|
+| `raft.c` | **Raft consensus** — leader election, log replication, the five §5 safety properties, disk-persisted term/vote (prevents double-voting across a crash), log compaction + InstallSnapshot (§7). Verified on a *deterministic simulated network* that injects partitions, crashes, and reordering | etcd / Consul Raft |
+| `replica.c` + `replnet.c` | **WAL replication** — a replica tails the primary's WAL and replays committed records (the crash-recovery redo, run as a stream); carried over a real socket via a walsender/walreceiver | PostgreSQL streaming replication |
+| `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree | RocksDB / LevelDB |
+| `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |
+| `cbtree.c` | a **concurrent B+Tree** with latch crabbing (per-node rwlocks), ThreadSanitizer-clean | InnoDB index concurrency |
 
 ## SQL supported
 
