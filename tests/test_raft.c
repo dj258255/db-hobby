@@ -545,6 +545,45 @@ int main(void) {
         CHECK(g.nodes[L].role != RAFT_LEADER, "L2: 자기 제거가 커밋된 뒤 리더 강등");
     }
 
+    /* ── 13. ReadIndex epoch(F1 수정): pre-barrier 응답이 오확인 못 한다 ──
+     * 배리어 시작 전에 보낸 하트비트의 응답(옛 epoch)이 재정렬로 뒤늦게 도착해도
+     * 확인에 세지 않는다 — 고립된 옛 리더가 낡은 읽기를 서빙하는 걸 막는다. */
+    {
+        cluster_init(5); /* 과반 3 */
+        cluster_run(20);
+        int lead = find_leader();
+        RaftOutbox out; out.n = 0;
+        int64_t ri = raft_read_index(&g.nodes[lead], &out); /* 배리어 시작, epoch++ */
+        CHECK(ri >= 0, "epoch: 리더가 read_index 시작");
+        uint64_t ep = g.nodes[lead].read_epoch;
+
+        /* pre-barrier(옛 epoch) 성공 응답 2개 주입 -> 오확인되면 안 됨 */
+        for (int f = 1; f <= 2; f++) {
+            RaftMsg rep; memset(&rep, 0, sizeof rep);
+            rep.type = MSG_APPEND_ENTRIES_REPLY; rep.from = f; rep.to = lead;
+            rep.term = g.nodes[lead].current_term; rep.success = 1;
+            rep.match_index = raft_last_log_index(&g.nodes[lead]);
+            rep.read_epoch = ep - 1; /* 옛 epoch */
+            RaftMsg r2; int hr = 0; RaftOutbox o2; o2.n = 0;
+            raft_recv(&g.nodes[lead], &rep, &r2, &hr, &o2);
+        }
+        CHECK(raft_read_confirmed(&g.nodes[lead]) < 0,
+              "epoch: pre-barrier 응답(옛 epoch)은 확인에 안 셈(오확인 방지)");
+
+        /* 현재 epoch 응답 2개 -> self+2 = 3 과반 -> 확인 */
+        for (int f = 1; f <= 2; f++) {
+            RaftMsg rep; memset(&rep, 0, sizeof rep);
+            rep.type = MSG_APPEND_ENTRIES_REPLY; rep.from = f; rep.to = lead;
+            rep.term = g.nodes[lead].current_term; rep.success = 1;
+            rep.match_index = raft_last_log_index(&g.nodes[lead]);
+            rep.read_epoch = ep; /* 현재 epoch */
+            RaftMsg r2; int hr = 0; RaftOutbox o2; o2.n = 0;
+            raft_recv(&g.nodes[lead], &rep, &r2, &hr, &o2);
+        }
+        CHECK(raft_read_confirmed(&g.nodes[lead]) == ri,
+              "epoch: 현재 epoch 응답 과반 -> 확인됨");
+    }
+
     for (int i = 0; i < RAFT_MAX_NODES; i++) {
         if (g.nodes[i].log) raft_free(&g.nodes[i]);
     }

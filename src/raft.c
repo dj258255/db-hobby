@@ -48,6 +48,10 @@ static int log_append(Raft *r, RaftEntry e) {
 int raft_is_member(const Raft *r, int id) {
     return (r->member_mask >> id) & 1u;
 }
+
+int64_t raft_read_confirmed(const Raft *r) {
+    return r->read_confirmed_index;
+}
 static int member_count(const Raft *r) {
     int c = 0;
     for (uint32_t m = r->member_mask; m; m &= m - 1) c++;
@@ -95,6 +99,10 @@ static void become_follower(Raft *r, uint64_t term) {
     r->current_term = term;
     r->voted_for = -1;
     r->election_elapsed = 0;
+    /* 리더가 아니게 됐으니 진행 중이던 읽기 확인은 무효 — 고립된 옛 리더의 읽기가
+     * 뒤늦게 확인되는 걸 막는다(선형화 안전). */
+    r->read_barrier_index = -1;
+    r->read_confirmed_index = -1;
 }
 
 /* 어떤 메시지든 자기보다 높은 term을 보면 즉시 팔로워로 물러난다(§5.1). */
@@ -142,6 +150,7 @@ static void send_append_entries(Raft *r, int peer, RaftOutbox *out) {
     m.prev_log_index = prev;
     m.prev_log_term = term_at(r, prev);
     m.leader_commit = r->commit_index;
+    m.read_epoch = r->read_epoch; /* ReadIndex: 팔로워가 되돌려줄 배리어 식별자 */
     int n = 0;
     for (int64_t idx = r->next_index[peer]; idx <= raft_last_log_index(r) && n < RAFT_MAX_BATCH;
          idx++) {
@@ -153,6 +162,8 @@ static void send_append_entries(Raft *r, int peer, RaftOutbox *out) {
 
 static void become_leader(Raft *r, RaftOutbox *out) {
     r->role = RAFT_LEADER;
+    r->read_barrier_index = -1; /* 새 리더: 진행 중 읽기 없음 */
+    r->read_confirmed_index = -1;
     for (int i = 0; i < RAFT_MAX_NODES; i++) {
         if (!raft_is_member(r, i)) continue;
         r->next_index[i] = raft_last_log_index(r) + 1;
@@ -235,6 +246,9 @@ int raft_init(Raft *r, int id, int n_nodes, int election_timeout, int heartbeat_
     r->last_applied = 0;
     r->election_timeout = election_timeout;
     r->heartbeat_timeout = heartbeat_timeout;
+    r->read_barrier_index = -1;
+    r->read_confirmed_index = -1;
+    r->read_ack_mask = 0;
     r->apply = apply;
     r->apply_ctx = apply_ctx;
     return 0;
@@ -311,6 +325,29 @@ int64_t raft_change_config(Raft *r, uint32_t new_mask) {
     return raft_last_log_index(r);
 }
 
+/* 선형화 읽기 시작(ReadIndex): commit_index를 read index로 잡고, '지금도 리더'임을
+ * 과반 하트비트 ack로 확인하러 하트비트를 뿌린다. handle_append_entries_reply가
+ * 그 ack를 세어 과반이 되면 read_confirmed_index를 세운다. */
+int64_t raft_read_index(Raft *r, RaftOutbox *out) {
+    if (r->role != RAFT_LEADER) {
+        return -1;
+    }
+    r->read_barrier_index = r->commit_index;
+    r->read_confirmed_index = -1;
+    r->read_ack_mask = (1u << r->id); /* 자기 자신은 당연히 ack */
+    r->read_epoch++;                  /* 새 배리어 -> 이 이후 하트비트 응답만 센다(F1) */
+    if (member_count(r) == 1) { /* 단일 노드면 즉시 확인 */
+        r->read_confirmed_index = r->read_barrier_index;
+        r->read_barrier_index = -1;
+    }
+    for (int i = 0; i < RAFT_MAX_NODES; i++) {
+        if (i != r->id && raft_is_member(r, i)) {
+            send_append_entries(r, i, out);
+        }
+    }
+    return r->commit_index;
+}
+
 /* ── 수신 핸들러 ── */
 
 static void handle_request_vote(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
@@ -358,6 +395,7 @@ static void handle_append_entries(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
     reply->to = msg->from;
     reply->success = 0;
     reply->match_index = 0;
+    reply->read_epoch = msg->read_epoch; /* ReadIndex: 리더의 배리어 식별자를 그대로 되돌린다 */
 
     if (msg->term < r->current_term) {
         reply->term = r->current_term; /* 낡은 리더 -> 거절(리더가 물러나게) */
@@ -462,6 +500,20 @@ static void handle_append_entries_reply(Raft *r, const RaftMsg *msg) {
         }
         r->next_index[msg->from] = r->match_index[msg->from] + 1;
         leader_advance_commit(r);
+        /* ReadIndex: 이번 배리어의 하트비트에 대한 응답만(epoch 일치) 센다. 과반이면
+         * '지금도 리더' 확인 -> read_confirmed_index. 재정렬로 도착한 pre-barrier
+         * 응답(옛 epoch)은 제외 — 고립된 옛 리더의 오확인을 막는다(F1 수정). */
+        if (r->read_barrier_index >= 0 && msg->read_epoch == r->read_epoch) {
+            r->read_ack_mask |= (1u << msg->from);
+            int acks = 0;
+            for (int i = 0; i < RAFT_MAX_NODES; i++) {
+                if (raft_is_member(r, i) && (r->read_ack_mask & (1u << i))) acks++;
+            }
+            if (acks >= majority(r)) {
+                r->read_confirmed_index = r->read_barrier_index;
+                r->read_barrier_index = -1;
+            }
+        }
     } else if (r->next_index[msg->from] > 1) {
         r->next_index[msg->from]--; /* 로그가 갈렸다 -> 한 칸 뒤로 물러 재시도 */
     }
@@ -589,6 +641,8 @@ void raft_crash_restart(Raft *r) {
     r->election_elapsed = 0;
     r->heartbeat_elapsed = 0;
     r->pending_config_index = -1; /* 휘발 */
+    r->read_barrier_index = -1;
+    r->read_confirmed_index = -1;
     memset(r->next_index, 0, sizeof(r->next_index));
     memset(r->match_index, 0, sizeof(r->match_index));
 }

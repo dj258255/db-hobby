@@ -83,8 +83,16 @@ int raftdb_leader(const RaftDb *rd);
 /* 쓰기 SQL을 리더에 제안한다(바로 실행 X — 커밋 후 모든 노드가 적용). 리더 없으면 -1. */
 int raftdb_write(RaftDb *rd, const char *sql);
 
-/* 읽기 SQL을 특정 노드 엔진에서 직접 실행(낡을 수 있음 — 선형화 읽기는 프론티어). */
+/* 읽기 SQL을 특정 노드 엔진에서 직접 실행(낡을 수 있음 — 비선형화). */
 void raftdb_query(RaftDb *rd, int node, const char *sql, FILE *out);
+
+/* 선형화 읽기(ReadIndex): 리더가 '지금도 리더'임을 과반으로 확인한 뒤에야 읽기를
+ * 서빙한다. 확인되면 리더 엔진에서 실행하고 0, 확인 안 되면(고립된 옛 리더 등)
+ * max_steps 안에 확인 실패로 -1을 반환 — 낡은 읽기를 서빙하지 않는다. */
+int raftdb_query_linearizable(RaftDb *rd, const char *sql, FILE *out, int max_steps);
+
+/* 노드를 다른 모든 노드로부터 분단(고립). 선형화 읽기 테스트용. */
+void raftdb_isolate(RaftDb *rd, int node);
 
 /* 노드를 크래시(다운). */
 void raftdb_crash(RaftDb *rd, int node);

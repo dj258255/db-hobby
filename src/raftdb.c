@@ -102,7 +102,43 @@ int raftdb_write(RaftDb *rd, const char *sql) {
 }
 
 void raftdb_query(RaftDb *rd, int node, const char *sql, FILE *out) {
-    db_exec(&rd->db[node], sql, out); /* 낡을 수 있음(선형화 읽기는 프론티어) */
+    db_exec(&rd->db[node], sql, out); /* 낡을 수 있음(비선형화) */
+}
+
+void raftdb_isolate(RaftDb *rd, int node) {
+    for (int j = 0; j < rd->n; j++) {
+        if (j != node) {
+            rd->connected[node][j] = 0;
+            rd->connected[j][node] = 0;
+        }
+    }
+}
+
+int raftdb_query_linearizable(RaftDb *rd, const char *sql, FILE *out, int max_steps) {
+    int L = raftdb_leader(rd);
+    if (L < 0) {
+        return -1;
+    }
+    RaftOutbox ob;
+    ob.n = 0;
+    int64_t ri = raft_read_index(&rd->raft[L], &ob); /* read index 잡고 하트비트 발사 */
+    if (ri < 0) {
+        return -1;
+    }
+    for (int k = 0; k < ob.n; k++) qpush(rd, &ob.m[k]); /* barrier 하트비트를 큐에 */
+
+    for (int s = 0; s < max_steps; s++) {
+        raftdb_step(rd);
+        /* 리더십이 바뀌었으면(옛 리더가 강등) 이 읽기는 무효 -> 거부 */
+        if (rd->raft[L].role != RAFT_LEADER) {
+            return -1;
+        }
+        if (raft_read_confirmed(&rd->raft[L]) >= ri && rd->raft[L].last_applied >= ri) {
+            db_exec(&rd->db[L], sql, out); /* 과반 확인됨 + 적용 완료 -> 선형화 읽기 */
+            return 0;
+        }
+    }
+    return -1; /* 과반 확인 실패(고립된 리더 등) -> 낡은 읽기를 서빙하지 않는다 */
 }
 
 void raftdb_crash(RaftDb *rd, int node) {

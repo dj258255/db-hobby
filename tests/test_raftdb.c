@@ -98,6 +98,31 @@ int main(void) {
     CHECK(strstr(qa, "name_8") != NULL, "failover 후 새 쓰기(name_8)도 복제됨");
     free(qa); free(qb);
 
+    /* ── 검증 3: 선형화 읽기(ReadIndex) — 확인된 리더에서만 읽는다 ── */
+    {
+        char *b = NULL; size_t sz = 0;
+        FILE *f = open_memstream(&b, &sz);
+        int rc = raftdb_query_linearizable(rd, "SELECT * FROM t", f, 40);
+        fclose(f);
+        CHECK(rc == 0, "선형화 읽기: 과반 확인된 리더에서 서빙됨");
+        CHECK(count_rows(b) == 8, "선형화 읽기: 최신 8행 반환");
+        free(b);
+
+        /* 리더를 고립 -> 과반 확인 불가 -> 선형화 읽기 거부(낡은 읽기 방지). 대조로
+         * 비선형화 직접 읽기는 여전히 뭔가 돌려준다(안전하지 않을 수 있음). */
+        raftdb_isolate(rd, new_lead);
+        char *b2 = NULL; size_t sz2 = 0;
+        FILE *f2 = open_memstream(&b2, &sz2);
+        int rc2 = raftdb_query_linearizable(rd, "SELECT * FROM t", f2, 40);
+        fclose(f2);
+        CHECK(rc2 == -1, "선형화 읽기: 고립된 리더는 과반 확인 실패 -> 거부");
+        free(b2);
+
+        char *b3 = query(rd, new_lead, "SELECT * FROM t"); /* 직접 읽기는 그냥 응답 */
+        CHECK(count_rows(b3) >= 0, "대조: 비선형화 직접 읽기는 확인 없이 응답(낡을 수 있음)");
+        free(b3);
+    }
+
     /* F1: apply 중 db_exec 실패가 하나도 없었나(있으면 그 노드가 발산한 것). */
     CHECK(raftdb_apply_errors(rd) == 0, "apply 오류 0 — 어떤 노드도 엔진 발산 없음");
 

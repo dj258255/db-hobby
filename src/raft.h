@@ -81,6 +81,9 @@ typedef struct {
     /* AppendEntriesReply */
     int success;
     int64_t match_index;        /* 성공 시 팔로워가 확정한 마지막 인덱스 */
+    uint64_t read_epoch;        /* ReadIndex: 하트비트에 실려 왕복. 팔로워가 그대로
+                                 * 되돌려, 리더가 '이 배리어의 응답'만 세게 한다(재정렬
+                                 * 하에서도 pre-barrier 응답의 오확인 방지). */
 
     /* InstallSnapshot (§7) */
     int64_t last_included_index; /* 스냅샷이 담은 마지막 인덱스 */
@@ -142,6 +145,15 @@ typedef struct {
     int heartbeat_elapsed;
     int heartbeat_timeout;      /* 리더가 이 주기로 AppendEntries(하트비트) */
 
+    /* ---- 선형화 읽기(ReadIndex) — 휘발 ----
+     * 읽기를 서빙하기 전, 리더는 '지금도 리더'임을 과반 하트비트 ack로 확인한다.
+     * 고립된 옛 리더는 과반을 못 받아 확인이 안 돼 -> 낡은 읽기를 못 서빙한다. */
+    int64_t read_barrier_index;   /* 진행 중 읽기의 read index(commit_index 스냅). -1=없음 */
+    uint32_t read_ack_mask;       /* 이번 barrier에 ack한 구성원(자기 포함) */
+    int64_t read_confirmed_index; /* 과반 확인된 read index. -1=미확인 */
+    uint64_t read_epoch;          /* 배리어마다 증가. 하트비트에 실어 응답이 이 epoch를
+                                   * 되돌려줄 때만 ack로 센다(재정렬 오확인 방지). */
+
     RaftApplyFn apply;
     RaftSnapInstallFn snap_install; /* InstallSnapshot 수신 시 SM에 스냅샷 설치 */
     void *apply_ctx;
@@ -185,6 +197,15 @@ int64_t raft_change_config(Raft *r, uint32_t new_member_mask);
 
 /* 노드 i가 현재 클러스터 구성원인가(관측용). */
 int raft_is_member(const Raft *r, int id);
+
+/* 선형화 읽기 시작(ReadIndex): 리더면 현재 commit_index를 read index로 잡고 과반
+ * 하트비트를 보내 '지금도 리더'임을 확인하러 나선다. read index를 반환(>=0),
+ * 리더가 아니면 -1. 이후 raft_read_confirmed가 그 index를 돌려주면 과반이 확인된
+ * 것 — 그때 last_applied가 그 index를 넘긴 뒤 자기 상태기계에서 읽으면 선형화된다. */
+int64_t raft_read_index(Raft *r, RaftOutbox *out);
+
+/* 과반 확인된 read index(>=0), 아직 확인 안 됐으면 -1. 고립된 옛 리더는 영영 -1. */
+int64_t raft_read_confirmed(const Raft *r);
 
 /* 로그 압축(§7): index까지의 로그를 버리고 스냅샷으로 대체한다. index는 이미
  * 커밋·적용된 지점이어야 한다(index <= commit_index, index > log_base). sm_state는
