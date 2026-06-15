@@ -5,8 +5,9 @@ A small relational database written from scratch in C — one that **an actual
 writers**, WAL crash recovery, VACUUM, a thread-safe buffer pool, and a
 cost-based query planner. And past the single node into the hard parts:
 **primary→replica replication over a real socket, Raft consensus** (leader
-election, log replication, disk-persisted votes, snapshots), and an **LSM
-storage engine**. Built from raw fixed-size pages all the way up to running
+election, log replication, disk-persisted votes, snapshots, membership changes)
+that **replicates the real engine into a highly-available DB surviving leader
+death**, and an **LSM storage engine**. Built from raw fixed-size pages up to running
 SQL — and out to a small distributed system — to dissect how PostgreSQL and
 MySQL actually work inside.
 
@@ -20,8 +21,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**585 checks across 34 suites**), and the concurrency is
-verified under ThreadSanitizer. The 32-part build log is at
+covered by tests (**596 checks across 35 suites**), and the concurrency is
+verified under ThreadSanitizer. The 33-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
@@ -134,6 +135,7 @@ and then opens as a full database serving `SELECT`.
 | Module | What it does | Mirrors |
 |---|---|---|
 | `raft.c` | **Raft consensus** — leader election, log replication, the five §5 safety properties, disk-persisted term/vote (prevents double-voting across a crash), log compaction + InstallSnapshot (§7), and single-server membership changes (§6). Verified on a *deterministic simulated network* that injects partitions, crashes, and reordering | etcd / Consul Raft |
+| `raftdb.c` | **Raft-replicated HA database** — state-machine replication wiring `raft.c` onto the real `db.c` engine: a write is proposed to Raft, and every node applies the committed command to its own engine. Survives leader death (failover); engines stay consistent | etcd / TiKV, replicated SQL |
 | `replica.c` + `replnet.c` | **WAL replication** — a replica tails the primary's WAL and replays committed records (the crash-recovery redo, run as a stream); carried over a real socket via a walsender/walreceiver. **Wired end-to-end**: replicates the real engine's writes into a replica that serves `SELECT` (base snapshot + WAL replay, pg_basebackup-style) | PostgreSQL streaming replication |
 | `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree | RocksDB / LevelDB |
 | `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |

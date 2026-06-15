@@ -10,7 +10,7 @@ SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/b
 BINSRCS := src/server.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_raft test_repl_e2e
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_raft test_repl_e2e test_raftdb
 
 .PHONY: test repl serve clean bench test-tsan
 
@@ -36,6 +36,10 @@ $(BUILD)/test_lsm: tests/test_lsm.c src/lsm.c | $(BUILD)
 # raft도 엔진과 별개(합의 코어, 결정적 시뮬레이션으로 검증). raft.c만 링크.
 $(BUILD)/test_raft: tests/test_raft.c src/raft.c | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(filter %.c,$^) -o $@
+
+# raftdb는 Raft(raft.c)로 실제 엔진(SRCS)을 복제하는 통합 계층. 셋 다 링크.
+$(BUILD)/test_raftdb: tests/test_raftdb.c src/raftdb.c src/raft.c $(SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc $< src/raftdb.c src/raft.c $(SRCS) -o $@
 
 test: $(addprefix $(BUILD)/, $(TESTS))
 	@for t in $(TESTS); do echo "=== $$t ==="; ./$(BUILD)/$$t || exit 1; echo; done
