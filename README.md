@@ -20,8 +20,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**565 checks across 34 suites**), and the concurrency is
-verified under ThreadSanitizer. The 31-part build log is at
+covered by tests (**585 checks across 34 suites**), and the concurrency is
+verified under ThreadSanitizer. The 32-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
@@ -133,7 +133,7 @@ and then opens as a full database serving `SELECT`.
 
 | Module | What it does | Mirrors |
 |---|---|---|
-| `raft.c` | **Raft consensus** — leader election, log replication, the five §5 safety properties, disk-persisted term/vote (prevents double-voting across a crash), log compaction + InstallSnapshot (§7). Verified on a *deterministic simulated network* that injects partitions, crashes, and reordering | etcd / Consul Raft |
+| `raft.c` | **Raft consensus** — leader election, log replication, the five §5 safety properties, disk-persisted term/vote (prevents double-voting across a crash), log compaction + InstallSnapshot (§7), and single-server membership changes (§6). Verified on a *deterministic simulated network* that injects partitions, crashes, and reordering | etcd / Consul Raft |
 | `replica.c` + `replnet.c` | **WAL replication** — a replica tails the primary's WAL and replays committed records (the crash-recovery redo, run as a stream); carried over a real socket via a walsender/walreceiver. **Wired end-to-end**: replicates the real engine's writes into a replica that serves `SELECT` (base snapshot + WAL replay, pg_basebackup-style) | PostgreSQL streaming replication |
 | `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree | RocksDB / LevelDB |
 | `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |

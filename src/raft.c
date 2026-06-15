@@ -27,6 +27,8 @@ static RaftEntry *ent(Raft *r, int64_t i) {
     return &r->log[i - r->log_base];
 }
 
+static void maybe_adopt_config(Raft *r, const RaftEntry *e); /* 아래 정의 */
+
 static int log_append(Raft *r, RaftEntry e) {
     if (r->log_len >= r->log_cap) {
         int64_t cap = r->log_cap * 2;
@@ -38,11 +40,42 @@ static int log_append(Raft *r, RaftEntry e) {
         r->log_cap = cap;
     }
     r->log[r->log_len++] = e;
+    maybe_adopt_config(r, &e); /* config 엔트리면 즉시 새 멤버십 채택(§6) */
     return 0;
 }
 
+/* ── 멤버십(§6): 과반·투표·복제 대상을 member_mask로 계산 ── */
+int raft_is_member(const Raft *r, int id) {
+    return (r->member_mask >> id) & 1u;
+}
+static int member_count(const Raft *r) {
+    int c = 0;
+    for (uint32_t m = r->member_mask; m; m &= m - 1) c++;
+    return c;
+}
 static int majority(const Raft *r) {
-    return r->n_nodes / 2 + 1;
+    return member_count(r) / 2 + 1;
+}
+/* config 엔트리가 로그에 들어오면 그 즉시 새 멤버 마스크를 채택한다(§6 규칙:
+ * 커밋을 기다리지 않는다). append 경로 어디서든 이걸 부른다. */
+static void maybe_adopt_config(Raft *r, const RaftEntry *e) {
+    if (e->is_config) {
+        r->member_mask = (uint32_t)e->command;
+    }
+}
+
+/* member_mask를 '권위 있게' 재계산한다: base(log_base 시점 멤버십)에서 시작해
+ * 남아있는 로그의 config 엔트리를 순서대로 적용. adopt-on-append의 대칭 짝 —
+ * 로그 꼬리가 truncate돼 config 엔트리가 롤백되면 이걸로 member_mask도 되돌린다. */
+static void recompute_member_mask(Raft *r) {
+    uint32_t m = r->base_member_mask;
+    for (int64_t i = r->log_base + 1; i <= r->log_base + r->log_len - 1; i++) {
+        RaftEntry *e = &r->log[i - r->log_base];
+        if (e->is_config) {
+            m = (uint32_t)e->command;
+        }
+    }
+    r->member_mask = m;
 }
 
 /* 후보의 로그가 나(투표자)만큼 최신인가 (§5.4.1 선거 제약). */
@@ -88,6 +121,7 @@ static void send_install_snapshot(Raft *r, int peer, RaftOutbox *out) {
     m.last_included_index = r->log_base;
     m.last_included_term = r->log[0].term;
     m.snapshot_value = r->snapshot_value;
+    m.member_mask = r->base_member_mask; /* 스냅샷 시점 멤버십 — 합류자가 이걸로 구성원이 됨 */
     push_msg(out, &m);
 }
 
@@ -119,15 +153,16 @@ static void send_append_entries(Raft *r, int peer, RaftOutbox *out) {
 
 static void become_leader(Raft *r, RaftOutbox *out) {
     r->role = RAFT_LEADER;
-    for (int i = 0; i < r->n_nodes; i++) {
+    for (int i = 0; i < RAFT_MAX_NODES; i++) {
+        if (!raft_is_member(r, i)) continue;
         r->next_index[i] = raft_last_log_index(r) + 1;
         r->match_index[i] = 0;
     }
     r->match_index[r->id] = raft_last_log_index(r);
     r->heartbeat_elapsed = 0;
     /* 즉시 하트비트(빈 AppendEntries)로 권위를 알린다 — 다른 후보의 선거를 막는다. */
-    for (int i = 0; i < r->n_nodes; i++) {
-        if (i != r->id) {
+    for (int i = 0; i < RAFT_MAX_NODES; i++) {
+        if (i != r->id && raft_is_member(r, i)) {
             send_append_entries(r, i, out);
         }
     }
@@ -143,8 +178,8 @@ static void become_candidate(Raft *r, RaftOutbox *out) {
         become_leader(r, out);
         return;
     }
-    for (int i = 0; i < r->n_nodes; i++) {
-        if (i == r->id) {
+    for (int i = 0; i < RAFT_MAX_NODES; i++) {
+        if (i == r->id || !raft_is_member(r, i)) {
             continue;
         }
         RaftMsg m;
@@ -181,6 +216,9 @@ int raft_init(Raft *r, int id, int n_nodes, int election_timeout, int heartbeat_
     memset(r, 0, sizeof(*r));
     r->id = id;
     r->n_nodes = n_nodes;
+    r->member_mask = (n_nodes >= 32) ? 0xFFFFFFFFu : ((1u << n_nodes) - 1u); /* 초기 0..n-1 구성원 */
+    r->base_member_mask = r->member_mask;
+    r->pending_config_index = -1;
     r->current_term = 0;
     r->voted_for = -1;
     r->log_cap = 16;
@@ -190,6 +228,7 @@ int raft_init(Raft *r, int id, int n_nodes, int election_timeout, int heartbeat_
     }
     r->log[0].term = 0; /* sentinel */
     r->log[0].command = 0;
+    r->log[0].is_config = 0;
     r->log_len = 1;
     r->role = RAFT_FOLLOWER;
     r->commit_index = 0;
@@ -213,13 +252,13 @@ void raft_tick(Raft *r, RaftOutbox *out) {
         r->heartbeat_elapsed++;
         if (r->heartbeat_elapsed >= r->heartbeat_timeout) {
             r->heartbeat_elapsed = 0;
-            for (int i = 0; i < r->n_nodes; i++) {
-                if (i != r->id) {
+            for (int i = 0; i < RAFT_MAX_NODES; i++) {
+                if (i != r->id && raft_is_member(r, i)) {
                     send_append_entries(r, i, out);
                 }
             }
         }
-    } else {
+    } else if (raft_is_member(r, r->id)) { /* 구성원이 아니면 선거를 시작하지 않는다 */
         r->election_elapsed++;
         if (r->election_elapsed >= r->election_timeout) {
             become_candidate(r, out); /* 리더가 안 보인다 -> 선거 시작 */
@@ -231,11 +270,44 @@ int64_t raft_submit(Raft *r, int64_t command) {
     if (r->role != RAFT_LEADER) {
         return -1;
     }
-    RaftEntry e = {.term = r->current_term, .command = command};
+    RaftEntry e = {.term = r->current_term, .command = command, .is_config = 0};
     if (log_append(r, e) != 0) {
         return -1;
     }
     r->match_index[r->id] = raft_last_log_index(r);
+    return raft_last_log_index(r);
+}
+
+/* 멤버십 변경(§6): 리더가 '변경 후 마스크'를 config 엔트리로 추가한다. log_append이
+ * 즉시 member_mask를 채택하고(§6), 새로 들어온 노드에는 next/match를 초기화해 다음
+ * 하트비트부터 복제한다. 안전을 위해 한 번에 한 노드 delta만 허용한다. */
+int64_t raft_change_config(Raft *r, uint32_t new_mask) {
+    if (r->role != RAFT_LEADER) {
+        return -1;
+    }
+    uint32_t diff = r->member_mask ^ new_mask;
+    if (diff == 0 || (diff & (diff - 1)) != 0) {
+        return -1; /* 정확히 한 비트만 바뀌어야 옛/새 과반이 겹쳐 안전(단일 서버 변경) */
+    }
+    /* §6 commit-wait: 직전 config 변경이 커밋되기 전엔 다음 변경을 금지한다.
+     * 겹치는 두 미커밋 변경이 옛/새 과반의 교집합 보장을 깨는 것을 막는다(단일-서버
+     * 방식의 알려진 결함을 Ongaro가 정정한 규칙). */
+    if (r->pending_config_index >= 0 && r->pending_config_index > r->commit_index) {
+        return -1;
+    }
+    RaftEntry e = {.term = r->current_term, .command = (int64_t)new_mask, .is_config = 1};
+    if (log_append(r, e) != 0) { /* log_append이 member_mask를 new_mask로 채택 */
+        return -1;
+    }
+    r->match_index[r->id] = raft_last_log_index(r);
+    r->pending_config_index = raft_last_log_index(r); /* 이 변경이 커밋될 때까지 다음 변경 금지 */
+    /* 새로 추가된 노드(diff 비트가 new_mask에 켜져 있으면)에 복제 시작점 세팅 */
+    for (int i = 0; i < RAFT_MAX_NODES; i++) {
+        if ((new_mask & (1u << i)) && i != r->id && r->next_index[i] == 0) {
+            r->next_index[i] = 1; /* 스냅샷/백트래킹으로 맞춰짐 */
+            r->match_index[i] = 0;
+        }
+    }
     return raft_last_log_index(r);
 }
 
@@ -309,6 +381,7 @@ static void handle_append_entries(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
      * 그 prefix를 이미 보장하므로 통과시키고 아래에서 log_base 이하 엔트리는 건너뛴다. */
 
     /* 엔트리 이어붙이기: 충돌(term 다름)이 나는 첫 지점부터 꼬리를 덮어쓴다. */
+    int truncated = 0;
     for (int i = 0; i < msg->n_entries; i++) {
         int64_t idx = msg->prev_log_index + 1 + i;
         if (idx <= r->log_base) {
@@ -317,6 +390,7 @@ static void handle_append_entries(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
         if (idx <= raft_last_log_index(r)) {
             if (term_at(r, idx) != msg->entries[i].term) {
                 r->log_len = idx - r->log_base; /* 충돌 꼬리 절단(물리 길이) */
+                truncated = 1;
                 log_append(r, msg->entries[i]);
             }
             /* 같으면 이미 가진 엔트리 -> 유지(커밋된 걸 지우지 않기 위함) */
@@ -326,6 +400,13 @@ static void handle_append_entries(Raft *r, const RaftMsg *msg, RaftMsg *reply) {
     }
     reply->success = 1;
     reply->match_index = msg->prev_log_index + msg->n_entries;
+
+    /* 꼬리를 truncate했다면 config 엔트리가 롤백됐을 수 있으므로, member_mask를 로그로
+     * 부터 권위 있게 재계산한다(adopt-on-append의 대칭 짝 — C2 수정). truncation이
+     * 없으면 log_append의 전방 채택으로 충분하다(정상 append 경로엔 손 안 댐). */
+    if (truncated) {
+        recompute_member_mask(r);
+    }
 
     /* 리더의 commit을 따라간다(내가 실제로 가진 데까지). */
     if (msg->leader_commit > r->commit_index) {
@@ -343,15 +424,25 @@ static void leader_advance_commit(Raft *r) {
         if (term_at(r, N) != r->current_term) {
             continue;
         }
-        int count = 1; /* 자기 자신 */
-        for (int i = 0; i < r->n_nodes; i++) {
-            if (i != r->id && r->match_index[i] >= N) {
+        /* 구성원 중 match_index >= N인 수를 센다. 자기 match_index[self]는 항상
+         * last_log_index로 유지되므로 자기도 이 루프에 포함된다(구성원일 때). */
+        int count = 0;
+        for (int i = 0; i < RAFT_MAX_NODES; i++) {
+            if (raft_is_member(r, i) && r->match_index[i] >= N) {
                 count++;
             }
         }
         if (count >= majority(r)) {
             r->commit_index = N;
+            if (r->pending_config_index >= 0 && r->commit_index >= r->pending_config_index) {
+                r->pending_config_index = -1; /* config 변경 커밋됨 -> 다음 변경 허용 */
+            }
             apply_committed(r);
+            /* §6(L2): 자기 자신을 제거하는 config가 '커밋된 뒤' 리더가 물러난다.
+             * (커밋 전엔 계속 리더로 남아 그 제거 엔트리를 새 구성에 복제해야 한다.) */
+            if (!raft_is_member(r, r->id)) {
+                become_follower(r, r->current_term);
+            }
             break;
         }
     }
@@ -405,11 +496,15 @@ static void handle_install_snapshot(Raft *r, const RaftMsg *msg, RaftMsg *reply)
      * 그 뒤 일부 엔트리를 갖고 있더라도 통째로 버린다 — 정확하되 약간 비효율). */
     r->log[0].term = msg->last_included_term;
     r->log[0].command = 0;
+    r->log[0].is_config = 0;
     r->log_len = 1;
     r->log_base = msg->last_included_index;
     r->commit_index = msg->last_included_index;
     r->last_applied = msg->last_included_index;
     r->snapshot_value = msg->snapshot_value;
+    /* 스냅샷에 담긴(압축된) config를 채택 — 스냅샷으로 합류한 노드가 구성원이 된다(C1 수정). */
+    r->base_member_mask = msg->member_mask;
+    r->member_mask = msg->member_mask;
     if (r->snap_install) {
         r->snap_install(r->id, msg->last_included_index, msg->snapshot_value, r->apply_ctx);
     }
@@ -464,11 +559,19 @@ int raft_snapshot(Raft *r, int64_t index, int64_t sm_state) {
         return -1; /* 이미 압축됐거나, 아직 커밋 안 됐거나, 범위 밖 */
     }
     uint64_t inc_term = term_at(r, index);
+    /* index까지의 config 엔트리를 base_member_mask로 접어 넣는다(그것들이 압축돼
+     * 사라지므로 — 이후 recompute/install의 기준이 된다). */
+    for (int64_t i = r->log_base + 1; i <= index; i++) {
+        if (ent(r, i)->is_config) {
+            r->base_member_mask = (uint32_t)ent(r, i)->command;
+        }
+    }
     int64_t keep = raft_last_log_index(r) - index; /* index+1.. 남길 엔트리 수 */
     int64_t src = (index + 1) - r->log_base;       /* 남길 첫 엔트리의 물리 위치 */
     memmove(&r->log[1], &r->log[src], (size_t)keep * sizeof(RaftEntry));
     r->log[0].term = inc_term; /* 마커: 논리 인덱스 index를 대표 */
     r->log[0].command = 0;
+    r->log[0].is_config = 0;
     r->log_len = keep + 1;
     r->log_base = index;
     r->snapshot_value = sm_state;
@@ -485,6 +588,7 @@ void raft_crash_restart(Raft *r) {
     r->votes_granted = 0;
     r->election_elapsed = 0;
     r->heartbeat_elapsed = 0;
+    r->pending_config_index = -1; /* 휘발 */
     memset(r->next_index, 0, sizeof(r->next_index));
     memset(r->match_index, 0, sizeof(r->match_index));
 }
@@ -528,6 +632,8 @@ int raft_save(const Raft *r, const char *path) {
     int rc = 0;
     if (wr_all(fd, &r->current_term, sizeof(r->current_term)) != 0 ||
         wr_all(fd, &r->voted_for, sizeof(r->voted_for)) != 0 ||
+        wr_all(fd, &r->member_mask, sizeof(r->member_mask)) != 0 ||
+        wr_all(fd, &r->base_member_mask, sizeof(r->base_member_mask)) != 0 ||
         wr_all(fd, &r->log_base, sizeof(r->log_base)) != 0 ||
         wr_all(fd, &r->snapshot_value, sizeof(r->snapshot_value)) != 0 ||
         wr_all(fd, &r->log_len, sizeof(r->log_len)) != 0 ||
@@ -548,8 +654,10 @@ int raft_load(Raft *r, const char *path) {
     }
     uint64_t term;
     int voted;
+    uint32_t mask, basemask;
     int64_t base, snap, len;
     if (rd_all(fd, &term, sizeof(term)) != 0 || rd_all(fd, &voted, sizeof(voted)) != 0 ||
+        rd_all(fd, &mask, sizeof(mask)) != 0 || rd_all(fd, &basemask, sizeof(basemask)) != 0 ||
         rd_all(fd, &base, sizeof(base)) != 0 || rd_all(fd, &snap, sizeof(snap)) != 0 ||
         rd_all(fd, &len, sizeof(len)) != 0 || len < 1) {
         close(fd);
@@ -571,6 +679,9 @@ int raft_load(Raft *r, const char *path) {
     close(fd);
     r->current_term = term;
     r->voted_for = voted;
+    r->member_mask = mask;
+    r->base_member_mask = basemask;
+    r->pending_config_index = -1; /* 휘발: 재기동 리더는 리더가 아니다 */
     r->log_base = base;
     r->snapshot_value = snap;
     r->log_len = len;

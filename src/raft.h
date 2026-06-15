@@ -41,10 +41,12 @@
 
 typedef enum { RAFT_FOLLOWER, RAFT_CANDIDATE, RAFT_LEADER } RaftRole;
 
-/* 로그 엔트리 = (그 엔트리가 만들어진 term, 상태기계 커맨드). */
+/* 로그 엔트리 = (term, 커맨드). is_config=1이면 멤버십 변경 엔트리(§6)로,
+ * command에 '변경 후 멤버 비트마스크'가 들어간다(상태기계엔 적용 안 함). */
 typedef struct {
     uint64_t term;
     int64_t command;
+    int is_config;
 } RaftEntry;
 
 typedef enum {
@@ -84,6 +86,8 @@ typedef struct {
     int64_t last_included_index; /* 스냅샷이 담은 마지막 인덱스 */
     uint64_t last_included_term; /* 그 인덱스의 term */
     int64_t snapshot_value;      /* 상태기계 스냅샷(학습용: 레지스터 SM의 값 하나) */
+    uint32_t member_mask;        /* 스냅샷 시점의 멤버십(§6): 스냅샷으로 합류한 노드가
+                                  * 압축돼 사라진 config 엔트리 대신 이걸로 구성원이 됨 */
 } RaftMsg;
 
 /* 노드가 이번 tick/수신에서 '보내고 싶은' 메시지들을 담는 봉투. 하버스가 라우팅한다. */
@@ -102,7 +106,14 @@ typedef void (*RaftSnapInstallFn)(int node_id, int64_t last_index, int64_t sm_st
 
 typedef struct {
     int id;
-    int n_nodes;                /* 클러스터 크기(과반 계산용) */
+    int n_nodes;                /* 초기 클러스터 크기(member_mask 초기화용) */
+    /* 멤버십(§6): 비트 i가 켜져 있으면 노드 i가 현재 클러스터 구성원. 과반·투표·
+     * 복제 대상이 모두 이 마스크로 계산된다. config 엔트리를 '로그에 보자마자'
+     * 갱신한다(커밋 때가 아니라 — §6 안전 규칙). 지속 상태. */
+    uint32_t member_mask;
+    uint32_t base_member_mask;  /* log_base 시점의 멤버십(스냅샷/truncation 복구 기준). 지속 */
+    int64_t pending_config_index; /* 리더가 낸 미커밋 config 엔트리 인덱스(-1=없음).
+                                   * §6: 직전 변경이 커밋되기 전엔 다음 변경 금지(commit-wait). 휘발 */
 
     /* ---- 지속 상태(persistent): 크래시에도 살아남아야 한다 ---- */
     uint64_t current_term;
@@ -166,6 +177,14 @@ int raft_save(const Raft *r, const char *path);
 /* raft_init으로 초기화된 노드에 디스크의 지속 상태를 되읽는다. 휘발 상태는
  * init 기본값 그대로(§5.1: 크래시 시 volatile은 잃어도 됨). 0 성공, -1 실패. */
 int raft_load(Raft *r, const char *path);
+
+/* 멤버십 변경(§6, 단일 서버 방식): 리더가 '변경 후 멤버 마스크'를 config 로그
+ * 엔트리로 추가하고 복제한다. 한 번에 한 노드만 add/remove해야 옛/새 과반이 겹쳐
+ * 안전하다(joint consensus 불필요). 리더 아니면 -1, 성공 시 엔트리 인덱스. */
+int64_t raft_change_config(Raft *r, uint32_t new_member_mask);
+
+/* 노드 i가 현재 클러스터 구성원인가(관측용). */
+int raft_is_member(const Raft *r, int id);
 
 /* 로그 압축(§7): index까지의 로그를 버리고 스냅샷으로 대체한다. index는 이미
  * 커밋·적용된 지점이어야 한다(index <= commit_index, index > log_base). sm_state는

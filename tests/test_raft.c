@@ -436,6 +436,115 @@ int main(void) {
         unlink(path);
     }
 
+    /* ── 11. 멤버십 변경(§6, 단일 서버): 노드 추가·제거 ──────────
+     * 시작은 3-멤버 {0,1,2}, 노드3은 passive(비구성원). 리더가 노드3을 추가하면
+     * config 엔트리가 복제돼 노드3이 '로그에 보자마자' 구성원이 되고 따라잡는다.
+     * 이어서 노드2를 제거하면 과반이 재계산돼 {0,1,3}로 계속 커밋한다. */
+    {
+        cluster_init(4);
+        for (int i = 0; i < 3; i++) g.nodes[i].member_mask = 0x7; /* {0,1,2} */
+        g.nodes[3].member_mask = 0x0;                             /* passive joiner */
+        cluster_run(20);
+        int lead = find_leader();
+        CHECK(lead >= 0 && lead < 3, "멤버십: {0,1,2}에서 리더 선출(노드3 제외)");
+        CHECK(!raft_is_member(&g.nodes[3], 3), "멤버십: 노드3은 아직 비구성원");
+        raft_submit(&g.nodes[lead], 11);
+        cluster_run(15);
+        CHECK(g.nodes[lead].commit_index >= 1, "멤버십: 3-멤버로 커밋");
+
+        /* 노드 3 추가 */
+        CHECK(raft_change_config(&g.nodes[lead], 0xF) > 0, "멤버십: 노드3 추가(config 엔트리)");
+        cluster_run(30);
+        CHECK(raft_is_member(&g.nodes[3], 3), "멤버십: 노드3이 구성원으로 채택(로그에 보자마자)");
+        CHECK(g.nodes[3].commit_index == g.nodes[lead].commit_index,
+              "멤버십: 추가된 노드3이 로그를 따라잡음");
+        raft_submit(&g.nodes[lead], 22);
+        cluster_run(20);
+        int all4 = 1;
+        for (int i = 0; i < 4; i++)
+            if (g.nodes[i].commit_index != g.nodes[lead].commit_index) all4 = 0;
+        CHECK(all4, "멤버십: 4-멤버로 새 엔트리 전원 커밋");
+
+        /* 노드 2 제거(단일 서버 delta 검증) + decommission */
+        CHECK(raft_change_config(&g.nodes[lead], 0xB) > 0, "멤버십: 노드2 제거(config 엔트리)");
+        CHECK(raft_change_config(&g.nodes[lead], 0x0) == -1,
+              "멤버십: 한 번에 여러 노드 변경은 거부(단일 서버 안전)");
+        g.alive[2] = 0; /* 제거된 노드는 decommission(live 제거 시 선거 disruption은 프론티어) */
+        cluster_run(30);
+        CHECK(!raft_is_member(&g.nodes[lead], 2), "멤버십: 노드2가 비구성원으로");
+
+        int64_t before = g.nodes[lead].commit_index;
+        raft_submit(&g.nodes[lead], 33);
+        cluster_run(20);
+        CHECK(g.nodes[lead].commit_index > before, "멤버십: 노드2 없이 {0,1,3}로 계속 커밋");
+        int ok013 = g.nodes[0].commit_index == g.nodes[lead].commit_index &&
+                    g.nodes[1].commit_index == g.nodes[lead].commit_index &&
+                    g.nodes[3].commit_index == g.nodes[lead].commit_index;
+        CHECK(ok013, "멤버십: 남은 {0,1,3}가 합의 유지");
+    }
+
+    /* ── 12. 멤버십 정확성 수정(적대적 리뷰 반영) ─────────────────
+     * 리뷰어가 찾은 4건: C1(스냅샷 합류자 member_mask 누락)·C2(truncation 시 config
+     * 미복구)·L1(commit-wait 부재)·L2(자기 제거 리더 미강등)를 각각 검증한다. */
+    {
+        /* C1: InstallSnapshot이 member_mask를 설치 -> 스냅샷으로 합류한 노드가 구성원 */
+        cluster_init(3);
+        Raft *N = &g.nodes[2];
+        N->member_mask = 0x0;
+        N->base_member_mask = 0x0; /* passive joiner */
+        RaftMsg is;
+        memset(&is, 0, sizeof is);
+        is.type = MSG_INSTALL_SNAPSHOT; is.from = 0; is.to = 2; is.term = 1;
+        is.last_included_index = 5; is.last_included_term = 1; is.snapshot_value = 100;
+        is.member_mask = 0x7; /* 스냅샷이 담은 멤버십 */
+        RaftMsg rep; int hr = 0; RaftOutbox out; out.n = 0;
+        raft_recv(N, &is, &rep, &hr, &out);
+        CHECK(N->member_mask == 0x7 && raft_is_member(N, 2),
+              "C1: InstallSnapshot이 member_mask 설치(스냅샷 합류자가 구성원됨)");
+
+        /* C2: adopt한 미커밋 config가 truncation으로 롤백되면 member_mask도 복구 */
+        cluster_init(3); /* base_member_mask=0x7 */
+        Raft *F = &g.nodes[1];
+        F->current_term = 1;
+        RaftMsg ae;
+        memset(&ae, 0, sizeof ae);
+        ae.type = MSG_APPEND_ENTRIES; ae.from = 0; ae.to = 1; ae.term = 1;
+        ae.prev_log_index = 0; ae.prev_log_term = 0;
+        ae.entries[0].term = 1; ae.entries[0].command = 0xF; ae.entries[0].is_config = 1;
+        ae.n_entries = 1; ae.leader_commit = 0;
+        raft_recv(F, &ae, &rep, &hr, &out);
+        CHECK(F->member_mask == 0xF, "C2 전: 미커밋 config를 adopt-on-append로 채택(0xF)");
+        RaftMsg ae2; /* 더 높은 term의 리더가 idx1을 비-config로 덮어씀(truncation) */
+        memset(&ae2, 0, sizeof ae2);
+        ae2.type = MSG_APPEND_ENTRIES; ae2.from = 2; ae2.to = 1; ae2.term = 2;
+        ae2.prev_log_index = 0; ae2.prev_log_term = 0;
+        ae2.entries[0].term = 2; ae2.entries[0].command = 999; ae2.entries[0].is_config = 0;
+        ae2.n_entries = 1; ae2.leader_commit = 0;
+        raft_recv(F, &ae2, &rep, &hr, &out);
+        CHECK(F->member_mask == 0x7, "C2: 롤백된 config가 member_mask에서 복구됨(0x7)");
+
+        /* L1: 직전 config 변경이 커밋되기 전엔 다음 변경 거부(commit-wait) */
+        cluster_init(4);
+        for (int i = 0; i < 3; i++) { g.nodes[i].member_mask = 0x7; g.nodes[i].base_member_mask = 0x7; }
+        g.nodes[3].member_mask = 0x0; g.nodes[3].base_member_mask = 0x0;
+        cluster_run(20);
+        int lead = find_leader();
+        CHECK(raft_change_config(&g.nodes[lead], 0xF) > 0, "L1: 첫 변경(노드3 추가) 수락");
+        CHECK(raft_change_config(&g.nodes[lead], 0xD) == -1,
+              "L1: 직전 변경 미커밋 중 두 번째 변경 거부(commit-wait)");
+        cluster_run(30);
+        CHECK(raft_change_config(&g.nodes[lead], 0xB) > 0, "L1: 커밋 후 다음 변경 수락");
+
+        /* L2: 자기 자신을 제거한 리더는 그 config가 커밋된 뒤 물러난다 */
+        cluster_init(3);
+        cluster_run(20);
+        int L = find_leader();
+        uint32_t without_self = 0x7 & ~(1u << L);
+        CHECK(raft_change_config(&g.nodes[L], without_self) > 0, "L2: 리더가 자기 제거 config 추가");
+        cluster_run(40);
+        CHECK(g.nodes[L].role != RAFT_LEADER, "L2: 자기 제거가 커밋된 뒤 리더 강등");
+    }
+
     for (int i = 0; i < RAFT_MAX_NODES; i++) {
         if (g.nodes[i].log) raft_free(&g.nodes[i]);
     }
