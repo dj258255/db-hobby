@@ -40,6 +40,29 @@ typedef struct LSM LSM;
  * threshold개를 넘으면 put/delete가 자동으로 flush를 유발한다. 실패 시 NULL. */
 LSM *lsm_open(const char *dir, size_t memtable_threshold);
 
+/* lsm_open과 같되 multi=1이면 '멀티값(비유니크)' 모드로 연다. 유니크 모드는 한 key에
+ * 값 하나(dedup 단위 = key)지만, 멀티 모드는 한 key에 여러 값을 담고 dedup 단위가
+ * (key,val) 짝이 된다. DB의 다중버전 인덱스(한 PK -> 여러 행 버전 RID)가 요구하는
+ * 모드다. 멀티 모드에서는 lsm_put_dup/lsm_delete_val/lsm_find_all/lsm_scan을 쓰고,
+ * 유니크 전용인 lsm_put/lsm_delete/lsm_get은 쓰지 않는다(반대도 마찬가지). */
+LSM *lsm_open_multi(const char *dir, size_t memtable_threshold, int multi);
+
+/* [멀티] (key,val) 짝을 추가한다. 같은 key의 다른 val을 가리지 않는다(비유니크).
+ * 같은 (key,val)을 다시 넣으면 tombstone만 해제된다. 성공 0, 실패 -1. */
+int lsm_put_dup(LSM *l, int64_t key, int64_t val);
+
+/* [멀티] 특정 (key,val) 짝만 tombstone 한다(그 짝만 삭제). 성공 0, 실패 -1. */
+int lsm_delete_val(LSM *l, int64_t key, int64_t val);
+
+/* [멀티] key의 살아있는 모든 val을 (val 오름차순) 콜백으로 넘긴다. 방문 개수 반환.
+ * (key,val)마다 최신 버전이 이기고, tombstone된 짝은 건너뛴다. */
+int64_t lsm_find_all(LSM *l, int64_t key,
+                     void (*cb)(int64_t key, int64_t val, void *ctx), void *ctx);
+
+/* 모든 SSTable을 unlink 하고 memtable을 비운다(빈 상태로 리셋). heap 같은 상위
+ * 진실의 원천에서 인덱스를 재구축하기 직전에 부른다. */
+void lsm_clear(LSM *l);
+
 /* 닫는다. 주의: memtable(인메모리)은 flush 하지 않은 채 버려진다 — 우리는 WAL을
  * 두지 않았기 때문(단순화). 살아남기려면 close 전에 lsm_flush를 부르거나 임계치로
  * flush를 유발해야 한다. 이미 flush된 SSTable은 디스크에 남아 reopen 시 읽힌다. */

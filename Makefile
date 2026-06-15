@@ -4,13 +4,13 @@ CFLAGS += -pthread   # 트랙 D: 버퍼 풀 latch·스레드 서버
 BUILD := build
 
 # 핵심 소스 (계층이 늘면 여기에 추가)
-SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/btree.c src/wal.c src/lock.c src/mvcc.c src/replica.c src/replnet.c
+SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/btree.c src/wal.c src/lock.c src/mvcc.c src/replica.c src/replnet.c src/lsm.c
 
 # REPL/서버 바이너리에만 링크되는 소스(테스트엔 불필요)
 BINSRCS := src/server.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_raft test_repl_e2e test_raftdb
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_lsm_engine test_raft test_repl_e2e test_raftdb
 
 .PHONY: test repl serve clean bench test-tsan
 
@@ -29,7 +29,8 @@ $(BUILD)/test_cbtree: tests/test_cbtree.c src/cbtree.c | $(BUILD)
 $(BUILD)/test_joinopt: tests/test_joinopt.c src/joinopt.c | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(filter %.c,$^) -o $@
 
-# lsm도 엔진과 별개(독립 LSM 저장 엔진, db.c 저장 계층에 미배선). lsm.c만 링크.
+# test_lsm은 LSM을 단위(unit)로 검증하므로 lsm.c만 링크한다. (35편에서 lsm.c는
+# SRCS에 편입돼 db.c의 PK 인덱스 저장 엔진으로도 배선됐다 — USING lsm.)
 $(BUILD)/test_lsm: tests/test_lsm.c src/lsm.c | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(filter %.c,$^) -o $@
 

@@ -109,6 +109,7 @@ typedef struct {
     char table[SQL_NAME_LEN];
     ColumnDef columns[SQL_MAX_COLS];
     int num_columns;
+    int index_kind; /* PK 인덱스 저장 엔진: 0=B+Tree(기본), 1=LSM. `USING lsm`로 지정 */
 } CreateStmt;
 
 typedef struct {

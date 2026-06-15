@@ -157,6 +157,82 @@ static void catalog_write(Database *db) {
     fclose(f);
 }
 
+/* ── PK 인덱스 추상화(Table Access Method): B+Tree 또는 LSM ───────────────
+ * 실행기는 PK 인덱스를 '키(PK) -> RID' 매핑으로만 쓴다. 그 매핑을 제자리 갱신
+ * B+Tree로 담을지, append-only LSM으로 담을지는 테이블마다 `USING`으로 고른다.
+ * 둘 다 '한 PK -> 여러 RID'(MVCC 다중버전)라 비유니크(dup)여야 한다 — B+Tree는
+ * btree_insert_dup, LSM은 멀티값 모드(lsm_put_dup)가 그 역할을 한다.
+ *
+ * ── 정직한 경계 ──────────────────────────────────────────────────────
+ * LSM PK 인덱스는 B+Tree 인덱스와 달리 자체 WAL/트랜잭션 롤백에 참여하지 않는다.
+ * 대신 WAL-backed heap을 진실의 원천으로 삼는 '파생 가속기'다: 재오픈·롤백 시
+ * heap에서 통째로 재구축하고(lsm_pk_rebuild), 중단된 트랜잭션이 남긴 dangling
+ * 항목은 읽기 경로의 heap 가시성 게이트(point_visit/range_visit의 rec_visible)가
+ * 걸러낸다. 그래서 인덱스가 잠깐 부정확해도 결과는 항상 옳다.
+ * ──────────────────────────────────────────────────────────────────── */
+#define LSM_PK_THRESHOLD 256 /* memtable 임계치(넘으면 SSTable로 flush) */
+
+/* btree_visit_fn(반환값=중단)과 lsm 콜백(void) 사이 어댑터. */
+typedef struct { btree_visit_fn visit; void *ctx; } PidxCb;
+static void pidx_cb_adapter(int64_t key, int64_t val, void *ctx_) {
+    PidxCb *a = ctx_;
+    a->visit((bkey_t)key, (bval_t)val, a->ctx); /* LSM 스캔은 조기중단을 안 쓰므로 반환 무시 */
+}
+
+/* PK 인덱스에 (키 -> RID) 추가(비유니크: 같은 PK의 여러 버전 공존). */
+static void pidx_insert(Table *t, int64_t key, RID rid) {
+    if (t->index_kind == 1) lsm_put_dup(t->lindex, key, rid_encode(rid));
+    else btree_insert_dup(&t->index, key, rid_encode(rid));
+}
+
+/* PK 인덱스에서 특정 (키, RID) 짝만 제거(VACUUM이 죽은 버전 정리 시). */
+static void pidx_delete(Table *t, int64_t key, RID rid) {
+    if (t->index_kind == 1) lsm_delete_val(t->lindex, key, rid_encode(rid));
+    else btree_delete_val(&t->index, key, rid_encode(rid));
+}
+
+/* PK '=' 점 조회: 그 키의 모든 버전 RID를 visit로 넘긴다(가시성 판정은 콜백이). */
+static void pidx_find_all(Table *t, int64_t key, btree_visit_fn visit, void *ctx) {
+    if (t->index_kind == 1) {
+        PidxCb a = {visit, ctx};
+        lsm_find_all(t->lindex, key, pidx_cb_adapter, &a);
+    } else {
+        btree_find_all(&t->index, key, visit, ctx);
+    }
+}
+
+/* PK 범위 조회(<,>,<=,>=): 콜백(range_visit)이 op·가시성으로 최종 필터링한다.
+ * LSM은 lsm_scan에 [lo,hi]를 주고, B+Tree는 seek/full-scan을 그대로 쓴다. */
+static void pidx_range(Table *t, int op, int64_t bound, btree_visit_fn visit, void *ctx) {
+    if (t->index_kind == 1) {
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        if (op == CMP_GT || op == CMP_GE) lo = bound; /* 하한만 */
+        else hi = bound;                              /* LT/LE: 상한만 */
+        PidxCb a = {visit, ctx};
+        lsm_scan(t->lindex, lo, hi, pidx_cb_adapter, &a);
+    } else {
+        if (op == CMP_GT || op == CMP_GE) btree_seek_scan(&t->index, bound, visit, ctx);
+        else btree_scan(&t->index, visit, ctx);
+    }
+}
+
+/* heap의 모든 튜플(라이브·죽은 버전 무관)에 대해 (PK -> RID)를 LSM 인덱스에 심는다.
+ * B+Tree 인덱스가 VACUUM 전까지 모든 버전 항목을 갖는 것과 같은 multiset을 만든다. */
+static int lsm_pk_build_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)len;
+    Table *t = ctx_;
+    Value row[SQL_MAX_COLS];
+    decode_row(&t->schema, (const uint8_t *)rec, row);
+    if (row[0].type == VAL_INT) lsm_put_dup(t->lindex, row[0].int_val, rid_encode(rid));
+    return 0;
+}
+
+/* LSM PK 인덱스를 비우고 heap에서 다시 채운다(재오픈·롤백 후 heap과 동기화). */
+static void lsm_pk_rebuild(Table *t) {
+    lsm_clear(t->lindex);
+    heap_scan(&t->heap, lsm_pk_build_visit, t);
+}
+
 /* 테이블 파일(.tbl, .idx, .wal)을 열어 Heap/B+Tree를 준비한다. schema는 미리 채워둘 것.
  * wal_open이 .wal 로그를 읽어 크래시 복구(redo/discard)를 먼저 수행한다. */
 static int table_open_files(Table *t, const char *dbpath) {
@@ -175,11 +251,23 @@ static int table_open_files(Table *t, const char *dbpath) {
     }
     heap_init(&t->heap, t->bp, &t->wal.data, 0); /* 테이블 파일은 순수 힙: page 0부터 */
     t->has_index = 0;
+    t->index_kind = t->schema.index_kind; /* 카탈로그에 영속된 저장 엔진 선택 */
+    t->lindex = NULL;
     if (t->schema.num_columns > 0 && t->schema.columns[0].type == COL_INT) {
-        char ip[700];
-        snprintf(ip, sizeof(ip), "%s.%s.idx", dbpath, t->schema.table);
-        if (btree_open(&t->index, ip) == 0) {
+        if (t->index_kind == 1) {
+            /* LSM PK 인덱스: 디렉터리로 연 뒤 heap에서 재구축(파생 가속기). */
+            char ld[720];
+            snprintf(ld, sizeof(ld), "%s.%s.lsmidx", dbpath, t->schema.table);
+            t->lindex = lsm_open_multi(ld, LSM_PK_THRESHOLD, 1);
+            if (!t->lindex) return -1;
             t->has_index = 1;
+            lsm_pk_rebuild(t); /* 옛 SSTable을 비우고 heap의 모든 버전으로 다시 채움 */
+        } else {
+            char ip[700];
+            snprintf(ip, sizeof(ip), "%s.%s.idx", dbpath, t->schema.table);
+            if (btree_open(&t->index, ip) == 0) {
+                t->has_index = 1;
+            }
         }
     }
     /* 보조 인덱스들(재오픈 시 카탈로그가 채운 num_sec/sec[]대로). 새 테이블은 num_sec=0. */
@@ -199,7 +287,12 @@ static void table_close_files(Table *t) {
     }
     t->num_sec = 0;
     if (t->has_index) {
-        btree_close(&t->index);
+        if (t->index_kind == 1) {
+            lsm_close(t->lindex); /* memtable은 버려짐 — 재오픈 때 heap에서 재구축 */
+            t->lindex = NULL;
+        } else {
+            btree_close(&t->index);
+        }
         t->has_index = 0;
     }
     if (t->bp) {
@@ -654,8 +747,8 @@ static int exec_insert(Database *db, const InsertStmt *in, FILE *out) {
     if (t->has_index && in->values[0].type == VAL_INT) {
         /* 버전마다 인덱스 항목을 단다(PostgreSQL식) — 다중 버전에선 같은 PK의 옛/새
          * 버전이 공존하므로, 유니크 덮어쓰기 대신 (키,RID) 짝을 추가하고 조회가
-         * '보이는' 버전을 고른다. */
-        btree_insert_dup(&t->index, in->values[0].int_val, rid_encode(rid));
+         * '보이는' 버전을 고른다. B+Tree든 LSM이든 pidx가 라우팅한다. */
+        pidx_insert(t, in->values[0].int_val, rid);
     }
     for (int k = 0; k < t->num_sec; k++) { /* 보조 인덱스도 (컬럼값 -> RID) 등록 */
         int col = t->sec[k].col;
@@ -2356,17 +2449,13 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         /* = -> 점 조회 O(log n). 같은 키의 버전 후보들 중 '보이는' 것만. */
         db->used_index = 1;
         PointCtx pc = {t, out, 0};
-        btree_find_all(&t->index, c0->val.int_val, point_visit, &pc);
+        pidx_find_all(t, c0->val.int_val, point_visit, &pc);
         count = pc.count;
     } else if (pk_range && range_use_idx) {
         /* <, >, <=, >= 이고 비용상 인덱스가 쌈 -> 인덱스 범위 스캔 (리프 체인) */
         db->used_index = 1;
         RangeCtx rc = {t, c0->val.int_val, c0->op, out, 0};
-        if (c0->op == CMP_GT || c0->op == CMP_GE) {
-            btree_seek_scan(&t->index, c0->val.int_val, range_visit, &rc);
-        } else {
-            btree_scan(&t->index, range_visit, &rc);
-        }
+        pidx_range(t, c0->op, c0->val.int_val, range_visit, &rc);
         count = rc.count;
     } else if (sec_index_for(t, tname, c0, pk_cond) >= 0) {
         /* 비PK 컬럼 = 값 -> 보조 인덱스 find_all + heap_get + WHERE 재검사 */
@@ -2488,7 +2577,7 @@ static int exec_update(Database *db, const UpdateStmt *u, FILE *out) {
          * 스냅샷 reader가 옛 버전을 인덱스로 찾을 수 있어야 한다(다중 버전 인덱스).
          * 죽은 버전의 항목은 나중에 VACUUM이 짝(키,RID)으로 지운다. */
         if (t->has_index && row[0].type == VAL_INT) {
-            btree_insert_dup(&t->index, row[0].int_val, rid_encode(newrid));
+            pidx_insert(t, row[0].int_val, newrid);
         }
         for (int k = 0; k < t->num_sec; k++) {
             int col = t->sec[k].col;
@@ -2593,7 +2682,7 @@ static int vacuum_table(Database *db, Table *t, FILE *out) {
     for (int i = 0; i < c.n; i++) {
         DeadRef *e = &c.dead[i];
         if (e->has_pk) {
-            btree_delete_val(&t->index, e->pk, rid_encode(e->rid));
+            pidx_delete(t, e->pk, e->rid);
         }
         for (int k = 0; k < t->num_sec; k++) {
             if (e->has_sk[k]) {
@@ -2722,7 +2811,7 @@ static void table_begin_write(Database *db, Table *t, int txn) {
     bufpool_set_steal_handler(t->bp, wal_steal_cb, &t->wal);
     wal_begin(&t->wal);
     t->txn_data_pages = t->wal.data.num_pages;
-    if (t->has_index) {
+    if (t->has_index && t->index_kind == 0) { /* LSM 인덱스는 자체 WAL/롤백에 미참여 */
         bufpool_set_no_steal(t->index.bp, 1);
         bufpool_set_steal_handler(t->index.bp, wal_steal_cb, &t->index.wal);
         wal_begin(&t->index.wal);
@@ -2746,7 +2835,7 @@ static void txn_commit_tables(Database *db, int txn) {
         wal_flush_commit(t->bp, &t->wal); /* 데이터: WAL로 원자 커밋 */
         bufpool_set_no_steal(t->bp, 0);
         bufpool_set_steal_handler(t->bp, NULL, NULL);
-        if (t->has_index) {
+        if (t->has_index && t->index_kind == 0) { /* LSM은 커밋할 인덱스 WAL이 없다(라이브 반영) */
             wal_flush_commit(t->index.bp, &t->index.wal); /* 인덱스: 인덱스 WAL로 */
             bufpool_set_no_steal(t->index.bp, 0);
             bufpool_set_steal_handler(t->index.bp, NULL, NULL);
@@ -2774,13 +2863,17 @@ static void txn_abort_tables(Database *db, int txn) {
         pager_truncate(&t->wal.data, t->txn_data_pages); /* non-steal 경로의 새 페이지 제거 */
         bufpool_set_no_steal(t->bp, 0);
         bufpool_set_steal_handler(t->bp, NULL, NULL);
-        if (t->has_index) {
+        if (t->has_index && t->index_kind == 0) {
             wal_undo(&t->index.wal);
             bufpool_invalidate_all(t->index.bp);
             pager_truncate(&t->index.wal.data, t->txn_index_pages);
             btree_reload_root(&t->index); /* 루트가 분할로 바뀌었을 수 있으니 다시 읽는다 */
             bufpool_set_no_steal(t->index.bp, 0);
             bufpool_set_steal_handler(t->index.bp, NULL, NULL);
+        } else if (t->has_index && t->index_kind == 1) {
+            /* LSM 인덱스는 롤백되지 않으니, 이미 롤백된 heap에서 통째로 재구축해
+             * 동기화한다(중단 txn이 남긴 dangling 항목 제거). */
+            lsm_pk_rebuild(t);
         }
         for (int k = 0; k < t->num_sec; k++) {
             wal_undo(&t->sec[k].tree.wal);

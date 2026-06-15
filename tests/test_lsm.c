@@ -124,6 +124,60 @@ int main(void) {
     CHECK(lsm_get(l, 5, &v) == 1 && v == 999999, "reopen 후 새 put이 옛 SSTable 값을 가림");
     lsm_close(l);
 
+    /* ── 8) 멀티값(비유니크) 모드: 한 key에 여러 val ─────────────────────
+     * DB의 다중버전 PK 인덱스(한 PK -> 여러 행 버전 RID)가 요구하는 모드.
+     * dedup 단위가 key가 아니라 (key,val)이라, 같은 key의 서로 다른 val이 공존하고
+     * delete_val이 특정 짝만 지운다. */
+    system("rm -rf " DIR "_m");
+    LSM *m = lsm_open_multi(DIR "_m", 2, 1); /* threshold 2: flush 자주 유발 */
+    CHECK(m != NULL, "multi lsm_open_multi 성공");
+
+    /* 한 key(1)에 세 개의 val을 append — 서로 가리지 않는다 */
+    lsm_put_dup(m, 1, 100);
+    lsm_put_dup(m, 1, 101);
+    lsm_put_dup(m, 1, 102); /* threshold 2 넘겨 flush 유발 -> memtable+SSTable 혼재 */
+    lsm_put_dup(m, 2, 200);
+
+    ScanCtx f1 = {.n = 0, .ordered = 1};
+    int64_t c1 = lsm_find_all(m, 1, scan_cb, &f1);
+    CHECK(c1 == 3 && f1.n == 3, "find_all(1): 같은 key의 세 val 모두 반환(3개)");
+    CHECK(f1.vals[0] == 100 && f1.vals[1] == 101 && f1.vals[2] == 102,
+          "find_all(1): val 오름차순 {100,101,102} — memtable/SSTable 경계 넘어 dedup by (key,val)");
+
+    /* 특정 (key,val) 짝만 tombstone */
+    lsm_delete_val(m, 1, 101);
+    ScanCtx f2 = {.n = 0, .ordered = 1};
+    int64_t c2 = lsm_find_all(m, 1, scan_cb, &f2);
+    CHECK(c2 == 2 && f2.vals[0] == 100 && f2.vals[1] == 102,
+          "delete_val(1,101): 그 짝만 삭제 -> {100,102} (다른 짝 살아있음)");
+
+    /* tombstone된 짝을 다시 put_dup -> 되살아난다(최신이 이긴다) */
+    lsm_put_dup(m, 1, 101);
+    ScanCtx f3 = {.n = 0, .ordered = 1};
+    int64_t c3 = lsm_find_all(m, 1, scan_cb, &f3);
+    CHECK(c3 == 3, "re-put_dup(1,101): tombstone 위에 최신 put -> 부활(3개)");
+
+    /* 멀티 모드 range scan: 살아있는 모든 (key,val) 방문, key 오름차순 */
+    ScanCtx rs = {.n = 0, .ordered = 1};
+    int64_t rc = lsm_scan(m, 0, 10, scan_cb, &rs);
+    CHECK(rc == 4 && rs.n == 4, "multi scan[0,10]: 살아있는 짝 4개 (1->3개 + 2->1개)");
+    CHECK(rs.keys[0] == 1 && rs.keys[3] == 2, "multi scan: key 오름차순 유지");
+
+    /* compaction 후에도 멀티값 dedup·tombstone 청소가 (key,val) 단위로 정확 */
+    lsm_flush(m);
+    lsm_compact(m);
+    ScanCtx f4 = {.n = 0, .ordered = 1};
+    int64_t c4 = lsm_find_all(m, 1, scan_cb, &f4);
+    CHECK(c4 == 3 && f4.vals[0] == 100 && f4.vals[1] == 101 && f4.vals[2] == 102,
+          "compaction 후에도 (key,val) 단위 라이브 유지: {100,101,102}");
+
+    /* lsm_clear: 재구축 직전 전체 리셋 */
+    lsm_clear(m);
+    CHECK(lsm_sstable_count(m) == 0, "lsm_clear: SSTable 전부 제거");
+    CHECK(lsm_find_all(m, 1, scan_cb, &f4) == 0, "lsm_clear 후 빈 상태");
+    lsm_close(m);
+    system("rm -rf " DIR "_m");
+
     cleanup(); /* 끝나면 임시 파일 제거 */
 
     if (failures == 0) { printf("\n모든 테스트 통과\n"); return 0; }

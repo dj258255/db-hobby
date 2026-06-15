@@ -410,6 +410,7 @@ static void parse_create(Parser *p, Statement *st) {
     st->type = STMT_CREATE;
     CreateStmt *c = &st->create;
     c->num_columns = 0;
+    c->index_kind = 0; /* 기본 B+Tree */
     p_expect(p, TOK_TABLE, "CREATE 다음에 TABLE이 필요합니다");
     parse_name(p, c->table);
     p_expect(p, TOK_LPAREN, "( 가 필요합니다");
@@ -439,6 +440,17 @@ static void parse_create(Parser *p, Statement *st) {
         }
     }
     p_expect(p, TOK_RPAREN, ") 가 필요합니다");
+
+    /* 선택적 `USING <engine>` — PK 인덱스 저장 엔진 선택(B+Tree vs LSM).
+     * USING/lsm/btree는 키워드가 아니라 식별자로 렉싱되므로 텍스트로 매칭한다. */
+    if (p->ok && p->cur.type == TOK_IDENT && !strcasecmp(p->cur.text, "USING")) {
+        p_advance(p);
+        char eng[SQL_NAME_LEN];
+        parse_name(p, eng);
+        if (!strcasecmp(eng, "lsm")) c->index_kind = 1;
+        else if (!strcasecmp(eng, "btree")) c->index_kind = 0;
+        else p_fail(p, "USING 다음에는 lsm 또는 btree가 필요합니다");
+    }
 }
 
 /* CREATE INDEX <name> ON <table>(<col>) */

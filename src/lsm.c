@@ -59,8 +59,9 @@ typedef struct {
 struct LSM {
     char    dir[900];
     size_t  threshold;
+    int     multi;        /* 0=유니크(dedup 단위 key), 1=멀티값(dedup 단위 (key,val)) */
 
-    Entry  *mem;          /* 정렬 동적 배열 memtable */
+    Entry  *mem;          /* 정렬 동적 배열 memtable. 유니크는 key순, 멀티는 (key,val)순 */
     size_t  mem_n, mem_cap;
 
     SSTable **ssts;       /* seq 오름차순(뒤가 최신). get은 뒤에서 앞으로 훑는다. */
@@ -90,6 +91,42 @@ static int mem_upsert(LSM *l, int64_t key, int64_t val, int tomb) {
     size_t pos = mem_bsearch(l, key, &found);
     if (found) {
         l->mem[pos].val = val;
+        l->mem[pos].tomb = tomb;
+        return 0;
+    }
+    if (l->mem_n == l->mem_cap) {
+        size_t nc = l->mem_cap ? l->mem_cap * 2 : 16;
+        Entry *ne = realloc(l->mem, nc * sizeof(Entry));
+        if (!ne) return -1;
+        l->mem = ne;
+        l->mem_cap = nc;
+    }
+    memmove(&l->mem[pos + 1], &l->mem[pos], (l->mem_n - pos) * sizeof(Entry));
+    l->mem[pos] = (Entry){key, val, tomb};
+    l->mem_n++;
+    return 0;
+}
+
+/* [멀티] (key,val) 짝으로 이진탐색. 있으면 그 인덱스, 없으면 삽입 위치를 lo로. */
+static size_t mem_bsearch2(const LSM *l, int64_t key, int64_t val, int *found) {
+    size_t lo = 0, hi = l->mem_n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int64_t k = l->mem[mid].key, v = l->mem[mid].val;
+        if (k < key || (k == key && v < val)) lo = mid + 1;
+        else if (k > key || (k == key && v > val)) hi = mid;
+        else { *found = 1; return mid; }
+    }
+    *found = 0;
+    return lo;
+}
+
+/* [멀티] (key,val) 짝 기록. 같은 짝이 있으면 tombstone 비트만 갱신, 없으면 정렬
+ * 위치((key,val)순)에 삽입. 유니크 mem_upsert와 달리 다른 val을 덮지 않는다. */
+static int mem_upsert_dup(LSM *l, int64_t key, int64_t val, int tomb) {
+    int found;
+    size_t pos = mem_bsearch2(l, key, val, &found);
+    if (found) {
         l->mem[pos].tomb = tomb;
         return 0;
     }
@@ -206,11 +243,16 @@ static int lsm_add_sst(LSM *l, SSTable *s) {
 /* ── 공개 API ────────────────────────────────────────────────────── */
 
 LSM *lsm_open(const char *dir, size_t memtable_threshold) {
+    return lsm_open_multi(dir, memtable_threshold, 0);
+}
+
+LSM *lsm_open_multi(const char *dir, size_t memtable_threshold, int multi) {
     if (!dir || memtable_threshold == 0) return NULL;
     LSM *l = calloc(1, sizeof(LSM));
     if (!l) return NULL;
     snprintf(l->dir, sizeof(l->dir), "%s", dir);
     l->threshold = memtable_threshold;
+    l->multi = multi;
     l->next_seq = 1;
 
     mkdir(dir, 0777); /* 있으면 EEXIST 무시 */
@@ -285,6 +327,28 @@ int lsm_delete(LSM *l, int64_t key) {
     return maybe_flush(l);
 }
 
+int lsm_put_dup(LSM *l, int64_t key, int64_t val) {
+    if (!l) return -1;
+    if (mem_upsert_dup(l, key, val, 0) != 0) return -1;
+    return maybe_flush(l);
+}
+
+int lsm_delete_val(LSM *l, int64_t key, int64_t val) {
+    if (!l) return -1;
+    if (mem_upsert_dup(l, key, val, 1) != 0) return -1; /* 그 (key,val) 짝만 tombstone */
+    return maybe_flush(l);
+}
+
+void lsm_clear(LSM *l) {
+    if (!l) return;
+    for (size_t i = 0; i < l->nsst; i++) {
+        unlink(l->ssts[i]->path);
+        sst_close(l->ssts[i]);
+    }
+    l->nsst = 0;
+    l->mem_n = 0;
+}
+
 int lsm_get(LSM *l, int64_t key, int64_t *out) {
     if (!l) return 0;
     /* 1) memtable(가장 최신) */
@@ -331,6 +395,23 @@ static int mentry_cmp(const void *a, const void *b) {
     return 0;
 }
 
+/* [멀티] (key asc, val asc, prio desc): 같은 (key,val) 짝의 최신이 그 짝의 맨 앞. */
+static int mentry_cmp_multi(const void *a, const void *b) {
+    const MEntry *x = a, *y = b;
+    if (x->key < y->key) return -1;
+    if (x->key > y->key) return 1;
+    if (x->val < y->val) return -1;
+    if (x->val > y->val) return 1;
+    if (x->prio > y->prio) return -1;
+    if (x->prio < y->prio) return 1;
+    return 0;
+}
+
+/* dedup 그룹 경계: 유니크는 key, 멀티는 (key,val)가 같으면 같은 그룹(=옛 버전). */
+static int same_group(const MEntry *a, const MEntry *b, int multi) {
+    return a->key == b->key && (!multi || a->val == b->val);
+}
+
 /* memtable + SSTable 전부를 하나의 MEntry 배열로 수집(prio 부여). */
 static MEntry *collect_all(LSM *l, size_t *out_n) {
     size_t cap = l->mem_n;
@@ -348,7 +429,7 @@ static MEntry *collect_all(LSM *l, size_t *out_n) {
             arr[n++] = (MEntry){k, v, t, s->seq};
         }
     }
-    qsort(arr, n, sizeof(MEntry), mentry_cmp);
+    qsort(arr, n, sizeof(MEntry), l->multi ? mentry_cmp_multi : mentry_cmp);
     *out_n = n;
     return arr;
 }
@@ -373,19 +454,18 @@ int lsm_compact(LSM *l) {
             arr[n++] = (MEntry){k, v, t, s->seq};
         }
     }
-    qsort(arr, n, sizeof(MEntry), mentry_cmp);
+    qsort(arr, n, sizeof(MEntry), l->multi ? mentry_cmp_multi : mentry_cmp);
 
-    /* 키마다 최신(맨 앞) 하나만. 전체 compaction이라 옛 데이터가 남지 않으므로
-     * tombstone은 버린다(진짜 삭제 완료 = VACUUM이 죽은 버전을 청소하던 그 지점). */
+    /* 그룹(유니크=key, 멀티=(key,val))마다 최신(맨 앞) 하나만. 전체 compaction이라
+     * 옛 데이터가 남지 않으므로 tombstone은 버린다(진짜 삭제 완료 = VACUUM 지점). */
     Entry *live = malloc((n ? n : 1) * sizeof(Entry));
     if (!live) { free(arr); return -1; }
     size_t ln = 0;
     for (size_t i = 0; i < n;) {
-        int64_t key = arr[i].key;
-        /* arr[i]가 이 key의 최신(prio 최대) */
-        if (!arr[i].tomb) live[ln++] = (Entry){key, arr[i].val, 0};
+        MEntry cur = arr[i]; /* 이 그룹의 최신(prio 최대) */
+        if (!cur.tomb) live[ln++] = (Entry){cur.key, cur.val, 0};
         i++;
-        while (i < n && arr[i].key == key) i++; /* 같은 key 나머지(옛 버전) 스킵 */
+        while (i < n && same_group(&arr[i], &cur, l->multi)) i++; /* 옛 버전 스킵 */
     }
     free(arr);
 
@@ -416,17 +496,38 @@ int64_t lsm_scan(LSM *l, int64_t lo, int64_t hi,
     size_t n = 0;
     MEntry *arr = collect_all(l, &n);
     if (!arr) return 0;
-    /* (key asc, prio desc) 정렬 상태. 키마다 최신 하나만, tombstone·범위밖 스킵. */
+    /* 정렬 상태. 그룹(유니크=key, 멀티=(key,val))마다 최신 하나만, tombstone·범위밖 스킵.
+     * 멀티 모드에선 같은 key의 살아있는 여러 val을 모두 방문한다(다중버전 인덱스). */
     int64_t cnt = 0;
     for (size_t i = 0; i < n;) {
-        int64_t key = arr[i].key;
-        int tomb = arr[i].tomb;
-        int64_t val = arr[i].val;
+        MEntry cur = arr[i];
         i++;
-        while (i < n && arr[i].key == key) i++;
-        if (key < lo || key > hi) continue;
-        if (tomb) continue;
-        if (cb) cb(key, val, ctx);
+        while (i < n && same_group(&arr[i], &cur, l->multi)) i++;
+        if (cur.key < lo || cur.key > hi) continue;
+        if (cur.tomb) continue;
+        if (cb) cb(cur.key, cur.val, ctx);
+        cnt++;
+    }
+    free(arr);
+    return cnt;
+}
+
+/* [멀티] key의 살아있는 모든 val을 (val 오름차순) 방문. (key,val)마다 최신이 이기고
+ * tombstone된 짝은 스킵. 다중버전 PK 인덱스의 '= 점 조회'가 쓰는 경로. */
+int64_t lsm_find_all(LSM *l, int64_t key,
+                     void (*cb)(int64_t key, int64_t val, void *ctx), void *ctx) {
+    if (!l) return 0;
+    size_t n = 0;
+    MEntry *arr = collect_all(l, &n);
+    if (!arr) return 0;
+    int64_t cnt = 0;
+    for (size_t i = 0; i < n;) {
+        MEntry cur = arr[i];
+        i++;
+        while (i < n && same_group(&arr[i], &cur, l->multi)) i++;
+        if (cur.key != key) continue;
+        if (cur.tomb) continue;
+        if (cb) cb(cur.key, cur.val, ctx);
         cnt++;
     }
     free(arr);

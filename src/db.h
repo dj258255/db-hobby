@@ -6,6 +6,7 @@
 #include "bufpool.h"
 #include "heap.h"
 #include "btree.h"
+#include "lsm.h"
 #include "wal.h"
 #include "sql.h"
 #include "lock.h"
@@ -64,8 +65,10 @@ typedef struct {
     Wal wal; /* 데이터 파일(.tbl)을 WAL로 감싼다. 데이터 페이저는 wal.data 안에 있다. */
     BufferPool *bp;
     Heap heap;
-    BTree index; /* 첫 컬럼(INT PK) 인덱스 */
+    BTree index; /* 첫 컬럼(INT PK) 인덱스 — index_kind==0(B+Tree)일 때 사용 */
     int has_index;
+    int index_kind;  /* 0=B+Tree(제자리, 읽기 최적), 1=LSM(append, 쓰기 최적). schema.index_kind 사본 */
+    LSM *lindex;     /* index_kind==1일 때 PK 인덱스(멀티값 LSM). heap에서 파생·재구축된다 */
 
     SecIndex sec[DB_MAX_SEC_IDX]; /* 보조 인덱스들 */
     int num_sec;
