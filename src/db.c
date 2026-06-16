@@ -1,5 +1,6 @@
 #include "db.h"
 #include "page.h" /* VACUUM의 슬롯 검사·compaction */
+#include "parscan.h" /* 병렬 풀 스캔(36편) — 스트리밍 SELECT 풀스캔 배선 */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -787,6 +788,71 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
     print_row(ctx->out, ctx->schema, row);
     ctx->count++;
     return 0;
+}
+
+/* ── 병렬 스트리밍 풀스캔(37편): 36편 parscan을 실제 SELECT에 배선 ──────────
+ * 뜨거운 부분(가시성 판정 + WHERE 평가)을 워커들이 병렬로 돌려 매칭 RID를 페이지
+ * 순서로 모으고, 유일하게 스레드 안전하지 않은 '출력'은 leader가 직렬로 한다.
+ * 그래서 결과는 직렬 경로와 바이트 단위로 동일하다. engine_mtx가 실행을 직렬화하는
+ * 동안(동시 writer 없음) 힙·스냅샷·스키마·WHERE는 모두 읽기 전용이라 안전하다. */
+#define PARSCAN_MIN_PAGES 16 /* 이 미만이면 병렬 오버헤드가 이득보다 커 직렬로 */
+#define PARSCAN_WORKERS   4
+
+/* WHERE에 서브쿼리(scalar/IN-SELECT)가 있으면 술어가 실행기를 재진입 → 병렬 불가. */
+static int where_has_subquery(const Where *w) {
+    for (int g = 0; g < w->count; g++)
+        for (int i = 0; i < w->groups[g].count; i++)
+            if (w->groups[g].conds[i].sub != NULL) return 1;
+    return 0;
+}
+
+typedef struct {
+    const CreateStmt *schema;
+    const char       *tname;
+    const Where      *where;
+    Database         *db;
+    int               my_txn;
+} ParSelCtx;
+
+/* 워커 술어: 가시성 게이트 + WHERE 평가(둘 다 읽기 전용). 매칭이면 1. */
+static int parsel_pred(RID rid, const void *rec, uint16_t len, void *ctx_) {
+    (void)rid; (void)len;
+    ParSelCtx *c = ctx_;
+    if (!row_visible(c->db, db_rec_xmin(rec), db_rec_xmax(rec), c->my_txn)) return 0;
+    Value row[SQL_MAX_COLS];
+    decode_row(c->schema, rec, row);
+    return where_matches(c->schema, c->tname, c->where, row);
+}
+
+/* 자격이 되면 병렬로 풀스캔해 결과를 출력하고 1을 반환(호출자는 직렬 스킵).
+ * 자격 미달(작은 테이블/서브쿼리/에러)이면 0을 반환 → 호출자가 직렬로 폴백. */
+static int parallel_fullscan(Database *db, Table *t, const char *tname,
+                             const Where *where, FILE *out, int *count_out) {
+    uint64_t np = t->heap.pager->num_pages;
+    uint64_t pages = (np > t->heap.first_page) ? (np - t->heap.first_page) : 0;
+    if (pages < PARSCAN_MIN_PAGES) return 0;   /* 작은 테이블은 직렬이 낫다 */
+    if (where_has_subquery(where)) return 0;   /* 서브쿼리는 실행기 재진입 → 직렬 */
+
+    ParSelCtx pc = {&t->schema, tname, where, db, db->cur_txn};
+    ParscanResult res;
+    if (parscan_collect(&t->heap, PARSCAN_WORKERS, parsel_pred, &pc, &res) != 0)
+        return 0; /* 병렬 실패 시 조용히 직렬 폴백 */
+
+    /* leader가 페이지 순서(res는 이미 페이지 순서)로 직렬 출력 — 직렬과 바이트 동일. */
+    int n = 0;
+    uint8_t recbuf[PAGE_SIZE];
+    uint16_t len;
+    for (int64_t i = 0; i < res.n; i++) {
+        if (heap_get(&t->heap, res.rids[i], recbuf, &len) == 0) {
+            Value row[SQL_MAX_COLS];
+            decode_row(&t->schema, recbuf, row);
+            print_row(out, &t->schema, row);
+            n++;
+        }
+    }
+    parscan_result_free(&res);
+    *count_out = n;
+    return 1;
 }
 
 /* 인덱스 범위 스캔: B+Tree가 준 (키, RID)마다 힙 행을 읽어 출력한다.
@@ -2464,8 +2530,10 @@ static int exec_select(Database *db, const SelectStmt *sel, FILE *out) {
         SecScanCtx sc = {t, tname, &sel->where, out, 0};
         btree_find_all(&t->sec[sk].tree, c0->val.int_val, sec_scan_visit, &sc);
         count = sc.count;
+    } else if (parallel_fullscan(db, t, tname, &sel->where, out, &count)) {
+        /* 큰 테이블 + 서브쿼리 없는 WHERE -> 병렬 풀스캔(37편). count 채워짐. */
     } else {
-        /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> 풀 스캔 */
+        /* 그 외(WHERE 없음/복합/비PK/TEXT 비교) -> (직렬) 풀 스캔 */
         SelectCtx ctx = {&t->schema, tname, &sel->where, out, 0, db, db->cur_txn};
         heap_scan(&t->heap, select_visit, &ctx);
         count = ctx.count;
