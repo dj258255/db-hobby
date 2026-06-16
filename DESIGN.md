@@ -63,6 +63,7 @@ SELECT * FROM users WHERE id = 1;
 | **동시성** | 스레드 안전 버퍼 풀, latch crabbing B+Tree | InnoDB latch | 20·22 |
 | **비용 옵티마이저** | ANALYZE 통계·선택도, Selinger 조인 순서 DP | System R planner | 21·24 |
 | **저장 대조** | 힙(PG) vs 클러스터드(InnoDB), LSM(RocksDB) | 세 저장 철학 | 23·27 |
+| **교체 가능 인덱스** | PK 인덱스를 B+Tree/LSM 중 선택(`USING lsm`), Table Access Method | PG tableam / MyRocks | 35 |
 | **복제** | WAL 로그 시핑(replica가 redo 재생), TCP 전송 | PG streaming replication | 25·26 |
 | **합의(Raft)** | 리더 선출·로그 복제·안전성·지속성·스냅샷 | etcd/Consul Raft | 28·29·30 |
 

@@ -21,8 +21,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**603 checks across 35 suites**), and the concurrency is
-verified under ThreadSanitizer. The 34-part build log is at
+covered by tests (**634 checks across 36 suites**), and the concurrency is
+verified under ThreadSanitizer. The 35-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
@@ -127,17 +127,18 @@ mydb.orders.idx.wal
 The core above is one coherent single-node database. On top of it, the harder
 axes of a real system are built as **focused, independently-tested modules** —
 each with an honest boundary spelled out in its part of the build log. Most are
-kept as standalone modules (so the 560+ green tests stay safe), each marking
-where it ends and integration would begin — **except replication, which is wired
-end-to-end as a capstone**: a replica replays the *real engine's* committed WAL
-and then opens as a full database serving `SELECT`.
+kept as standalone modules (so the 600+ green tests stay safe), each marking
+where it ends and integration would begin — **except three capstones wired
+end-to-end**: WAL replication (a replica replays the *real engine's* committed
+WAL and serves `SELECT`), Raft state-machine replication (`raftdb.c`), and the
+**LSM tree as a pluggable PK index** (`CREATE TABLE … USING lsm`).
 
 | Module | What it does | Mirrors |
 |---|---|---|
 | `raft.c` | **Raft consensus** — leader election, log replication, the five §5 safety properties, disk-persisted term/vote (prevents double-voting across a crash), log compaction + InstallSnapshot (§7), and single-server membership changes (§6). Verified on a *deterministic simulated network* that injects partitions, crashes, and reordering | etcd / Consul Raft |
 | `raftdb.c` | **Raft-replicated HA database** — state-machine replication wiring `raft.c` onto the real `db.c` engine: a write is proposed to Raft, and every node applies the committed command to its own engine. Survives leader death (failover); engines stay consistent; linearizable reads via ReadIndex (a partitioned old leader is refused, not served stale) | etcd / TiKV, replicated SQL |
 | `replica.c` + `replnet.c` | **WAL replication** — a replica tails the primary's WAL and replays committed records (the crash-recovery redo, run as a stream); carried over a real socket via a walsender/walreceiver. **Wired end-to-end**: replicates the real engine's writes into a replica that serves `SELECT` (base snapshot + WAL replay, pg_basebackup-style) | PostgreSQL streaming replication |
-| `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree | RocksDB / LevelDB |
+| `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree. **Wired into the engine** as a pluggable PK index (`CREATE TABLE … USING lsm`): a multi-value mode holds the non-unique PK→RID multimap that MVCC needs, routed through a small Table Access Method (`pidx_*`) | RocksDB / MyRocks |
 | `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |
 | `cbtree.c` | a **concurrent B+Tree** with latch crabbing (per-node rwlocks), ThreadSanitizer-clean | InnoDB index concurrency |
 

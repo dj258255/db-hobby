@@ -3,7 +3,7 @@
 진행 상황 한눈에. 블로그 시리즈(1~12편)와 그 뒤 추가분을 추적한다.
 세부 한계는 `README.md`의 "Scope", 구조는 `DESIGN.md` 참고.
 
-현재: **테스트 603개 / 35스위트 통과.**
+현재: **테스트 634개 / 36스위트 통과.**
 
 > 저장 철학에 따라 갈리는 일을 나눈다 — **A: PostgreSQL식**(현재 정체성), **B: MySQL/InnoDB 대조**,
 > 저장과 무관한 SQL 마무리는 **C**. 공통 핵심은 이미 다 만들었다(Done).
@@ -133,10 +133,11 @@ db-hobby는 전부 단일 노드다. 여기서 축이 완전히 바뀐다(MIT 6.
 
 ---
 
-## 트랙 I — 대체 스토리지 엔진 (B-Tree <-> LSM) — **LSM 코어 도달(27편)**
+## 트랙 I — 대체 스토리지 엔진 (B-Tree <-> LSM) — **실제 엔진 배선(35편)**
 
 트랙 B가 "PG 힙 vs InnoDB 클러스터드"를 한 코드에서 대조하듯, 여기선 "B-Tree vs LSM-Tree"를 대조한다. RocksDB/LevelDB 내부.
-- [~] **I1. LSM 스토리지 모드(27편)** — `src/lsm.c`: memtable(인메모리 정렬) + 임계치 flush로 불변 SSTable 생성. 제자리 갱신 없음, 삭제는 tombstone. read path는 memtable->최신 SSTable 순(read amp). 독립 모듈(test_lsm, 24). db.c 저장계층 배선은 프론티어
+- [x] **I1. LSM 스토리지 모드(27편)** — `src/lsm.c`: memtable(인메모리 정렬) + 임계치 flush로 불변 SSTable 생성. 제자리 갱신 없음, 삭제는 tombstone. read path는 memtable->최신 SSTable 순(read amp). 독립 모듈(test_lsm).
+- [x] **I5. LSM을 실제 PK 인덱스로 배선(35편)** — `CREATE TABLE ... USING lsm`. PK 인덱스는 MVCC 다중버전 때문에 '한 PK -> 여러 RID' 비유니크 멀티맵이라, LSM에 멀티값 모드(dedup 단위 (key,val))를 더해 담는다. 실행기 5개 지점을 Table Access Method(`pidx_*`)로 라우팅. LSM 인덱스는 WAL-backed heap의 파생 가속기(재오픈·롤백 시 재구축, dangling은 가시성 게이트가 무해화). B+Tree와 점/범위/UPDATE/DELETE/VACUUM/ROLLBACK/재오픈 동치를 test_lsm_engine(22)로 증명. 보조 인덱스 LSM화·인덱스 WAL 내구성은 프론티어
 - [~] **I2. Compaction(27편)** — 모든 SSTable을 하나로 merge, 키당 최신만 남기고 tombstone 청소, SSTable 개수 축소. leveled/tiered 계층화는 프론티어
 - [ ] **I3. Bloom filter** — SSTable별 존재 필터로 읽기 증폭 감소
 - [ ] **I4. `make bench`로 B-Tree vs LSM** — 쓰기 많은/읽기 많은 워크로드에서 write/read amplification 비교
