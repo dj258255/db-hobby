@@ -1461,6 +1461,147 @@ static int aggregate_rowset(const SelectStmt *sel, Value *rows, int n, int ncols
 }
 
 /* 단일 테이블 투영/집계: WHERE에 맞는 행을 모아 aggregate_rowset에 넘긴다. */
+/* ── 진짜 병렬 부분 집계(39편): 행을 안 모으고 누적만 — 메모리 O(워커수×항목수) ──
+ * 38편은 매칭 행을 모두 모은 뒤 집계했다(메모리 O(매칭행수)). 39편은 워커가 자기
+ * 페이지 범위를 훑으며 항목별 부분합(total/cnt/sum/min/max)만 '누적'하고, leader가
+ * 부분합을 결합해 compute_cell과 같은 OutCell을 만든다 — 행을 하나도 안 쌓는다.
+ * PostgreSQL의 Partial Aggregate -> Finalize Aggregate 두 단계와 같은 결.
+ * 자격: 그룹/HAVING/DISTINCT 없는 순수 집계, 모든 항목이 INT 집계(또는 COUNT(*)),
+ * 서브쿼리 없는 WHERE, 큰 테이블. 그 외는 38편(수집)·직렬 경로로 폴백. */
+typedef struct {
+    long total;      /* 매칭 행 수 (COUNT(*)) */
+    long cnt;        /* 비NULL 개수 (COUNT(col)/SUM/AVG) */
+    long sum;        /* 합 (SUM/AVG) */
+    long minv, maxv; /* 최소/최대 (INT) */
+    int  seen;       /* 비NULL을 하나라도 봤나 */
+} AggPart;
+
+typedef struct {
+    const CreateStmt *schema;
+    const char       *tname;
+    const Where      *where;
+    Database         *db;
+    int               my_txn;
+    const SelectStmt *sel;
+    const int        *item_ci;         /* 공유 읽기전용: 항목별 컬럼 인덱스(-1=COUNT(*)) */
+    AggPart           part[SQL_MAX_COLS]; /* 워커 전용 누적(락 불필요) */
+} AggWctx;
+
+/* 워커: 가시성 게이트 + WHERE 통과 행에 대해 항목별 부분합을 누적(행은 안 모음). */
+static void agg_worker_visit(RID rid, const void *rec, uint16_t len, void *c_) {
+    (void)rid; (void)len;
+    AggWctx *w = c_;
+    if (!row_visible(w->db, db_rec_xmin(rec), db_rec_xmax(rec), w->my_txn)) return;
+    Value row[SQL_MAX_COLS];
+    decode_row(w->schema, rec, row);
+    if (!where_matches(w->schema, w->tname, w->where, row)) return;
+    for (int k = 0; k < w->sel->num_items; k++) {
+        const SelectItem *it = &w->sel->items[k];
+        AggPart *p = &w->part[k];
+        p->total++;
+        if (it->agg == AGG_COUNT && it->star) continue; /* COUNT(*): 행 수만 */
+        const Value *v = &row[w->item_ci[k]];
+        if (v->type == VAL_NULL) continue;              /* COUNT(col)/SUM/AVG/MIN/MAX는 NULL 무시 */
+        long iv = v->int_val;
+        p->cnt++;
+        p->sum += iv;
+        if (!p->seen) { p->minv = p->maxv = iv; p->seen = 1; }
+        else { if (iv < p->minv) p->minv = iv; if (iv > p->maxv) p->maxv = iv; }
+    }
+}
+
+static int try_parallel_partial_aggregate(Table *t, const char *tname,
+                                          const SelectStmt *sel, FILE *out) {
+    if (!sel->has_aggregate) return 0;
+    if (sel->group_col[0] || sel->has_having || sel->distinct) return 0;
+    if (where_has_subquery(&sel->where)) return 0;
+
+    Database *db = t->owner;
+    uint64_t np = t->heap.pager->num_pages;
+    uint64_t pages = (np > t->heap.first_page) ? (np - t->heap.first_page) : 0;
+    if (pages < PARSCAN_MIN_PAGES) return 0;
+
+    int ncols = t->schema.num_columns;
+    ColRef cols[SQL_MAX_COLS];
+    for (int i = 0; i < ncols; i++) {
+        cols[i].tbl = tname;
+        cols[i].col = t->schema.columns[i].name;
+        cols[i].is_int = (t->schema.columns[i].type == COL_INT);
+    }
+    /* 항목 해소 + INT 검증. 부적합(투영 섞임·없는 컬럼·비INT SUM/AVG/MIN/MAX)이면
+     * 폴백 → 직렬/38 경로가 처리(에러 메시지도 거기서 일관되게). */
+    int item_ci[SQL_MAX_COLS];
+    for (int k = 0; k < sel->num_items; k++) {
+        const SelectItem *it = &sel->items[k];
+        if (it->agg == AGG_NONE) return 0;
+        if (it->agg == AGG_COUNT && it->star) { item_ci[k] = -1; continue; }
+        int ci = find_col(cols, ncols, it->tbl, it->col);
+        if (ci < 0) return 0;
+        if (!cols[ci].is_int) return 0; /* TEXT MIN/MAX 등은 직렬로 */
+        item_ci[k] = ci;
+    }
+
+    int nw = PARSCAN_WORKERS;
+    AggWctx *wctx = calloc((size_t)nw, sizeof(AggWctx));
+    void **ctxs = calloc((size_t)nw, sizeof(void *));
+    if (!wctx || !ctxs) { free(wctx); free(ctxs); return 0; }
+    for (int i = 0; i < nw; i++) {
+        wctx[i].schema = &t->schema;
+        wctx[i].tname = tname;
+        wctx[i].where = &sel->where;
+        wctx[i].db = db;
+        wctx[i].my_txn = db->cur_txn;
+        wctx[i].sel = sel;
+        wctx[i].item_ci = item_ci;
+        ctxs[i] = &wctx[i];
+    }
+    if (parscan_foreach(&t->heap, nw, ctxs, agg_worker_visit) != 0) {
+        free(wctx); free(ctxs); return 0; /* 폴백 */
+    }
+
+    /* Finalize: 워커 부분합을 결합해 compute_cell과 같은 OutCell을 만든다. */
+    OutCell outbuf[SQL_MAX_COLS];
+    for (int k = 0; k < sel->num_items; k++) {
+        const SelectItem *it = &sel->items[k];
+        long total = 0, cnt = 0, sum = 0, minv = 0, maxv = 0;
+        int seen = 0;
+        for (int i = 0; i < nw; i++) {
+            AggPart *p = &wctx[i].part[k];
+            total += p->total;
+            cnt += p->cnt;
+            sum += p->sum;
+            if (p->seen) {
+                if (!seen) { minv = p->minv; maxv = p->maxv; seen = 1; }
+                else { if (p->minv < minv) minv = p->minv; if (p->maxv > maxv) maxv = p->maxv; }
+            }
+        }
+        OutCell c = {0, 0, 0.0, {0}};
+        if (it->agg == AGG_COUNT && it->star) {
+            c.num = (double)total;
+        } else if (it->agg == AGG_COUNT) {
+            c.num = (double)cnt;
+        } else if (it->agg == AGG_SUM || it->agg == AGG_AVG) {
+            if (!seen) c.is_null = 1;
+            else c.num = (it->agg == AGG_SUM) ? (double)sum : (double)sum / cnt;
+        } else { /* MIN / MAX (INT) */
+            if (!seen) c.is_null = 1;
+            else c.num = (double)((it->agg == AGG_MIN) ? minv : maxv);
+        }
+        outbuf[k] = c;
+    }
+    free(wctx);
+    free(ctxs);
+
+    /* 헤더 + emit_out_rows(행 + 푸터) — 직렬 aggregate_rowset과 출력 형식 동일. */
+    for (int k = 0; k < sel->num_items; k++) {
+        if (k) fprintf(out, " | ");
+        print_item_label(out, &sel->items[k]);
+    }
+    fprintf(out, "\n");
+    emit_out_rows(sel, outbuf, 1, out);
+    return 1;
+}
+
 /* ── 병렬 집계(38편): 집계/GROUP BY의 행 수집을 병렬로 + materialize cap 우회 ──
  * 직렬 exec_select_project는 SELECT_MAX_ROWS까지만 모아 큰 테이블 집계를 '조용히
  * 절단'한다(6000행 테이블의 COUNT(*)가 4096을 주는 버그). 여기선 워커가 가시성
@@ -1513,7 +1654,11 @@ static int try_parallel_aggregate(Table *t, const char *tname, const SelectStmt 
 
 static int exec_select_project(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
     int ncols = t->schema.num_columns;
-    /* 병렬 집계(38편): 큰 테이블의 집계/GROUP BY는 병렬 수집 + cap 우회 경로로.
+    /* 진짜 부분 집계(39편): 그룹 없는 순수 집계는 행을 안 모으고 병렬 누적만(메모리 O(1)). */
+    if (try_parallel_partial_aggregate(t, tname, sel, out)) {
+        return 0;
+    }
+    /* 병렬 집계(38편): 그 외 집계/GROUP BY는 병렬 수집 + cap 우회 경로로.
      * 자격 미달(작은 테이블/서브쿼리/순수 투영)이면 아래 직렬 경로로 폴백. */
     if (try_parallel_aggregate(t, tname, sel, out)) {
         return 0;

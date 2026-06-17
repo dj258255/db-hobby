@@ -67,6 +67,75 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+/* ── 일반화 프리미티브: 워커별 컨텍스트로 병렬 순회 ─────────────────────── */
+typedef struct {
+    Heap     *h;
+    page_id_t lo, hi;
+    void    (*visit)(RID, const void *, uint16_t, void *);
+    void     *ctx;   /* 이 워커 전용 컨텍스트 */
+    int       rc;
+} FeWorker;
+
+static void *fe_worker_main(void *arg) {
+    FeWorker *w = arg;
+    w->rc = 0;
+    for (page_id_t pid = w->lo; pid < w->hi; pid++) {
+        void *page = bufpool_fetch(w->h->bp, pid);
+        if (!page) { w->rc = -1; return NULL; }
+        uint16_t n = slotpage_num_slots(page);
+        for (uint16_t s = 0; s < n; s++) {
+            const void *rec;
+            uint16_t len;
+            if (slotpage_get(page, s, &rec, &len) == 0) {
+                RID rid = {pid, s};
+                w->visit(rid, rec, len, w->ctx); /* pin 중 인라인 — rec 유효 */
+            }
+        }
+        bufpool_unpin(w->h->bp, pid, 0);
+    }
+    return NULL;
+}
+
+int parscan_foreach(Heap *h, int nworkers, void **ctxs,
+                    void (*visit)(RID, const void *, uint16_t, void *)) {
+    if (!h || !ctxs || !visit) return -1;
+    if (nworkers < 1) nworkers = 1;
+    uint64_t np = h->pager->num_pages;
+    page_id_t first = h->first_page;
+    uint64_t total = (np > first) ? (np - first) : 0;
+    if (total == 0) return 0;
+    if ((uint64_t)nworkers > total) nworkers = (int)total;
+
+    FeWorker *ws = calloc((size_t)nworkers, sizeof(FeWorker));
+    pthread_t *th = calloc((size_t)nworkers, sizeof(pthread_t));
+    if (!ws || !th) { free(ws); free(th); return -1; }
+
+    uint64_t chunk = (total + (uint64_t)nworkers - 1) / (uint64_t)nworkers;
+    for (int i = 0; i < nworkers; i++) {
+        ws[i].h = h;
+        ws[i].visit = visit;
+        ws[i].ctx = ctxs[i];
+        ws[i].lo = (page_id_t)(first + (uint64_t)i * chunk);
+        uint64_t hi = first + (uint64_t)(i + 1) * chunk;
+        if (hi > np) hi = np;
+        ws[i].hi = (page_id_t)hi;
+        if (ws[i].lo > ws[i].hi) ws[i].lo = ws[i].hi;
+    }
+
+    int spawned = 0, rc = 0;
+    for (int i = 0; i < nworkers; i++) {
+        if (pthread_create(&th[i], NULL, fe_worker_main, &ws[i]) != 0) { rc = -1; break; }
+        spawned++;
+    }
+    for (int i = 0; i < spawned; i++) {
+        pthread_join(th[i], NULL);
+        if (ws[i].rc != 0) rc = -1;
+    }
+    free(ws);
+    free(th);
+    return rc;
+}
+
 int parscan_collect(Heap *h, int nworkers, parscan_pred_fn pred, void *ctx,
                     ParscanResult *out) {
     if (!h || !out) return -1;

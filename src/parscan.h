@@ -53,4 +53,12 @@ int parscan_collect(Heap *h, int nworkers, parscan_pred_fn pred, void *ctx,
 
 void parscan_result_free(ParscanResult *r);
 
+/* 일반화 프리미티브: nworkers 스레드가 [first_page, num_pages)를 연속 블록으로 나눠
+ * 훑으며, 각 살아있는 슬롯마다 visit(rid, rec, len, ctxs[wid])를 부른다. ctxs[wid]는
+ * '워커 전용' 컨텍스트라 visit이 거기에 자유롭게 누적해도 락이 필요 없다(부분 집계
+ * 같은 map-reduce에 쓴다). read-only heap 접근. 성공 0, 실패(스레드 생성) -1.
+ * 주의: 각 워커가 한 번에 페이지 하나를 pin하므로 풀 프레임 수 >= nworkers 필요. */
+int parscan_foreach(Heap *h, int nworkers, void **ctxs,
+                    void (*visit)(RID rid, const void *rec, uint16_t len, void *ctx));
+
 #endif /* MINIDB_PARSCAN_H */
