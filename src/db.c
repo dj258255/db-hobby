@@ -1461,8 +1461,63 @@ static int aggregate_rowset(const SelectStmt *sel, Value *rows, int n, int ncols
 }
 
 /* 단일 테이블 투영/집계: WHERE에 맞는 행을 모아 aggregate_rowset에 넘긴다. */
+/* ── 병렬 집계(38편): 집계/GROUP BY의 행 수집을 병렬로 + materialize cap 우회 ──
+ * 직렬 exec_select_project는 SELECT_MAX_ROWS까지만 모아 큰 테이블 집계를 '조용히
+ * 절단'한다(6000행 테이블의 COUNT(*)가 4096을 주는 버그). 여기선 워커가 가시성
+ * 게이트+WHERE를 병렬 평가해 매칭 RID를 페이지 순서로 모으고(parscan_collect·
+ * parsel_pred 재사용), leader가 매칭 수만큼 rows를 채워 aggregate_rowset(직렬과
+ * '같은 코드')에 넘긴다 → cap 없이 정답을 내면서 병렬화, 출력 형식도 동일하다.
+ * 자격 미달(작은 테이블/서브쿼리/집계·그룹 아님)이면 0 → 호출자가 직렬 폴백.
+ * 정직한 경계: 매칭 행을 모두 담으므로(cap 제거의 대가) 매우 큰 결과엔 메모리를
+ * 쓴다 — 진짜 partial aggregation(누적만, 행 안 모음)은 프론티어. */
+static int try_parallel_aggregate(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
+    if (!(sel->has_aggregate || sel->group_col[0])) return 0; /* 순수 투영은 직렬(형식 유지) */
+    if (where_has_subquery(&sel->where)) return 0;
+
+    Database *db = t->owner;
+    uint64_t np = t->heap.pager->num_pages;
+    uint64_t pages = (np > t->heap.first_page) ? (np - t->heap.first_page) : 0;
+    if (pages < PARSCAN_MIN_PAGES) return 0;
+
+    ParSelCtx pc = {&t->schema, tname, &sel->where, db, db->cur_txn};
+    ParscanResult res;
+    if (parscan_collect(&t->heap, PARSCAN_WORKERS, parsel_pred, &pc, &res) != 0) return 0;
+
+    int ncols = t->schema.num_columns;
+    Value *rows = malloc((size_t)(res.n > 0 ? res.n : 1) * ncols * sizeof(Value));
+    if (!rows) { parscan_result_free(&res); return 0; } /* 폴백 */
+
+    int nrows = 0;
+    uint8_t recbuf[PAGE_SIZE];
+    uint16_t len;
+    for (int64_t i = 0; i < res.n; i++) {
+        if (heap_get(&t->heap, res.rids[i], recbuf, &len) == 0) {
+            Value row[SQL_MAX_COLS];
+            decode_row(&t->schema, recbuf, row);
+            memcpy(rows + (size_t)nrows * ncols, row, (size_t)ncols * sizeof(Value));
+            nrows++;
+        }
+    }
+    parscan_result_free(&res);
+
+    ColRef cols[SQL_MAX_COLS];
+    for (int i = 0; i < ncols; i++) {
+        cols[i].tbl = tname;
+        cols[i].col = t->schema.columns[i].name;
+        cols[i].is_int = (t->schema.columns[i].type == COL_INT);
+    }
+    aggregate_rowset(sel, rows, nrows, ncols, cols, out);
+    free(rows);
+    return 1;
+}
+
 static int exec_select_project(Table *t, const char *tname, const SelectStmt *sel, FILE *out) {
     int ncols = t->schema.num_columns;
+    /* 병렬 집계(38편): 큰 테이블의 집계/GROUP BY는 병렬 수집 + cap 우회 경로로.
+     * 자격 미달(작은 테이블/서브쿼리/순수 투영)이면 아래 직렬 경로로 폴백. */
+    if (try_parallel_aggregate(t, tname, sel, out)) {
+        return 0;
+    }
     Value *rows = malloc((size_t)SELECT_MAX_ROWS * ncols * sizeof(Value));
     if (!rows) {
         fprintf(out, "ERROR: 메모리 부족\n");
