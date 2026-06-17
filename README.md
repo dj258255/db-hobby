@@ -21,8 +21,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**645 checks across 37 suites**), and the concurrency is
-verified under ThreadSanitizer. The 36-part build log is at
+covered by tests (**655 checks across 38 suites**), and the concurrency is
+verified under ThreadSanitizer. The 37-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
@@ -128,10 +128,12 @@ The core above is one coherent single-node database. On top of it, the harder
 axes of a real system are built as **focused, independently-tested modules** —
 each with an honest boundary spelled out in its part of the build log. Most are
 kept as standalone modules (so the 600+ green tests stay safe), each marking
-where it ends and integration would begin — **except three capstones wired
+where it ends and integration would begin — **except four capstones wired
 end-to-end**: WAL replication (a replica replays the *real engine's* committed
-WAL and serves `SELECT`), Raft state-machine replication (`raftdb.c`), and the
-**LSM tree as a pluggable PK index** (`CREATE TABLE … USING lsm`).
+WAL and serves `SELECT`), Raft state-machine replication (`raftdb.c`), the
+**LSM tree as a pluggable PK index** (`CREATE TABLE … USING lsm`), and the
+**parallel scan wired into a real `SELECT`** (workers judge visibility+WHERE,
+the leader prints — byte-identical to serial, ThreadSanitizer-clean).
 
 | Module | What it does | Mirrors |
 |---|---|---|
@@ -141,7 +143,7 @@ WAL and serves `SELECT`), Raft state-machine replication (`raftdb.c`), and the
 | `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree. **Wired into the engine** as a pluggable PK index (`CREATE TABLE … USING lsm`): a multi-value mode holds the non-unique PK→RID multimap that MVCC needs, routed through a small Table Access Method (`pidx_*`) | RocksDB / MyRocks |
 | `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |
 | `cbtree.c` | a **concurrent B+Tree** with latch crabbing (per-node rwlocks), ThreadSanitizer-clean | InnoDB index concurrency |
-| `parscan.c` | a **parallel sequential scan** — worker threads sweep disjoint page ranges over the thread-safe buffer pool, leader merges in page order; identical to serial down to RID order, ThreadSanitizer-clean. The first foothold to peel the coarse engine latch off layer by layer | PostgreSQL parallel query |
+| `parscan.c` | a **parallel sequential scan** — worker threads sweep disjoint page ranges over the thread-safe buffer pool, leader merges in page order; identical to serial down to RID order, ThreadSanitizer-clean. **Wired into `exec_select`**: a large-table, subquery-free streaming full-scan `SELECT` runs the visibility gate + WHERE in parallel and prints via the leader — the first foothold to peel the coarse engine latch off layer by layer | PostgreSQL parallel query |
 
 ## SQL supported
 
