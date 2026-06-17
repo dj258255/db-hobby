@@ -21,8 +21,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**655 checks across 38 suites**), and the concurrency is
-verified under ThreadSanitizer. The 37-part build log is at
+covered by tests (**668 checks across 39 suites**), and the concurrency is
+verified under ThreadSanitizer. The 38-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
@@ -143,7 +143,7 @@ the leader prints — byte-identical to serial, ThreadSanitizer-clean).
 | `lsm.c` | an **LSM-tree** storage engine — memtable → SSTable flush → compaction, tombstone deletes — the write-optimized counterpart to the B+Tree. **Wired into the engine** as a pluggable PK index (`CREATE TABLE … USING lsm`): a multi-value mode holds the non-unique PK→RID multimap that MVCC needs, routed through a small Table Access Method (`pidx_*`) | RocksDB / MyRocks |
 | `joinopt.c` | a **Selinger join-order optimizer** — subset DP (2ⁿ instead of n!), cross-product avoidance, cardinality estimation | System R planner |
 | `cbtree.c` | a **concurrent B+Tree** with latch crabbing (per-node rwlocks), ThreadSanitizer-clean | InnoDB index concurrency |
-| `parscan.c` | a **parallel sequential scan** — worker threads sweep disjoint page ranges over the thread-safe buffer pool, leader merges in page order; identical to serial down to RID order, ThreadSanitizer-clean. **Wired into `exec_select`**: a large-table, subquery-free streaming full-scan `SELECT` runs the visibility gate + WHERE in parallel and prints via the leader — the first foothold to peel the coarse engine latch off layer by layer | PostgreSQL parallel query |
+| `parscan.c` | a **parallel sequential scan** — worker threads sweep disjoint page ranges over the thread-safe buffer pool, leader merges in page order; identical to serial down to RID order, ThreadSanitizer-clean. **Wired into `exec_select`**: a large-table, subquery-free streaming full-scan `SELECT` (and aggregates / GROUP BY) run the visibility gate + WHERE in parallel; the parallel aggregate path also fixes a silent materialization-cap truncation bug. The first foothold to peel the coarse engine latch off layer by layer | PostgreSQL parallel query |
 
 ## SQL supported
 
