@@ -60,7 +60,7 @@ SELECT * FROM users WHERE id = 1;
 | **복구를 제대로** | STEAL + no-force WAL, 로그가 진실의 원천 | PG WAL, ARIES | 14·15 |
 | **MVCC 완성** | DELETE=xmax, VACUUM, 다중 트랜잭션 스냅샷 격리 | PG MVCC/VACUUM | 16·17·18 |
 | **네트워크** | PostgreSQL v3 wire protocol 서버(진짜 psql이 붙음) | PG backend | 19 |
-| **동시성** | 스레드 안전 버퍼 풀, latch crabbing B+Tree, 병렬 풀 스캔·병렬 SELECT·병렬 집계 | InnoDB latch, PG parallel query | 20·22·36·37·38 |
+| **동시성** | 스레드 안전 버퍼 풀, latch crabbing B+Tree, 병렬 풀 스캔·병렬 SELECT·병렬 집계·부분 집계 | InnoDB latch, PG parallel query | 20·22·36·37·38·39 |
 | **비용 옵티마이저** | ANALYZE 통계·선택도, Selinger 조인 순서 DP | System R planner | 21·24 |
 | **저장 대조** | 힙(PG) vs 클러스터드(InnoDB), LSM(RocksDB) | 세 저장 철학 | 23·27 |
 | **교체 가능 인덱스** | PK 인덱스를 B+Tree/LSM 중 선택(`USING lsm`), Table Access Method | PG tableam / MyRocks | 35 |
@@ -76,7 +76,7 @@ SELECT * FROM users WHERE id = 1;
 - **핵심 구조부터, 그다음 어려운 축.** 1단계에선 동시성·네트워크·분산을 뒤로
   미뤄 저장·실행 뼈대를 세우고, 2단계에서 그것들을 정면으로 하나씩 뚫는다.
 - **각 계층은 테스트로 검증.** "동작한다고 주장"이 아니라 테스트로 증명(현재
-  668개 / 39스위트, 동시성은 ThreadSanitizer로).
+  677개 / 40스위트, 동시성은 ThreadSanitizer로).
 - **실제 DB와 비교 주석.** 우리가 단순화한 부분에 "PG/MySQL은 여기서 ~한다"를 남긴다.
 - **화물숭배 금지.** 기법은 그게 필요해지는 문제가 나타날 때 들여온다(예: CLR·퍼지
   체크포인트는 '이 엔진에선 불필요'를 증명하고 닫음). 무엇을 안 했는지도 명시한다.
