@@ -115,6 +115,11 @@ int db_open(Database *db, const char *path);
 /* flush하고 닫는다. */
 void db_close(Database *db);
 
+/* 병렬 실행(36~39편)의 워커 수를 바꾼다(기본 4). 벤치가 워커 수별 speedup을 재거나
+ * 테스트가 워커 수 무관 결과 동일성을 검증할 때 쓴다. 1이면 사실상 직렬 기준선. */
+void db_set_parallel_workers(int n);
+int  db_get_parallel_workers(void);
+
 /* SQL 한 문장을 실행한다. 결과/메시지는 out으로. 0 성공, -1 오류. */
 int db_exec(Database *db, const char *sql, FILE *out);
 

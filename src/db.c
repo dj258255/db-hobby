@@ -796,7 +796,11 @@ static int select_visit(RID rid, const void *rec, uint16_t len, void *ctx_) {
  * 그래서 결과는 직렬 경로와 바이트 단위로 동일하다. engine_mtx가 실행을 직렬화하는
  * 동안(동시 writer 없음) 힙·스냅샷·스키마·WHERE는 모두 읽기 전용이라 안전하다. */
 #define PARSCAN_MIN_PAGES 16 /* 이 미만이면 병렬 오버헤드가 이득보다 커 직렬로 */
-#define PARSCAN_WORKERS   4
+/* 병렬 워커 수. 기본 4. 벤치/테스트가 워커 수별 speedup을 재려고 런타임에 바꾼다
+ * (db_set_parallel_workers). 1이면 사실상 직렬 기준선(스레드 1개가 전 페이지 처리). */
+static int g_parscan_workers = 4;
+void db_set_parallel_workers(int n) { g_parscan_workers = (n < 1) ? 1 : n; }
+int db_get_parallel_workers(void) { return g_parscan_workers; }
 
 /* WHERE에 서브쿼리(scalar/IN-SELECT)가 있으면 술어가 실행기를 재진입 → 병렬 불가. */
 static int where_has_subquery(const Where *w) {
@@ -835,7 +839,7 @@ static int parallel_fullscan(Database *db, Table *t, const char *tname,
 
     ParSelCtx pc = {&t->schema, tname, where, db, db->cur_txn};
     ParscanResult res;
-    if (parscan_collect(&t->heap, PARSCAN_WORKERS, parsel_pred, &pc, &res) != 0)
+    if (parscan_collect(&t->heap, g_parscan_workers, parsel_pred, &pc, &res) != 0)
         return 0; /* 병렬 실패 시 조용히 직렬 폴백 */
 
     /* leader가 페이지 순서(res는 이미 페이지 순서)로 직렬 출력 — 직렬과 바이트 동일. */
@@ -1541,7 +1545,7 @@ static int try_parallel_partial_aggregate(Table *t, const char *tname,
         item_ci[k] = ci;
     }
 
-    int nw = PARSCAN_WORKERS;
+    int nw = g_parscan_workers;
     AggWctx *wctx = calloc((size_t)nw, sizeof(AggWctx));
     void **ctxs = calloc((size_t)nw, sizeof(void *));
     if (!wctx || !ctxs) { free(wctx); free(ctxs); return 0; }
@@ -1622,7 +1626,7 @@ static int try_parallel_aggregate(Table *t, const char *tname, const SelectStmt 
 
     ParSelCtx pc = {&t->schema, tname, &sel->where, db, db->cur_txn};
     ParscanResult res;
-    if (parscan_collect(&t->heap, PARSCAN_WORKERS, parsel_pred, &pc, &res) != 0) return 0;
+    if (parscan_collect(&t->heap, g_parscan_workers, parsel_pred, &pc, &res) != 0) return 0;
 
     int ncols = t->schema.num_columns;
     Value *rows = malloc((size_t)(res.n > 0 ? res.n : 1) * ncols * sizeof(Value));

@@ -10,7 +10,7 @@ SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/b
 BINSRCS := src/server.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_lsm_engine test_parscan test_parexec test_paragg test_partagg test_raft test_repl_e2e test_raftdb
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_lsm_engine test_parscan test_parexec test_paragg test_partagg test_parworkers test_raft test_repl_e2e test_raftdb
 
 .PHONY: test repl serve clean bench test-tsan
 
@@ -61,6 +61,12 @@ test: $(addprefix $(BUILD)/, $(TESTS))
 bench: $(BUILD)/bench
 	./$(BUILD)/bench
 $(BUILD)/bench: tests/bench.c $(SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -O2 -Isrc $< $(SRCS) -o $@
+
+# 병렬 실행(36~39편) speedup 실측 (워커 1·2·4·8, 워밍 vs 콜드)
+bench-parallel: $(BUILD)/bench_parallel
+	./$(BUILD)/bench_parallel
+$(BUILD)/bench_parallel: tests/bench_parallel.c $(SRCS) | $(BUILD)
 	$(CC) $(CFLAGS) -O2 -Isrc $< $(SRCS) -o $@
 
 # 힙(PG) vs 클러스터드(InnoDB) 접근 경로 비용 대조
