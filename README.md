@@ -21,8 +21,8 @@ so psql can't tell the difference.
 
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
-covered by tests (**682 checks across 41 suites**), and the concurrency is
-verified under ThreadSanitizer. The 40-part build log is at
+covered by tests (**686 checks across 42 suites**), and the concurrency is
+verified under ThreadSanitizer. The 41-part build log is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-hobby-0-overview).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
