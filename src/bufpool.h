@@ -51,6 +51,10 @@ int bufpool_flush_cb(BufferPool *bp, bufpool_sink_fn sink, void *ctx);
  * 그 핸들러를 통해(=undo 로그를 남기고) dirty 프레임을 축출할 수 있다(트랙 E). */
 void bufpool_set_no_steal(BufferPool *bp, int on);
 
+/* 벤치 A/B 스위치(41편): on=1이면 읽기 I/O(pager_read)를 풀 latch 안에서 한다(직렬,
+ * 41편 이전 동작). 0이면 latch 밖에서(병렬). 프로세스 전역. before/after 측정용. */
+void bufpool_set_io_in_latch(int on);
+
 /* no-steal 중 dirty 프레임을 축출해야 할 때 부를 핸들러. 핸들러가 그 페이지를
  * 안전하게(=WAL로 undo 로깅 + 디스크 쓰기) 처리하면 0을 준다. NULL이면 옛 no-steal
  * (dirty를 축출하지 않고 자리가 없으면 실패). */

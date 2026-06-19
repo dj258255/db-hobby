@@ -6,7 +6,8 @@
  *   ① 워밍(warm): 테이블이 버퍼 풀(64프레임)에 다 올라온 CPU-bound 워크로드.
  *      -> 페이지 fetch가 싸고, 가시성+WHERE+누적이 코어 수만큼 병렬 -> speedup 기대.
  *   ② 콜드(cold): 테이블이 풀보다 커(>64페이지) 스캔마다 thrash.
- *      -> pager_read(디스크 I/O)가 풀 latch 안에서 직렬화 -> 병렬 이득이 작다(정직).
+ *      -> 41편 전엔 pager_read가 풀 latch 안에서 직렬화돼 이득이 작았다(8워커 0.65x).
+ *         41편에서 읽기 I/O를 latch 밖으로 빼자 워커들이 병렬로 읽어 이득이 살아났다.
  *
  * 빌드/실행:  make bench-parallel   (자동 -O2)
  */
@@ -105,13 +106,18 @@ int main(void) {
     int COLD_N = 120000; /* ~360페이지 > 64 -> 스캔마다 재적재 */
     printf("적재(cold): %d행...\n", COLD_N);
     load(&cdb, COLD_N);
-    printf("\n[콜드 체제 — I/O-bound, 풀 latch가 fetch를 직렬화]\n\n");
-    sweep(&cdb, "SUM(v) 전체 스캔(부분 집계)", "SELECT SUM(v) FROM big", 20);
+    printf("\n[콜드 체제 — 테이블>풀. 41편 A/B: 읽기 I/O를 latch 안 vs 밖]\n\n");
+    const char *cold_q = "SELECT SUM(v) FROM big";
+    bufpool_set_io_in_latch(1); /* 41편 이전: I/O를 latch 안에서(직렬) */
+    sweep(&cdb, "before — pager_read를 latch 안에서(직렬 I/O)", cold_q, 20);
+    bufpool_set_io_in_latch(0); /* 41편: I/O를 latch 밖에서(병렬) */
+    sweep(&cdb, "after  — pager_read를 latch 밖에서(병렬 I/O)", cold_q, 20);
     db_close(&cdb);
 
     db_set_parallel_workers(4); /* 원복 */
     fclose(NULLOUT);
-    printf("끝. (해석: 워밍=CPU-bound라 병렬 이득, 콜드=풀 latch가 I/O 직렬화라 이득 작음\n");
-    printf("      -> 더 큰/세밀한 풀과 engine_mtx 제거가 다음 프론티어)\n");
+    printf("끝. (해석: 워밍=CPU-bound 병렬 이득. 콜드=41편에서 pager_read를 풀 latch 밖으로\n");
+    printf("      빼 병렬 읽기가 가능해져 이득이 살아남. 남은 천장: 스레드 오버헤드·작은 풀·\n");
+    printf("      dirty 쓰기 latch·engine_mtx -> 더 큰/세밀한 풀과 engine_mtx 제거가 프론티어)\n");
     return 0;
 }

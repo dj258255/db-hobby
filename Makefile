@@ -10,7 +10,7 @@ SRCS := src/pager.c src/page.c src/bufpool.c src/heap.c src/sql.c src/db.c src/b
 BINSRCS := src/server.c
 
 # 테스트 (tests/test_<name>.c 를 추가하고 여기에 이름만 넣으면 된다)
-TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_lsm_engine test_parscan test_parexec test_paragg test_partagg test_parworkers test_raft test_repl_e2e test_raftdb
+TESTS := test_pager test_page test_bufpool test_heap test_sql test_exec test_btree test_wal test_txn test_dml test_where test_join test_agg test_waldml test_explain test_secindex test_lock test_isolation test_mvcc test_mvcc_store test_recovery test_mvcc_dml test_vacuum test_multitxn test_concurrency test_optimizer test_cbtree test_clustered test_joinopt test_replica test_replnet test_lsm test_lsm_engine test_parscan test_parexec test_paragg test_partagg test_parworkers test_iobypass test_raft test_repl_e2e test_raftdb
 
 .PHONY: test repl serve clean bench test-tsan
 
@@ -28,6 +28,8 @@ test-tsan: | $(BUILD)
 	./$(BUILD)/test_paragg_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -Isrc tests/test_partagg.c $(SRCS) -o $(BUILD)/test_partagg_tsan
 	./$(BUILD)/test_partagg_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -Isrc tests/test_iobypass.c $(SRCS) -o $(BUILD)/test_iobypass_tsan
+	./$(BUILD)/test_iobypass_tsan
 
 # parscan은 엔진과 별개(병렬 풀 스캔, 실행기 미배선). 스토리지 스택만 링크.
 $(BUILD)/test_parscan: tests/test_parscan.c src/parscan.c src/heap.c src/bufpool.c src/pager.c src/page.c | $(BUILD)

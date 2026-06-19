@@ -9,6 +9,7 @@ typedef struct {
     int valid;             /* 사용 중인 프레임인가 */
     int dirty;             /* 메모리에서 수정됐나 */
     int pin_count;         /* 지금 쓰는 중인 곳 수 (>0이면 쫓아낼 수 없음) */
+    int io_pending;        /* 이 프레임을 latch 밖에서 로딩 중(read-in-progress). 41편 */
     uint64_t last_used;    /* LRU 스탬프 (클수록 최근) */
     uint8_t data[PAGE_SIZE];
 } Frame;
@@ -25,9 +26,13 @@ struct BufferPool {
     void *steal_ctx;
     /* 트랙 D: 프레임 테이블(메타데이터)을 보호하는 latch. 반환된 페이지 데이터 자체는
      * pin이 지킨다(pin>0이면 축출 안 되므로 mutex 밖에서 써도 안전) — 이게 pin 프로토콜.
-     * I/O(pager_read/write)도 이 latch 안에서 한다: 직렬화되지만 단순하고 정확하다.
-     * (진짜 DB는 "read-in-progress" 상태로 I/O를 latch 밖으로 뺀다.) */
+     * 41편: 읽기 I/O(pager_read)는 이제 latch 밖에서 한다 — miss 시 victim 프레임을
+     * io_pending으로 예약(pin해서 축출 방지)하고 latch를 놓은 뒤 읽는다. 같은 페이지를
+     * 동시에 miss한 스레드는 io_cond에서 기다렸다 깨어나 hit로 잡는다(중복 로드 없음).
+     * 그래서 콜드 스캔에서 여러 워커의 디스크 읽기가 병렬로 돈다. (dirty victim 쓰기는
+     * 아직 latch 안 — 스테이징 경로라 스캔에선 드물다.) */
     pthread_mutex_t latch;
+    pthread_cond_t  io_cond; /* io_pending 프레임이 로딩을 마치면 broadcast */
 };
 
 BufferPool *bufpool_create(Pager *pager, size_t num_frames) {
@@ -44,10 +49,16 @@ BufferPool *bufpool_create(Pager *pager, size_t num_frames) {
         return NULL;
     }
     pthread_mutex_init(&bp->latch, NULL);
+    pthread_cond_init(&bp->io_cond, NULL);
     bp->pager = pager;
     bp->num_frames = num_frames;
     return bp;
 }
+
+/* 벤치 A/B 스위치: 1이면 41편 이전처럼 읽기 I/O를 latch 안에서 한다(직렬). 기본 0.
+ * 프로세스 전역(단순화) — 벤치가 같은 프로세스에서 before/after를 재려고 토글한다. */
+static int g_io_in_latch = 0;
+void bufpool_set_io_in_latch(int on) { g_io_in_latch = on; }
 
 /* page_id를 담은 프레임을 찾는다. 없으면 NULL. (latch 보유 가정. 학습용이라 선형 탐색 —
  * 진짜 DB는 page_id -> frame 해시 테이블을 둔다.) */
@@ -101,29 +112,64 @@ static Frame *pick_frame(BufferPool *bp) {
     return victim;
 }
 
-/* latch 보유 상태에서 page_id 프레임을 확보한다(hit면 pin, miss면 load). */
+/* latch 보유 상태로 진입/반환한다(hit면 pin, miss면 load). miss의 pager_read는
+ * 41편부터 latch를 놓고 수행한다 — 그동안 프레임은 io_pending+pin으로 보호된다. */
 static Frame *fetch_locked(BufferPool *bp, page_id_t page_id) {
-    Frame *f = find_frame(bp, page_id);
-    if (f) {
-        bp->hits++;
-        f->pin_count++;
+    for (;;) {
+        Frame *f = find_frame(bp, page_id);
+        if (f) {
+            if (f->io_pending) {
+                /* 다른 스레드가 바로 이 페이지를 로딩 중 — 끝날 때까지 기다렸다 재시도.
+                 * cond_wait이 latch를 원자적으로 놓고 잤다 다시 잡는다. */
+                pthread_cond_wait(&bp->io_cond, &bp->latch);
+                continue;
+            }
+            bp->hits++;
+            f->pin_count++;
+            f->last_used = ++bp->clock;
+            return f;
+        }
+        bp->misses++;
+        f = pick_frame(bp);
+        if (!f) {
+            return NULL;
+        }
+        if (g_io_in_latch) {
+            /* 41편 이전 동작(벤치 A/B용): 읽기 I/O를 latch 안에서 — 직렬화된다. */
+            if (pager_read(bp->pager, page_id, f->data) != 0) {
+                f->valid = 0;
+                return NULL;
+            }
+            f->page_id = page_id;
+            f->valid = 1;
+            f->dirty = 0;
+            f->pin_count = 1;
+            f->last_used = ++bp->clock;
+            return f;
+        }
+        /* 이 프레임을 page_id로 '예약': io_pending으로 표시하고 pin해서 로딩 중
+         * 축출되지 않게 한다. 이제 latch를 놓아도 다른 스레드는 이 프레임을 찾으면
+         * io_pending을 보고 위에서 기다린다(중복 로드 방지). */
+        f->page_id = page_id;
+        f->valid = 1;
+        f->dirty = 0;
+        f->io_pending = 1;
+        f->pin_count = 1;
+
+        pthread_mutex_unlock(&bp->latch);
+        int rc = pager_read(bp->pager, page_id, f->data); /* ← latch 밖: 병렬 I/O */
+        pthread_mutex_lock(&bp->latch);
+
+        f->io_pending = 0;
+        pthread_cond_broadcast(&bp->io_cond); /* 기다리던 스레드 깨움 */
+        if (rc != 0) {
+            f->pin_count = 0;
+            f->valid = 0; /* 로드 실패 — 프레임 반납 */
+            return NULL;
+        }
         f->last_used = ++bp->clock;
         return f;
     }
-    bp->misses++;
-    f = pick_frame(bp);
-    if (!f) {
-        return NULL;
-    }
-    if (pager_read(bp->pager, page_id, f->data) != 0) {
-        return NULL; /* f는 이미 valid=0(빈 프레임) 상태 */
-    }
-    f->page_id = page_id;
-    f->valid = 1;
-    f->dirty = 0;
-    f->pin_count = 1;
-    f->last_used = ++bp->clock;
-    return f;
 }
 
 void *bufpool_fetch(BufferPool *bp, page_id_t page_id) {
@@ -245,6 +291,7 @@ void bufpool_destroy(BufferPool *bp) {
         return;
     }
     bufpool_flush_all(bp);
+    pthread_cond_destroy(&bp->io_cond);
     pthread_mutex_destroy(&bp->latch);
     free(bp->frames);
     free(bp);
