@@ -22,7 +22,7 @@ so psql can't tell the difference.
 It's a learning project: the goal isn't to invent something new, it's to
 reproduce the real structure accurately and understand it. Every layer is
 covered by tests (**686 checks across 42 suites**), and the concurrency is
-verified under ThreadSanitizer. The 10-part deep-dive series (DB Internals via a Mini DB) is at
+verified under ThreadSanitizer. The 11-part deep-dive series (DB Internals via a Mini DB) is at
 [IT-Oasis / db-hobby](https://dj258255.github.io/IT-Oasis/blog/project/db-hobby/db-internals-01-storage).
 
 **What's in it:** page storage · buffer pool (thread-safe, pin protocol) · heap ·
