@@ -42,11 +42,14 @@
 typedef enum { RAFT_FOLLOWER, RAFT_CANDIDATE, RAFT_LEADER } RaftRole;
 
 /* 로그 엔트리 = (term, 커맨드). is_config=1이면 멤버십 변경 엔트리(§6)로,
- * command에 '변경 후 멤버 비트마스크'가 들어간다(상태기계엔 적용 안 함). */
+ * command에 '변경 후 멤버 비트마스크'가 들어간다(상태기계엔 적용 안 함).
+ * is_noop=1이면 리더 당선 직후의 no-op 엔트리(§6.4 전제조건·§5.4.2) — 커밋
+ * 확인용일 뿐이라 상태기계에 적용하지 않는다. */
 typedef struct {
     uint64_t term;
     int64_t command;
     int is_config;
+    int is_noop;
 } RaftEntry;
 
 typedef enum {
@@ -138,6 +141,11 @@ typedef struct {
     /* ---- 리더 전용 휘발 상태 ---- */
     int64_t next_index[RAFT_MAX_NODES];  /* 각 팔로워에 보낼 다음 인덱스 */
     int64_t match_index[RAFT_MAX_NODES]; /* 각 팔로워가 확정한 마지막 인덱스 */
+    int64_t read_gate_index;             /* §6.4 전제조건: 당선 시점의 마지막 로그 인덱스
+                                          * (전임 term 미확정 꼬리가 있으면 no-op 인덱스).
+                                          * commit_index가 여기 닿기 전엔 ReadIndex 거부 —
+                                          * 갓 선출된 리더의 commit_index는 전임이 커밋한
+                                          * 엔트리를 아직 모를 수 있다(§5.4.2). */
 
     /* ---- 논리 타이머(하버스가 raft_tick으로 구동) ---- */
     int election_elapsed;
@@ -200,7 +208,10 @@ int raft_is_member(const Raft *r, int id);
 
 /* 선형화 읽기 시작(ReadIndex): 리더면 현재 commit_index를 read index로 잡고 과반
  * 하트비트를 보내 '지금도 리더'임을 확인하러 나선다. read index를 반환(>=0),
- * 리더가 아니면 -1. 이후 raft_read_confirmed가 그 index를 돌려주면 과반이 확인된
+ * 리더가 아니면 -1. §6.4 전제조건: 당선 직후 현재 term의 엔트리(no-op)가 커밋되기
+ * 전에도 -1 — 그 시점의 commit_index는 전임 리더가 커밋한 엔트리를 놓칠 수 있어
+ * (§5.4.2) read index로 쓰면 선형화가 깨진다. 호출자는 재시도하면 된다.
+ * 이후 raft_read_confirmed가 그 index를 돌려주면 과반이 확인된
  * 것 — 그때 last_applied가 그 index를 넘긴 뒤 자기 상태기계에서 읽으면 선형화된다. */
 int64_t raft_read_index(Raft *r, RaftOutbox *out);
 

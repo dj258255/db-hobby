@@ -584,6 +584,64 @@ int main(void) {
               "epoch: 현재 epoch 응답 과반 -> 확인됨");
     }
 
+    /* ── 14. ReadIndex 게이트(§6.4 전제조건): no-op 커밋 전 읽기 보류 ──
+     * 갓 선출된 리더의 commit_index는 전임 리더가 커밋한 엔트리를 아직 반영 못 했을
+     * 수 있다(§5.4.2: 옛 term 엔트리는 직접 커밋 불가). 그 시점의 commit_index를
+     * read index로 잡으면 커밋된 쓰기를 놓친 읽기가 된다 — 새 리더는 당선 직후
+     * no-op을 append하고, 그것이 커밋되기 전의 ReadIndex 요청은 거부해야 한다. */
+    {
+        cluster_init(3);
+        /* 전임 리더(term1)가 커밋까지 마친 엔트리(42)를 노드1에 복제하되,
+         * leader_commit이 닿기 전에 죽었다고 치자: 노드1은 last=1, commit=0. */
+        Raft *N = &g.nodes[1];
+        RaftMsg ae;
+        memset(&ae, 0, sizeof ae);
+        ae.type = MSG_APPEND_ENTRIES; ae.from = 0; ae.to = 1; ae.term = 1;
+        ae.prev_log_index = 0; ae.prev_log_term = 0;
+        ae.entries[0].term = 1; ae.entries[0].command = 42;
+        ae.n_entries = 1; ae.leader_commit = 0;
+        RaftMsg rep; int hr = 0; RaftOutbox out; out.n = 0;
+        raft_recv(N, &ae, &rep, &hr, &out);
+        CHECK(raft_last_log_index(N) == 1 && N->commit_index == 0,
+              "게이트: 전임 커밋 엔트리를 가졌지만 commit_index엔 미반영(창 재현)");
+
+        /* 노드1만 tick해 후보로 만들고, 노드2의 표로 당선시킨다(하트비트는 아직 미전달
+         * — 이 창이 no-op 커밋 전의 새 리더다). */
+        out.n = 0;
+        for (int t = 0; t < 20 && N->role != RAFT_CANDIDATE; t++) raft_tick(N, &out);
+        for (int k = 0; k < out.n; k++) {
+            if (out.m[k].to == 2) {
+                RaftOutbox o2; o2.n = 0;
+                raft_recv(&g.nodes[2], &out.m[k], &rep, &hr, &o2);
+            }
+        }
+        RaftOutbox hb; hb.n = 0; /* 당선 직후 하트비트 — 일부러 버린다(재전송됨) */
+        RaftMsg r2;
+        raft_recv(N, &rep, &r2, &hr, &hb);
+        CHECK(N->role == RAFT_LEADER, "게이트: 노드1이 새 리더로 당선");
+        CHECK(raft_last_log_index(N) == 2 && N->log[2].is_noop && N->log[2].term == N->current_term,
+              "게이트: 당선 직후 현재 term의 no-op을 append(인덱스 2)");
+        /* 버그 시나리오: 여기서 read index를 commit_index(0)로 잡으면 전임이 커밋한
+         * 엔트리 1(42)을 놓친 읽기다 -> 게이트가 거부해야 한다. */
+        out.n = 0;
+        CHECK(raft_read_index(N, &out) == -1,
+              "게이트: no-op 커밋 전 ReadIndex는 거부(커밋된 쓰기를 놓칠 수 있음)");
+
+        /* 복제 재개 -> no-op이 커밋되면서 전임 term 엔트리도 간접 커밋(§5.4.2). */
+        cluster_run(10);
+        CHECK(N->commit_index == 2, "게이트: no-op 커밋이 전임 엔트리(1)까지 확정");
+        CHECK(g.applied[1][1] == 42 && g.sm[1] == 42,
+              "게이트: 전임 엔트리는 적용, no-op은 상태기계에 미적용");
+
+        /* 이제 게이트 통과: read index = 2 (전임 커밋분 포함한 올바른 배리어). */
+        out.n = 0;
+        int64_t ri = raft_read_index(N, &out);
+        CHECK(ri == 2, "게이트: no-op 커밋 후 ReadIndex 서빙(배리어=2, 전임 커밋 포함)");
+        for (int k = 0; k < out.n; k++) qpush(out.m[k]);
+        cluster_run(3);
+        CHECK(raft_read_confirmed(N) == ri, "게이트: 과반 하트비트 ack로 읽기 확인");
+    }
+
     for (int i = 0; i < RAFT_MAX_NODES; i++) {
         if (g.nodes[i].log) raft_free(&g.nodes[i]);
     }

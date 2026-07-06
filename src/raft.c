@@ -28,6 +28,7 @@ static RaftEntry *ent(Raft *r, int64_t i) {
 }
 
 static void maybe_adopt_config(Raft *r, const RaftEntry *e); /* 아래 정의 */
+static void leader_advance_commit(Raft *r);                  /* 아래 정의 */
 
 static int log_append(Raft *r, RaftEntry e) {
     if (r->log_len >= r->log_cap) {
@@ -169,7 +170,19 @@ static void become_leader(Raft *r, RaftOutbox *out) {
         r->next_index[i] = raft_last_log_index(r) + 1;
         r->match_index[i] = 0;
     }
+    /* §6.4 전제조건: 커밋 여부를 모르는 전임 term 꼬리가 있으면(last > commit)
+     * 현재 term의 no-op을 append한다. 옛 term 엔트리는 직접 커밋할 수 없으므로
+     * (§5.4.2) 이 no-op이 커밋되면서 전임 커밋분까지 commit_index에 확정된다 —
+     * 그 전까지 ReadIndex는 read_gate_index로 보류된다(etcd/raft의 empty entry).
+     * last == commit이면 Leader Completeness(§5.4)로 커밋된 엔트리 전부가 이미
+     * commit_index 이하라 no-op 없이도 안전하다(로그 인덱스를 불필요하게 안 민다). */
+    if (raft_last_log_index(r) > r->commit_index) {
+        RaftEntry noop = {.term = r->current_term, .command = 0, .is_config = 0, .is_noop = 1};
+        log_append(r, noop);
+    }
+    r->read_gate_index = raft_last_log_index(r);
     r->match_index[r->id] = raft_last_log_index(r);
+    leader_advance_commit(r); /* 단일 노드 클러스터면 no-op이 여기서 즉시 커밋 */
     r->heartbeat_elapsed = 0;
     /* 즉시 하트비트(빈 AppendEntries)로 권위를 알린다 — 다른 후보의 선거를 막는다. */
     for (int i = 0; i < RAFT_MAX_NODES; i++) {
@@ -207,11 +220,12 @@ static void become_candidate(Raft *r, RaftOutbox *out) {
     }
 }
 
-/* commit_index까지 상태기계에 적용(§5.3). 재시작 후 재적용도 인덱스 기준이라 안전. */
+/* commit_index까지 상태기계에 적용(§5.3). 재시작 후 재적용도 인덱스 기준이라 안전.
+ * no-op 엔트리는 커밋 확인용일 뿐이라 건너뛴다(last_applied는 전진). */
 static void apply_committed(Raft *r) {
     while (r->last_applied < r->commit_index) {
         r->last_applied++;
-        if (r->apply) {
+        if (r->apply && !ent(r, r->last_applied)->is_noop) {
             r->apply(r->id, r->last_applied, ent(r, r->last_applied)->command, r->apply_ctx);
         }
     }
@@ -240,6 +254,7 @@ int raft_init(Raft *r, int id, int n_nodes, int election_timeout, int heartbeat_
     r->log[0].term = 0; /* sentinel */
     r->log[0].command = 0;
     r->log[0].is_config = 0;
+    r->log[0].is_noop = 0;
     r->log_len = 1;
     r->role = RAFT_FOLLOWER;
     r->commit_index = 0;
@@ -330,6 +345,13 @@ int64_t raft_change_config(Raft *r, uint32_t new_mask) {
  * 그 ack를 세어 과반이 되면 read_confirmed_index를 세운다. */
 int64_t raft_read_index(Raft *r, RaftOutbox *out) {
     if (r->role != RAFT_LEADER) {
+        return -1;
+    }
+    /* §6.4 전제조건: 현재 term의 엔트리(당선 시 no-op)가 커밋되기 전엔 서빙 불가.
+     * 갓 선출된 리더의 commit_index는 전임 리더가 커밋한 엔트리를 아직 반영하지
+     * 못했을 수 있어(§5.4.2), 그걸 read index로 잡으면 커밋된 쓰기를 놓친 읽기가
+     * 된다. -1로 거부 — 호출자가 재시도한다. */
+    if (r->commit_index < r->read_gate_index) {
         return -1;
     }
     r->read_barrier_index = r->commit_index;
@@ -549,6 +571,7 @@ static void handle_install_snapshot(Raft *r, const RaftMsg *msg, RaftMsg *reply)
     r->log[0].term = msg->last_included_term;
     r->log[0].command = 0;
     r->log[0].is_config = 0;
+    r->log[0].is_noop = 0;
     r->log_len = 1;
     r->log_base = msg->last_included_index;
     r->commit_index = msg->last_included_index;
@@ -624,6 +647,7 @@ int raft_snapshot(Raft *r, int64_t index, int64_t sm_state) {
     r->log[0].term = inc_term; /* 마커: 논리 인덱스 index를 대표 */
     r->log[0].command = 0;
     r->log[0].is_config = 0;
+    r->log[0].is_noop = 0;
     r->log_len = keep + 1;
     r->log_base = index;
     r->snapshot_value = sm_state;
